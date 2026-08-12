@@ -447,12 +447,13 @@ const char *recIndent() {
 }
 
 bool isAbsolutePath(const Common::String &path) {
-	// Starts with Mac directory notation for the game root
-	if (path.hasPrefix(Common::String("@:")) ||
-		path.hasPrefix(Common::String("@\\")) ||
-		path.hasPrefix(Common::String("@/"))) {
-		return true;
-	}
+	// A leading @ is not an absolute path: Director reads it as "the folder of
+	// the movie that is running now", so it can only be resolved against the
+	// current folder. Treating it as absolute made the lookup fall through to a
+	// whole-tree search, which answers with a path that has lost its folders --
+	// and the movie loaded under that path then computes every path of its own
+	// (the pathName & something) from the wrong place.
+	// See isPathWithRelativeMarkers() and rectifyRelativePath().
 	// Starts with a Windows drive letter
 	if (path.size() >= 3
 			&& Common::isAlpha(path[0])
@@ -463,6 +464,9 @@ bool isAbsolutePath(const Common::String &path) {
 }
 
 bool isPathWithRelativeMarkers(const Common::String &path) {
+	// @ means "relative to the folder of the current movie"
+	if (path.hasPrefix("@"))
+		return true;
 	if (path.contains("::"))
 		return true;
 	if (path.hasPrefix(".\\") || path.hasSuffix("\\.") || path.contains("\\.\\"))
@@ -477,10 +481,10 @@ Common::String rectifyRelativePath(const Common::String &path, const Common::Pat
 	Common::StringArray components = base.splitComponents();
 	uint32 idx = 0;
 
-	// If a path is provided that begins with @, it will be relative to the top level, not the base.
+	// A path beginning with @ is relative to the folder of the current movie,
+	// which is what the base already is: skip the marker and keep the base.
 	if ((path.size() > 0) && (path[0] == '@')) {
 		idx++;
-		components.clear();
 	}
 
 	while (idx < path.size()) {
