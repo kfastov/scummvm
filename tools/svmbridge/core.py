@@ -265,13 +265,38 @@ class Bridge:
         return reply.get("out", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
+def engine_fatal() -> str:
+    """Если движок упал в свою консоль, возвращает текст ошибки, иначе пусто.
+
+    При фатальной ошибке ScummVM открывает модальный диалог консоли и перестаёт
+    крутить главный цикл — мост замолкает. Без этой проверки любая такая
+    поломка выглядит как «мост не отвечает», и настоящая причина теряется.
+    """
+    st = read_state()
+    log = Path(st.log) if st else RUNDIR / "bridge-run.log"
+    if not log.exists():
+        return ""
+    text = log.read_bytes().decode("utf-8", "replace")
+    idx = text.rfind("ERROR: ")
+    if idx < 0:
+        return ""
+    lines = text[:idx].splitlines()[-8:] + [text[idx:].splitlines()[0]]
+    return "\n".join(lines)
+
+
 def command(line: str, port: int | None = None) -> str:
     """Разовая команда: подключиться, спросить, отключиться."""
     if port is None:
         st = read_state()
         port = st.port if st else DEFAULT_PORT
-    with Bridge(port) as br:
-        return br.command(line)
+    try:
+        with Bridge(port) as br:
+            return br.command(line)
+    except (OSError, BridgeError):
+        fatal = engine_fatal()
+        if fatal:
+            raise BridgeError(f"движок в отладочной консоли после ошибки:\n{fatal}")
+        raise
 
 
 def commands(lines: list[str], port: int | None = None) -> list[str]:

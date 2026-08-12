@@ -515,10 +515,30 @@ index 4ed09bbf..10aafd23 100644
  	// however the developers were using slow hardware, so some
  	// animations play back much faster than intended.
 diff --git a/engines/director/lingo/lingo-builtins.cpp b/engines/director/lingo/lingo-builtins.cpp
-index 10925e4c..4a2ae4e5 100644
+index 10925e4c..ad751caa 100644
 --- a/engines/director/lingo/lingo-builtins.cpp
 +++ b/engines/director/lingo/lingo-builtins.cpp
-@@ -1658,6 +1658,16 @@ void LB::b_getNthFileNameInFolder(int nargs) {
+@@ -1277,7 +1277,8 @@ void LB::b_getPropAt(int nargs) {
+ 	case PARRAY:
+ 		{
+ 			if ((index <= 0) || (index > (int)list.u.parr->arr.size())) {
+-				g_lingo->lingoError("b_getPropAt(): index out of range");
++				g_lingo->lingoError("b_getPropAt(): index %d out of range, list has %d entries",
++						index, (int)list.u.parr->arr.size());
+ 				return;
+ 			}
+ 			g_lingo->push(list.u.parr->arr[index - 1].p);
+@@ -1286,7 +1287,8 @@ void LB::b_getPropAt(int nargs) {
+ 	case OBJECT:
+ 		{
+ 			if ((index <= 0) || (index > (int)list.u.obj->getPropCount())) {
+-				g_lingo->lingoError("b_getPropAt(): index out of range");
++				g_lingo->lingoError("b_getPropAt(): index %d out of range, object has %d properties",
++						index, (int)list.u.obj->getPropCount());
+ 				return;
+ 			}
+ 			Common::String key = list.u.obj->getPropAt(index);
+@@ -1658,6 +1660,16 @@ void LB::b_getNthFileNameInFolder(int nargs) {
  		return;
  	}
  
@@ -535,7 +555,7 @@ index 10925e4c..4a2ae4e5 100644
  	// getNthFileNameInFolder requires an absolute path as an input.
  	// relative paths will not match anything.
  	Common::Path path = findAbsolutePath(pathRaw, true);
-@@ -1705,9 +1715,13 @@ void LB::b_getNthFileNameInFolder(int nargs) {
+@@ -1705,9 +1717,13 @@ void LB::b_getNthFileNameInFolder(int nargs) {
  	if (!fileNameList.empty() && (uint)fileNum < fileNameList.size()) {
  		// Sort files alphabetically
  		Common::sort(fileNameList.begin(), fileNameList.end());
@@ -549,6 +569,54 @@ index 10925e4c..4a2ae4e5 100644
  	g_lingo->push(r);
  }
  
+diff --git a/engines/director/lingo/lingo-events.cpp b/engines/director/lingo/lingo-events.cpp
+index f58d7766..8f301850 100644
+--- a/engines/director/lingo/lingo-events.cpp
++++ b/engines/director/lingo/lingo-events.cpp
+@@ -139,12 +139,26 @@ void Movie::resolveScriptEvent(LingoEvent &event) {
+ 			leventType2str(event.event), event.eventId, scriptType2str(event.scriptType),
+ 			eventHandlerSourceType2str(event.eventHandlerSourceType), event.mousePos.x, event.mousePos.y, spriteId);
+ 
+-		if (event.event == kEventMouseDown || event.event == kEventRightMouseDown) {
++		// the clickOn is decided once, when the button goes down, and keeps that
++		// value for the whole click, mouseUp included. Two things used to spoil it.
++		//
++		// One, it was overwritten on mouseUp with the sprite under the mouse at
++		// release. Drag and drop scripts pick a sprite up in mouseDown and then
++		// ask the clickOn in mouseUp what they were dragging, so they were handed
++		// the drop target instead and their channel arithmetic went out of range.
++		// That also disabled mouseUpOutSide, which is by definition "released away
++		// from the sprite the click started on".
++		//
++		// Two, one mouse click queues several handlers (sprite, cast, frame,
++		// movie) and every one of them is resolved in turn, re-reading what is
++		// under the mouse. The very first handler had already run by then, and a
++		// drag script parks a sprite under the cursor -- so the second resolution
++		// saw that sprite and made it the clickOn. Hence the event id check: the
++		// first resolution of a given click wins.
++		if ((event.event == kEventMouseDown || event.event == kEventRightMouseDown) &&
++				_clickOnEventId != event.eventId) {
++			_clickOnEventId = event.eventId;
+ 			_lastClickedSpriteId = spriteId; // the clickOn
+-		} else 	if (event.event == kEventMouseUp || event.event == kEventRightMouseUp) {
+-			// Do not override when clicked on Score
+-			if (spriteId)
+-				_lastClickedSpriteId = spriteId;
+ 		}
+ 
+ 	}
+@@ -263,11 +277,6 @@ void Movie::resolveScriptEvent(LingoEvent &event) {
+ 				scriptId = _currentKeyDownSpriteScriptID;
+ 				immediate = _currentKeyDownSpriteImmediate;
+ 			} else {
+-				// clickOn must reflect the release sprite so drop-target scripts
+-				// can identify the channel
+-				if ((event.event == kEventMouseUp || event.event == kEventRightMouseUp) && event.channelId)
+-					_lastClickedSpriteId = event.channelId;
+-
+ 				Frame *currentFrame = _score->_currentFrame;
+ 				assert(currentFrame != nullptr);
+ 				Sprite *sprite = _score->getSpriteById(event.channelId);
 diff --git a/engines/director/lingo/xlibs/f/fileio.cpp b/engines/director/lingo/xlibs/f/fileio.cpp
 index 76a2cccf..0bbee0a8 100644
 --- a/engines/director/lingo/xlibs/f/fileio.cpp
@@ -591,6 +659,31 @@ index f6d5a211..987e1859 100644
  	debugger.o \
  	director.o \
  	events.o \
+diff --git a/engines/director/movie.cpp b/engines/director/movie.cpp
+index f3d966f1..f90974d0 100644
+--- a/engines/director/movie.cpp
++++ b/engines/director/movie.cpp
+@@ -49,6 +49,7 @@ Movie::Movie(Window *window) {
+ 	_stageColor = _vm->_wm->_colorWhite;
+ 
+ 	_lastClickedSpriteId = 0;
++	_clickOnEventId = -1;
+ 	_currentSpriteNum = 0;
+ 	_currentEditableTextChannel = 0;
+ 	_lastEventTime = _vm->getMacTicks();
+diff --git a/engines/director/movie.h b/engines/director/movie.h
+index a4d13e9e..d225157e 100644
+--- a/engines/director/movie.h
++++ b/engines/director/movie.h
+@@ -189,6 +189,8 @@ public:
+ 	bool _videoPlayback;
+ 
+ 	int _nextEventId;
++	// Идентификатор нажатия, для которого уже определён the clickOn.
++	int _clickOnEventId;
+ 	Common::Queue<LingoEvent> _inputEventQueue;
+ 
+ 	int _selStart;
 diff --git a/engines/director/score.cpp b/engines/director/score.cpp
 index f8040863..2952358e 100644
 --- a/engines/director/score.cpp
