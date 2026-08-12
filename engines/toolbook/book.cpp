@@ -184,19 +184,33 @@ void Book::scanImages() {
 		img.colors = readU32(&_data[i + 32]);
 		if (img.colors == 0 && bpp <= 8)
 			img.colors = 1u << bpp;
-		img.pixels = i + 40 + img.colors * 4;
-		uint32 stride = ((w * bpp + 31) / 32) * 4;
-		img.dataSize = stride * img.height;
+		img.stride = ((w * bpp + 31) / 32) * 4;
+		img.rawSize = img.stride * img.height;
 
 		// Несжатой считаем только ту картинку, перед которой стоит файловая
-		// шапка BM с согласованным bfOffBits: у таких данные проверяемо
-		// разворачиваются. Всё прочее в книге сжато своим способом.
+		// шапка BM с согласованным bfOffBits: у таких пиксели лежат сразу за
+		// палитрой как есть.
 		if (i >= 14 && _data[i - 14] == 'B' && _data[i - 13] == 'M') {
 			uint32 offBits = readU32(&_data[i - 14 + 10]);
 			img.raw = (offBits == 14 + 40 + img.colors * 4);
 		}
+		if (img.raw)
+			img.pixels = i + 40 + img.colors * 4;
 
-		if (img.pixels + img.dataSize <= n)
+		// Перед заголовком лежит пара размеров: распакованный и сжатый. По ней
+		// и опознаётся сжатый поток — и она же служит проверкой при поиске
+		// начала данных.
+		for (uint32 back = 8; back <= 0x140 && back <= i; back++) {
+			if (readU32(&_data[i - back]) != img.rawSize)
+				continue;
+			uint32 comp = readU32(&_data[i - back + 4]);
+			if (comp > 0 && comp <= img.rawSize * 2) {
+				img.compSize = comp;
+				break;
+			}
+		}
+
+		if (img.rawSize > 0 && (img.raw || img.compSize))
 			_images.push_back(img);
 
 		i += 40;
@@ -223,11 +237,9 @@ void Book::scanPages() {
 				break;
 			if (page.background < 0)
 				page.background = k;
-			bool fullScreen = _images[k].width >= 600 && _images[k].height >= 440;
-			if (fullScreen) {
+			if (_images[k].width >= 600 && _images[k].height >= 440) {
 				page.background = k;
-				if (_images[k].raw)
-					break;
+				break;
 			}
 		}
 
@@ -299,20 +311,95 @@ void Book::scanClassNames() {
 	}
 }
 
-Graphics::Surface *Book::decodeImage(const Image &img, Graphics::Palette &palette) const {
-	if (!img.raw) {
-		// Сжатие книги не разобрано; показывать такие данные как пиксели нельзя.
-		return nullptr;
+// Распаковка потока картинки, см. book.h и ledger/0021.
+static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
+		uint32 stride, uint32 *usedOut) {
+	uint32 in = 0, out = 0, col = 0;
+
+	while (in < srcLen && out < dstLen) {
+		byte c = src[in++];
+		uint32 n;
+
+		if (c <= 0xf5) {
+			if (in >= srcLen)
+				break;
+			byte v = src[in++];
+			n = MIN<uint32>(MIN<uint32>(c + 3, stride - col), dstLen - out);
+			memset(dst + out, v, n);
+			// Хвост серии, не влезший в строку, отбрасывается: серия не
+			// переходит на следующую строку.
+			out += n;
+			n = MIN<uint32>(c + 3, stride - col);
+		} else {
+			uint32 k = c - 0xf5;
+			n = MIN<uint32>(k, dstLen - out);
+			for (uint32 j = 0; j < n && in < srcLen; j++)
+				dst[out++] = src[in++];
+			in += (k > n) ? (k - n) : 0;
+			n = k;
+		}
+		col = (col + n) % stride;
 	}
+
+	if (usedOut)
+		*usedOut = in;
+	return out;
+}
+
+bool Book::locatePixels(Image &img) {
+	if (img.pixels)
+		return true;
+	if (!img.compSize || !img.rawSize)
+		return false;
+
+	const uint32 afterPalette = img.offset + 40 + img.colors * 4;
+	// У части картинок между палитрой и данными вклиниваются другие записи,
+	// поэтому начало ищется перебором. Признак верного начала — распаковка
+	// даёт ровно rawSize байт, израсходовав примерно compSize.
+	const uint32 kSearch = 0x10000;
+	Common::Array<byte> tmp;
+	tmp.resize(img.rawSize);
+
+	for (uint32 off = 0; off < kSearch; off++) {
+		uint32 start = afterPalette + off;
+		if (start + img.compSize > _data.size())
+			break;
+
+		uint32 used = 0;
+		uint32 got = unpackRLE(&_data[start], MIN<uint32>(img.compSize + 512, _data.size() - start),
+				tmp.begin(), img.rawSize, img.stride, &used);
+
+		if (got == img.rawSize && used + img.height / 2 + 16 >= img.compSize &&
+				used <= img.compSize + img.height / 2 + 16) {
+			img.pixels = start;
+			return true;
+		}
+	}
+	return false;
+}
+
+Graphics::Surface *Book::decodeImage(Image &img, Graphics::Palette &palette) {
+	if (!locatePixels(img))
+		return nullptr;
 	if (img.depth != 8 && img.depth != 24) {
 		warning("ToolBook: картинка %d бит пока не разворачивается", img.depth);
 		return nullptr;
 	}
-	if (img.pixels + img.dataSize > _data.size())
-		return nullptr;
+	Common::Array<byte> pixels;
+	pixels.resize(img.rawSize);
+	memset(pixels.begin(), 0, img.rawSize);
+
+	if (img.raw) {
+		if (img.pixels + img.rawSize > _data.size())
+			return nullptr;
+		memcpy(pixels.begin(), &_data[img.pixels], img.rawSize);
+	} else {
+		unpackRLE(&_data[img.pixels], MIN<uint32>(img.compSize + 512, _data.size() - img.pixels),
+				pixels.begin(), img.rawSize, img.stride, nullptr);
+	}
 
 	Graphics::Surface *surf = new Graphics::Surface();
-	uint32 stride = ((img.width * img.depth + 31) / 32) * 4;
+	uint32 stride = img.stride;
 
 	if (img.depth == 8) {
 		surf->create(img.width, img.height, Graphics::PixelFormat::createFormatCLUT8());
@@ -324,13 +411,13 @@ Graphics::Surface *Book::decodeImage(const Image &img, Graphics::Palette &palett
 		}
 		// DIB хранится снизу вверх.
 		for (int y = 0; y < img.height; y++) {
-			const byte *src = &_data[img.pixels + (img.height - 1 - y) * stride];
+			const byte *src = pixels.begin() + (img.height - 1 - y) * stride;
 			memcpy(surf->getBasePtr(0, y), src, MIN<uint32>(stride, (uint32)img.width));
 		}
 	} else {
 		surf->create(img.width, img.height, Graphics::PixelFormat(4, 8, 8, 8, 8, 16, 8, 0, 24));
 		for (int y = 0; y < img.height; y++) {
-			const byte *src = &_data[img.pixels + (img.height - 1 - y) * stride];
+			const byte *src = pixels.begin() + (img.height - 1 - y) * stride;
 			uint32 *dst = (uint32 *)surf->getBasePtr(0, y);
 			for (int x = 0; x < img.width; x++, src += 3)
 				*dst++ = surf->format.ARGBToColor(0xff, src[2], src[1], src[0]);
