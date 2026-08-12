@@ -903,18 +903,16 @@ Common::Path findPath(const Common::String &path, bool currentFolder, bool searc
 		}
 	}
 
-	// Fall back to checking the game root path
-	debugCN(1, kDebugPaths, "%s", recIndent());
-	debugC(1, kDebugPaths, "findPath(): searching game root path");
-	base = Common::Path();
-	result = resolvePartialPathWithFuzz(testPath, base, directory, exts);
-	if (!result.empty()) {
-		debugCN(1, kDebugPaths, "%s", recIndent());
-		debugC(1, kDebugPaths, "findPath(): resolved \"%s\" -> \"%s\"", testPath.c_str(), result.toString().c_str());
-		return result;
-	}
-
-	// Check each of the search paths in sequence
+	// Check each of the search paths in sequence.
+	//
+	// This has to come before the game root fallback below. The root fallback
+	// resolves a bare name against the whole game tree, so it answers with the
+	// name it was given and not with the folder the file actually lives in.
+	// A movie found that way then gets composed against whatever the current
+	// folder happens to be, and the load fails. The search path, on the other
+	// hand, is what the game itself asked us to look at, and it resolves to a
+	// real folder. It also matches how Director looks things up: the file name
+	// as given, then the search path, and only then anything else.
 	if (searchPaths) {
 		Common::Array<Common::String> searchPathList;
 		Datum searchPath = g_director->getLingo()->_searchPath;
@@ -943,6 +941,17 @@ Common::Path findPath(const Common::String &path, bool currentFolder, bool searc
 				return result;
 			}
 		}
+	}
+
+	// Fall back to checking the game root path
+	debugCN(1, kDebugPaths, "%s", recIndent());
+	debugC(1, kDebugPaths, "findPath(): searching game root path");
+	base = Common::Path();
+	result = resolvePartialPathWithFuzz(testPath, base, directory, exts);
+	if (!result.empty()) {
+		debugCN(1, kDebugPaths, "%s", recIndent());
+		debugC(1, kDebugPaths, "findPath(): resolved \"%s\" -> \"%s\"", testPath.c_str(), result.toString().c_str());
+		return result;
 	}
 
 	// Return empty path
