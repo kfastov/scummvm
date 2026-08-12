@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "scummvm": {
+      "command": "python3",
+      "args": ["tools/svmbridge/mcp_server.py"]
+    }
+  }
+}
