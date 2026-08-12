@@ -20,3 +20,6 @@ scummvm-src/
 # Прогоны: логи, кадры, дампы
 svm-run/
 *.log
+
+# Сборка под Android: слепок исходников, зависимости, APK
+build-android/
