@@ -31,6 +31,7 @@
 
 #include "director/director.h"
 #include "director/debugger.h"
+#include "director/debug-bridge.h"
 #include "director/archive.h"
 #include "director/cast.h"
 #include "director/movie.h"
@@ -108,6 +109,9 @@ DirectorEngine::DirectorEngine(OSystem *syst, const DirectorGameDescription *gam
 	_loadSlowdownCooldownTime = 0;
 	_fileIOType = 0;
 	_vfwPaletteHack = false;
+	_inputScriptPos = 0;
+	_inputScriptLoaded = false;
+	_debugBridge = nullptr;
 
 	_key = 0;
 	_keyCode = 0;
@@ -180,6 +184,7 @@ DirectorEngine::~DirectorEngine() {
 
 	delete _surface;
 	delete _primitives;
+	delete _debugBridge;
 }
 
 Movie *DirectorEngine::getCurrentMovie() const { return _currentWindow->getCurrentMovie(); }
@@ -300,6 +305,16 @@ Common::Error DirectorEngine::run() {
 
 	_wm = new Graphics::MacWindowManager(_wmMode, &_director3QuickDrawPatterns, getLanguage(), _pixelformat);
 	_wm->setEngine(this);
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост. Поднимаем до загрузки
+	// фильма, чтобы можно было расспрашивать движок с самого начала прогона.
+	if (ConfMan.hasKey("debugbridge_port")) {
+		_debugBridge = new DebugBridge();
+		if (!_debugBridge->listen(ConfMan.getInt("debugbridge_port"))) {
+			delete _debugBridge;
+			_debugBridge = nullptr;
+		}
+	}
 
 	gameQuirks(_gameDescription->desc.gameId, _gameDescription->desc.platform);
 	// Mix in all the saved files for the current target

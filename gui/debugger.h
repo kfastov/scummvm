@@ -74,6 +74,14 @@ public:
 	 */
 	bool isActive() const { return _isActive; }
 
+	/**
+	 * ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): выполнить команду консоли, не
+	 * открывая консоль, и сложить её вывод в строку. Нужно отладочному мосту
+	 * движка director: в безоконном прогоне консоль показать негде, а команды
+	 * (channels, print, funcs, breakpoints) хочется те же самые.
+	 */
+	void runCapturedCommand(const Common::String &cmd, Common::String &output);
+
 protected:
 	typedef Common::Functor1<const char *, bool> defaultCommand;
 	typedef Common::Functor2<int, const char **, bool> Debuglet;
@@ -210,6 +218,11 @@ private:
 	 * A nullptr till set by via registerDefaultCommand.
 	 */
 	defaultCommand *_defaultCommandProcessor;
+
+	/**
+	 * ЛОКАЛЬНАЯ ПРАВКА: пока не ноль, debugPrintf пишет сюда, а не в консоль.
+	 */
+	Common::String *_captureOutput;
 
 protected:
 	PauseToken _debugPauseToken;

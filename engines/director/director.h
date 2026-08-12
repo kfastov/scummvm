@@ -56,6 +56,7 @@ class Archive;
 class MacArchive;
 class Cast;
 class Debugger;
+class DebugBridge;
 class DirectorSound;
 class Lingo;
 class Movie;
@@ -250,6 +251,31 @@ public:
 	void processEventQUIT();
 	int getMacTicks();
 	Common::Array<Common::Event> _injectedEvents;
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных прогонов.
+	// Путь к файлу задаётся ключом inputscript в конфиге, строки вида
+	//   1500 click 232 215
+	//   4000 key 27
+	// где первое число — миллисекунды от старта движка. Нужен, чтобы прогон по
+	// игре был воспроизводимым и снимал одни и те же эталонные кадры.
+	enum ScriptedInputAction { kActionPress, kActionRelease, kActionKey, kActionSpriteEvent };
+
+	struct ScriptedInput {
+		uint32 timeMs;
+		ScriptedInputAction action;
+		int x, y;
+		int code;
+	};
+	Common::Array<ScriptedInput> _inputScript;
+	uint _inputScriptPos;
+	bool _inputScriptLoaded;
+
+	void loadInputScript();
+	void feedScriptedInput();
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост, см. debug-bridge.h.
+	// Поднимается, если в конфиге есть ключ debugbridge_port.
+	DebugBridge *_debugBridge;
 
 	// game-quirks.cpp
 	bool lingoOpenWrapper(const char *target, Common::Platform platform, const Common::String &whichApplication, const Common::String &whichDocument);
