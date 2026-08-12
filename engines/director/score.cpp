@@ -521,6 +521,16 @@ void Score::updateCurrentFrame() {
 		// This is mostly a no-op, however any sprite changes for
 		// non-puppet sprites will be reverted.
 
+		// Auto-puppet has to be released here as well. Above, on a frame change,
+		// the mask of the incoming frame decides what gets released; a frame that
+		// loops on itself overrides nothing, so that mask is empty. Yet the
+		// playhead did move, and by Director semantics that ends every temporary
+		// property override on a non-puppet sprite. Without this a sprite property
+		// set from Lingo sticks for good, and a looping frame keeps applying its
+		// changes on top of the previous ones instead of starting from the score.
+		for (uint ch = 0; ch < _channels.size(); ch++)
+			_channels[ch]->_sprite->releaseAutoPuppet(0xffffffff);
+
 		// If playback has been paused on a frame, the sprites aren't cleaned.
 		updateSprites(kRenderModeNormal, true);
 
