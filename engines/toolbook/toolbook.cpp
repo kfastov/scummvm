@@ -76,12 +76,9 @@ Common::Error ToolBookEngine::run() {
 		classes += _book->classNames()[i] + " ";
 	debug(1, "ToolBook: классы объектов: %s", classes.c_str());
 
-	for (uint i = 0; i < _book->images().size(); i++) {
-		if (_book->images()[i].raw)
-			_rawImages.push_back(i);
-	}
-	debug(0, "ToolBook: картинок, которые разворачиваются: %u из %u",
-			_rawImages.size(), _book->images().size());
+	for (uint i = 0; i < _book->images().size(); i++)
+		_rawImages.push_back(i);
+	debug(0, "ToolBook: картинок: %u", _rawImages.size());
 
 	showPage(0);
 
@@ -178,7 +175,7 @@ void ToolBookEngine::showPage(int index) {
 	bool drawn = false;
 	if (page.background >= 0) {
 		Graphics::Palette palette(256);
-		Graphics::Surface *img = _book->decodeImage(_book->images()[page.background], palette);
+		Graphics::Surface *img = _book->decodeImage(const_cast<Image &>(_book->images()[page.background]), palette);
 		if (img) {
 			if (img->format.isCLUT8())
 				_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
@@ -216,7 +213,7 @@ void ToolBookEngine::showImage(int index) {
 	if (index < 0 || index >= (int)_rawImages.size())
 		return;
 
-	const Image &img = _book->images()[_rawImages[index]];
+	Image &img = const_cast<Image &>(_book->images()[_rawImages[index]]);
 	Graphics::Palette palette(256);
 	Graphics::Surface *surf = _book->decodeImage(img, palette);
 
@@ -269,7 +266,7 @@ void ToolBookEngine::drawPageInfo(Graphics::Surface *screen, int index, const Pa
 	if (page.background >= 0) {
 		const Image &img = _book->images()[page.background];
 		font->drawString(screen, Common::String::format(
-				"fon %dx%d %d bit - szhat, ne razobran", img.width, img.height, img.depth),
+				"fon %dx%d %d bit - dannye ne naydeny", img.width, img.height, img.depth),
 				20, y, screen->w - 40, grey);
 	} else {
 		font->drawString(screen, "fon ne nayden", 20, y, screen->w - 40, grey);
