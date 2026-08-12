@@ -1,0 +1,532 @@
+diff --git a/backends/graphics/surfacesdl/surfacesdl-graphics.cpp b/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
+index 02abddf9..30eb45b0 100644
+--- a/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
++++ b/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
+@@ -1381,6 +1381,10 @@ void SurfaceSdlGraphicsManager::internUpdateScreen() {
+ 			dst.x += _maxExtraPixels;	// Shift rect since some scalers need to access the data around
+ 			dst.y += _maxExtraPixels;	// any pixel to scale it, and we want to avoid mem access crashes.
+ 
++			// ЛОКАЛЬНАЯ ПРАВКА: см. выше — под dummy поверхности могут отсутствовать.
++			if (!origSurf || !srcSurf)
++				continue;
++
+ 			if (!blitSurface(origSurf, r, srcSurf, &dst))
+ 				error("SDL_BlitSurface failed: %s", SDL_GetError());
+ 		}
+@@ -1980,6 +1984,13 @@ void SurfaceSdlGraphicsManager::clearOverlay() {
+ 	if (!_overlayVisible)
+ 		return;
+ 
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): под видеодрайвером dummy экранных
++	// поверхностей может не быть, а ронять весь прогон из-за оверлея незачем.
++	if (!_screen || !_tmpscreen) {
++		warning("clearOverlay(): нет поверхностей, пропускаю");
++		return;
++	}
++
+ 	// Clear the overlay by making the game screen "look through" everywhere.
+ 	SDL_Rect src, dst;
+ 	src.x = src.y = 0;
+@@ -2582,6 +2593,15 @@ void SurfaceSdlGraphicsManager::drawMouse() {
+ 	// Note that SDL_BlitSurface() and addDirtyRect() will both perform any
+ 	// clipping necessary
+ 
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): под видеодрайвером dummy экранной
++	// поверхности может не быть вовсе. Ронять весь движок из-за курсора в
++	// безоконном прогоне бессмысленно — курсор там всё равно никто не увидит.
++	if (!_mouseSurface || !_hwScreen) {
++		warning("drawMouse(): нет поверхности (mouse %p, screen %p), пропускаю",
++				(const void *)_mouseSurface, (const void *)_hwScreen);
++		return;
++	}
++
+ 	if (!blitSurface(_mouseSurface, nullptr, _hwScreen, &dst))
+ 		error("SDL_BlitSurface failed: %s", SDL_GetError());
+ }
+diff --git a/backends/modular-backend.cpp b/backends/modular-backend.cpp
+index 838ea16c..e13c3e6d 100644
+--- a/backends/modular-backend.cpp
++++ b/backends/modular-backend.cpp
+@@ -26,6 +26,7 @@
+ #include "backends/mixer/mixer.h"
+ #include "gui/EventRecorder.h"
+ 
++#include "common/config-manager.h"
+ #include "common/timer.h"
+ #include "graphics/pixelformat.h"
+ 
+@@ -197,6 +198,29 @@ void ModularGraphicsBackend::updateScreen() {
+ 
+ 	_graphicsManager->updateScreen();
+ 
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): периодический сброс кадра на диск.
++	// Нужен, чтобы гонять движок без окна (SDL_VIDEODRIVER=dummy) и всё равно
++	// видеть картинку: снять экран у хоста нечем, а штатный скриншот ScummVM
++	// висит на нажатии клавиши, которое посылать некуда.
++	// Период в миллисекундах задаётся ключом framedump_ms в scummvm.ini
++	// (getenv в ScummVM запрещён через common/forbidden.h).
++	{
++		// Значение перечитываем каждый кадр, а не кэшируем: первый updateScreen
++		// случается до того, как активируется секция игры в конфиге.
++		static uint32 lastFrameDump = 0;
++		int frameDumpPeriod = ConfMan.hasKey("framedump_ms") ? ConfMan.getInt("framedump_ms") : 0;
++
++		// Экран может быть ещё не инициализирован — снимать с него нечего,
++		// и SDL_BlitSurface ругается на невалидный src.
++		if (frameDumpPeriod > 0 && _graphicsManager->getWidth() > 0 && _graphicsManager->getHeight() > 0) {
++			uint32 now = g_system->getMillis();
++			if (now - lastFrameDump >= (uint32)frameDumpPeriod) {
++				lastFrameDump = now;
++				_graphicsManager->saveScreenshot();
++			}
++		}
++	}
++
+ #ifdef ENABLE_EVENTRECORDER
+ 	g_eventRec.postDrawOverlayGui();
+ #endif
+diff --git a/engines/director/castmember/digitalvideo.cpp b/engines/director/castmember/digitalvideo.cpp
+index 1f68611b..bf1f54bb 100644
+--- a/engines/director/castmember/digitalvideo.cpp
++++ b/engines/director/castmember/digitalvideo.cpp
+@@ -526,8 +526,15 @@ Graphics::MacWidget *DigitalVideoCastMember::createWidget(Common::Rect &bbox, Ch
+ 		}
+ 
+ 		if (frame->getPixels()) {
+-			// Video should have the dithering palette set, decode using whatever palette we have now
+-			_lastFrame = frame->convertTo(g_director->_pixelformat, _ditheringPalette);
++			// Video should have the dithering palette set, decode using whatever palette we have now.
++			// _ditheringPalette is a copy of the current game palette, so it is the destination of
++			// the conversion, not its source. Passing it as the source left the destination palette
++			// empty, and Surface::convertTo bails out on a truecolor frame with an 8-bit target.
++			const byte *srcPal = frame->format.bytesPerPixel == 1 ? _ditheringPalette : nullptr;
++			const byte *dstPal = g_director->_pixelformat.bytesPerPixel == 1 ? _ditheringPalette : nullptr;
++
++			_lastFrame = frame->convertTo(g_director->_pixelformat, srcPal, srcPal ? 256 : 0,
++					dstPal, dstPal ? 256 : 0, Graphics::kDitherNaive);
+ 		} else {
+ 			warning("DigitalVideoCastMember::createWidget(): frame has no pixel data");
+ 		}
+diff --git a/engines/director/channel.cpp b/engines/director/channel.cpp
+index 7587340a..90defa2d 100644
+--- a/engines/director/channel.cpp
++++ b/engines/director/channel.cpp
+@@ -535,6 +535,11 @@ void Channel::setClean(Sprite *nextSprite, bool partial) {
+ 		if (_sprite->_puppet || _sprite->_autoPuppet || (!nextSprite->isQDShape() && partial)) {
+ 			// Updating scripts, etc. does not require a full re-render
+ 			_sprite->_scriptId = nextSprite->_scriptId;
++			// Behaviours are script attachments just like the script id, and they
++			// have to come across here as well. Without them the channel keeps an
++			// empty list, respondsToMouse() returns false for D6 and later, and the
++			// sprite silently stops reacting to clicks while still drawing fine.
++			_sprite->_behaviors = nextSprite->_behaviors;
+ 		} else {
+ 			previousCastId = _sprite->_castId;
+ 			replaceSprite(nextSprite);
+diff --git a/engines/director/detection_tables.h b/engines/director/detection_tables.h
+index cb294329..8d14cd0c 100644
+--- a/engines/director/detection_tables.h
++++ b/engines/director/detection_tables.h
+@@ -1543,6 +1543,7 @@ static const PlainGameDescriptor directorGames[] = {
+ 	{ "pyatachok3",			"Пятачок в Затерянном мире" },				   // Pong-Pong's Learning Adventure: The Lost World
+ 	{ "pyatachok4",			"Пятачок: Назад в будущее" },				   // Pong-Pong's Learning Adventure: Back to the Future
+ 	{ "pyatachok5",			"Пятачок сдает экзамен по Анатомии" },		   // Pong-Pong's Learning Adventure: Mysteries of Human Body
++	{ "sevenwitches",		"Семь ведьм и заколдованный принц" },		   // Sieben Hexen und der verzauberte Prinz (Tivola)
+ 	{ "tchaik",				"Пётр Ильи́ч Чайко́вский: Жизнь и творчество" }, // Pyotr Ilyich Tchaikovsky: Life and Work
+ 	{ "tutti",				"Волшебные истории Тутти" },				   // Tutti's Magical Stories
+ 
+@@ -8445,6 +8446,10 @@ static const DirectorGameDescription gameDescriptions[] = {
+ 	MACGAME1("catseyeview", "Vol. 7", "Cat'sEyeView7", "55d01cca925752c170ac1e9c01d1f87e", 1030462, 601),
+ 	WINGAME1t("catseyeview", "Vol. 7", "Cat'sEyeView7.exe", "1c8ec55a7a65ba13890697e0e92670a5", 6017657, 600),
+ 
++	// Russian release by Buka of the Tivola title
++	// "Sieben Hexen und der verzauberte Prinz"
++	WINGAME1_l("sevenwitches", "", "Prince.exe", "t:0e1975bcf5c000ce3d55e864fc0d8c05", 1851314, Common::RU_RUS, 600),
++
+ 	// German title is "Hexentanz und Firlefanz", published by Tivola
+ 	// Bilingual English/German
+ 	MACGAME1("catshats", "", "Cats and Hats", "r:cc27aab06406e53f53bcf7efd154ac1c", 1033729, 602),
+diff --git a/engines/director/director.cpp b/engines/director/director.cpp
+index 845b1727..ce434a13 100644
+--- a/engines/director/director.cpp
++++ b/engines/director/director.cpp
+@@ -108,6 +108,9 @@ DirectorEngine::DirectorEngine(OSystem *syst, const DirectorGameDescription *gam
+ 	_loadSlowdownCooldownTime = 0;
+ 	_fileIOType = 0;
+ 	_vfwPaletteHack = false;
++	_cdDriveLetter = 0;
++	_inputScriptPos = 0;
++	_inputScriptLoaded = false;
+ 
+ 	_key = 0;
+ 	_keyCode = 0;
+diff --git a/engines/director/director.h b/engines/director/director.h
+index a454b81d..ab748cbc 100644
+--- a/engines/director/director.h
++++ b/engines/director/director.h
+@@ -251,6 +251,27 @@ public:
+ 	int getMacTicks();
+ 	Common::Array<Common::Event> _injectedEvents;
+ 
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных прогонов.
++	// Путь к файлу задаётся ключом inputscript в конфиге, строки вида
++	//   1500 click 232 215
++	//   4000 key 27
++	// где первое число — миллисекунды от старта движка. Нужен, чтобы прогон по
++	// игре был воспроизводимым и снимал одни и те же эталонные кадры.
++	enum ScriptedInputAction { kActionPress, kActionRelease, kActionKey, kActionSpriteEvent };
++
++	struct ScriptedInput {
++		uint32 timeMs;
++		ScriptedInputAction action;
++		int x, y;
++		int code;
++	};
++	Common::Array<ScriptedInput> _inputScript;
++	uint _inputScriptPos;
++	bool _inputScriptLoaded;
++
++	void loadInputScript();
++	void feedScriptedInput();
++
+ 	// game-quirks.cpp
+ 	bool lingoOpenWrapper(const char *target, Common::Platform platform, const Common::String &whichApplication, const Common::String &whichDocument);
+ 	void gameQuirks(const char *target, Common::Platform platform);
+@@ -309,6 +330,11 @@ public:
+ 	uint32 _loadSlowdownCooldownTime;
+ 	int _fileIOType;
+ 	bool _vfwPaletteHack;
++	// Буква диска, которую игре разрешено считать компакт-диском. Игры, ищущие
++	// свой диск перебором букв, останавливаются на первой подошедшей — и попадают
++	// на C:, куда FileIO даёт писать, после чего решают, что это винчестер.
++	// Ноль — обход выключен.
++	char _cdDriveLetter;
+ 
+ 	uint16 _key;
+ 	int _keyCode;
+diff --git a/engines/director/events.cpp b/engines/director/events.cpp
+index f8437569..bd44627e 100644
+--- a/engines/director/events.cpp
++++ b/engines/director/events.cpp
+@@ -19,7 +19,10 @@
+  *
+  */
+ 
++#include "common/config-manager.h"
+ #include "common/events.h"
++#include "common/fs.h"
++#include "common/tokenizer.h"
+ #include "common/keyboard.h"
+ #include "common/system.h"
+ #include "common/translation.h"
+@@ -43,7 +46,122 @@ namespace Director {
+ 
+ int DirectorEngine::getMacTicks() { return (int)(g_system->getMillis() * 60 / 1000.) - _tickBaseline; }
+ 
++void DirectorEngine::loadInputScript() {
++	_inputScriptLoaded = true;
++
++	if (!ConfMan.hasKey("inputscript"))
++		return;
++
++	Common::FSNode node(ConfMan.getPath("inputscript"));
++	Common::SeekableReadStream *stream = node.createReadStream();
++	if (!stream) {
++		warning("loadInputScript(): не открывается %s", ConfMan.get("inputscript").c_str());
++		return;
++	}
++
++	while (!stream->eos()) {
++		Common::String line = stream->readLine();
++		line.trim();
++		if (line.empty() || line[0] == '#')
++			continue;
++
++		Common::StringTokenizer tok(line);
++		ScriptedInput in;
++		in.timeMs = atoi(tok.nextToken().c_str());
++		Common::String kind = tok.nextToken();
++
++		if (kind.equalsIgnoreCase("click")) {
++			in.x = atoi(tok.nextToken().c_str());
++			in.y = atoi(tok.nextToken().c_str());
++			in.code = 0;
++
++			// Клик разворачиваем в нажатие и отпускание, разнесённые во времени:
++			// Director опрашивает состояние мыши в своём цикле, и нажатие длиной
++			// в один тик он просто не замечает.
++			in.action = kActionPress;
++			_inputScript.push_back(in);
++			in.action = kActionRelease;
++			in.timeMs += 300;
++			_inputScript.push_back(in);
++			continue;
++		}
++
++		if (kind.equalsIgnoreCase("sprite")) {
++			// Прямой вызов обработчика спрайта, мимо попадания и тайминга:
++			// "<мс> sprite <номер> <mouseUp|mouseDown>". Нужен, чтобы проверять
++			// логику игры, не угадывая момент и точку клика.
++			in.action = kActionSpriteEvent;
++			in.x = atoi(tok.nextToken().c_str());
++			Common::String ev = tok.nextToken();
++			in.code = ev.equalsIgnoreCase("mouseDown") ? kEventMouseDown : kEventMouseUp;
++			in.y = 0;
++			_inputScript.push_back(in);
++			continue;
++		}
++
++		in.action = kActionKey;
++		in.x = in.y = 0;
++		in.code = atoi(tok.nextToken().c_str());
++		_inputScript.push_back(in);
++	}
++	delete stream;
++
++	debug("loadInputScript(): загружено событий: %d", _inputScript.size());
++}
++
++void DirectorEngine::feedScriptedInput() {
++	if (!_inputScriptLoaded)
++		loadInputScript();
++
++	while (_inputScriptPos < _inputScript.size() &&
++			_inputScript[_inputScriptPos].timeMs <= g_system->getMillis()) {
++		const ScriptedInput &in = _inputScript[_inputScriptPos++];
++		Common::Event ev;
++
++		// Кладём события в сам менеджер, а не в _injectedEvents: Lingo читает
++		// положение и кнопки мыши напрямую через getMousePos/getButtonState,
++		// и события в обход менеджера для игры просто не существуют.
++		Common::EventManager *eventMan = g_system->getEventManager();
++
++		if (in.action == kActionSpriteEvent) {
++			Movie *movie = g_director->getCurrentMovie();
++			if (movie) {
++				debug("feedScriptedInput(): событие %d спрайту %d", in.code, in.x);
++				movie->processEvent((LEvent)in.code, in.x);
++			} else {
++				warning("feedScriptedInput(): фильма нет, событие спрайту %d пропущено", in.x);
++			}
++			continue;
++		}
++
++		if (in.action == kActionPress) {
++			ev.mouse = Common::Point(in.x, in.y);
++			ev.type = Common::EVENT_MOUSEMOVE;
++			eventMan->pushEvent(ev);
++			ev.type = Common::EVENT_LBUTTONDOWN;
++			eventMan->pushEvent(ev);
++			debug("feedScriptedInput(): нажатие в (%d, %d)", in.x, in.y);
++		} else if (in.action == kActionRelease) {
++			ev.mouse = Common::Point(in.x, in.y);
++			ev.type = Common::EVENT_MOUSEMOVE;
++			eventMan->pushEvent(ev);
++			ev.type = Common::EVENT_LBUTTONUP;
++			eventMan->pushEvent(ev);
++			debug("feedScriptedInput(): отпускание в (%d, %d)", in.x, in.y);
++		} else {
++			ev.type = Common::EVENT_KEYDOWN;
++			ev.kbd = Common::KeyState((Common::KeyCode)in.code, in.code);
++			eventMan->pushEvent(ev);
++			ev.type = Common::EVENT_KEYUP;
++			eventMan->pushEvent(ev);
++			debug("feedScriptedInput(): клавиша %d", in.code);
++		}
++	}
++}
++
+ bool DirectorEngine::pollEvent(Common::Event &event) {
++	feedScriptedInput();
++
+ 	// used by UnitTest XObject
+ 	if (!_injectedEvents.empty()) {
+ 		event = _injectedEvents.remove_at(0);
+diff --git a/engines/director/game-quirks.cpp b/engines/director/game-quirks.cpp
+index 4ed09bbf..10aafd23 100644
+--- a/engines/director/game-quirks.cpp
++++ b/engines/director/game-quirks.cpp
+@@ -107,6 +107,13 @@ struct CachedFile {
+ 		"INSTALL.INF",
+ 			(const byte *)"CDDrive=D:\\\r\nSourcePath=D:\\\r\nDestPath=C:\\", -1
+ 	},
++	{"sevenwitches", Common::kPlatformWindows,
++		// The startup script reads the location of its preferences file from
++		// hexen.ini in the Windows directory. Without that file it takes the
++		// "installation damaged" branch, and the save state never gets loaded.
++		"WINDOWS/hexen.ini",
++		(const byte *)"[Hexen]\r\npath=C:\\\r\n", -1
++	},
+ 	{"tkkg1", Common::kPlatformWindows,
+ 		// TKKG1 checks a file to determine the location of the CD.
+ 		"PATH.INI",
+@@ -239,6 +246,16 @@ static void quirkForceFileIOXtra() {
+ 	g_director->_fileIOType = kXtraObj;
+ }
+ 
++static void quirkSevenWitches() {
++	// Стартовый скрипт ищет свой компакт-диск, перебирая буквы дисков от C до Z,
++	// и останавливается на первой, где лежит нужный каталог. У нас подходит любая,
++	// то есть игра выбирает C:. Дальше она проверяет носитель на запись: если файл
++	// удалось создать, значит это винчестер, а не компакт-диск, и путь сбрасывается.
++	// FileIO уже изображает диск E:\ доступным только для чтения — остаётся привести
++	// игру к нему.
++	g_director->_cdDriveLetter = 'E';
++}
++
+ static void quirkVideoForWindowsPalette() {
+ 	g_director->_vfwPaletteHack = true;
+ }
+@@ -320,6 +337,11 @@ const struct Quirk {
+ 	{ "warlock", Common::kPlatformMacintosh, &quirkWarlock },
+ 	{ "warlock", Common::kPlatformWindows, &quirkWarlock },
+ 
++	// Seven Witches scans drive letters for its CD and stops at the first hit,
++	// which lands it on C:. It then rejects the medium because it is writable.
++	// Point the scan at E:, which FileIO already treats as a read-only CD.
++	{ "sevenwitches", Common::kPlatformWindows, &quirkSevenWitches },
++
+ 	// Eastern Mind sets the score to play back at a high frame rate,
+ 	// however the developers were using slow hardware, so some
+ 	// animations play back much faster than intended.
+diff --git a/engines/director/lingo/lingo-builtins.cpp b/engines/director/lingo/lingo-builtins.cpp
+index 10925e4c..4a2ae4e5 100644
+--- a/engines/director/lingo/lingo-builtins.cpp
++++ b/engines/director/lingo/lingo-builtins.cpp
+@@ -1658,6 +1658,16 @@ void LB::b_getNthFileNameInFolder(int nargs) {
+ 		return;
+ 	}
+ 
++	// Games that hunt for their CD by walking the drive letters stop at the first
++	// one that answers, and every letter answers here, so they settle on C: and
++	// then reject it as writable. A quirk names the letter FileIO already treats
++	// as a read-only CD; make the other letters look empty.
++	if (g_director->_cdDriveLetter && pathRaw.size() >= 2 && pathRaw[1] == ':' &&
++			toupper(pathRaw[0]) != g_director->_cdDriveLetter) {
++		g_lingo->push(Datum(""));
++		return;
++	}
++
+ 	// getNthFileNameInFolder requires an absolute path as an input.
+ 	// relative paths will not match anything.
+ 	Common::Path path = findAbsolutePath(pathRaw, true);
+@@ -1705,9 +1715,13 @@ void LB::b_getNthFileNameInFolder(int nargs) {
+ 	if (!fileNameList.empty() && (uint)fileNum < fileNameList.size()) {
+ 		// Sort files alphabetically
+ 		Common::sort(fileNameList.begin(), fileNameList.end());
++
+ 		r = Datum(fileNameList[fileNum]);
+ 	}
+ 
++	debugC(3, kDebugLingoExec, "b_getNthFileNameInFolder(%s, %d): %s",
++			pathRaw.c_str(), fileNum + 1, r.asString().c_str());
++
+ 	g_lingo->push(r);
+ }
+ 
+diff --git a/engines/director/lingo/xlibs/f/fileio.cpp b/engines/director/lingo/xlibs/f/fileio.cpp
+index 76a2cccf..0bbee0a8 100644
+--- a/engines/director/lingo/xlibs/f/fileio.cpp
++++ b/engines/director/lingo/xlibs/f/fileio.cpp
+@@ -396,7 +396,11 @@ void FileIO::m_openFile(int nargs) {
+ 	Common::String option;
+ 	switch (mode) {
+ 	case 0:
+-		option = "append";
++		// Mode 0 is read/write in the FileIO Xtra, and we can only do one at a
++		// time. Reading has to win: mapping it to append made opening a missing
++		// file succeed, so a game reading its config back always got an empty
++		// string instead of taking its own "file is not there" branch.
++		option = "read";
+ 		break;
+ 	case 1:
+ 		option = "read";
+@@ -758,6 +762,11 @@ void FileIO::m_delete(int nargs) {
+ // Non-standard extensions
+ XOBJSTUBNR(FileIO::m_setOverrideDrive)
+ 
+-XOBJSTUB(FileIO::m_getOSDirectory, "")
++void FileIO::m_getOSDirectory(int nargs) {
++	// Was a stub returning an empty string, which left games building paths like
++	// "\\config.ini" and looking for them in the wrong place.
++	g_lingo->push(Datum(g_director->getPlatform() == Common::kPlatformWindows
++			? "C:\\WINDOWS" : "System Folder"));
++}
+ 
+ } // End of namespace Director
+diff --git a/engines/director/score.cpp b/engines/director/score.cpp
+index f8040863..2952358e 100644
+--- a/engines/director/score.cpp
++++ b/engines/director/score.cpp
+@@ -521,6 +521,16 @@ void Score::updateCurrentFrame() {
+ 		// This is mostly a no-op, however any sprite changes for
+ 		// non-puppet sprites will be reverted.
+ 
++		// Auto-puppet has to be released here as well. Above, on a frame change,
++		// the mask of the incoming frame decides what gets released; a frame that
++		// loops on itself overrides nothing, so that mask is empty. Yet the
++		// playhead did move, and by Director semantics that ends every temporary
++		// property override on a non-puppet sprite. Without this a sprite property
++		// set from Lingo sticks for good, and a looping frame keeps applying its
++		// changes on top of the previous ones instead of starting from the score.
++		for (uint ch = 0; ch < _channels.size(); ch++)
++			_channels[ch]->_sprite->releaseAutoPuppet(0xffffffff);
++
+ 		// If playback has been paused on a frame, the sprites aren't cleaned.
+ 		updateSprites(kRenderModeNormal, true);
+ 
+@@ -1682,6 +1692,17 @@ uint16 Score::getSpriteIDFromPos(Common::Point pos) {
+ uint16 Score::getMouseSpriteIDFromPos(Common::Point pos) {
+ 	for (int i = _channels.size() - 1; i >= 0; i--) {
+ 		CollisionTest test = _channels[i]->isMouseIn(pos);
++
++		if (debugChannelSet(5, kDebugEvents)) {
++			const Common::Rect bbox = _channels[i]->getBbox();
++			const Common::Point scorePos = _currentFrame->_sprites[i]->getPosition();
++			debugC(5, kDebugEvents, "  канал %d: bbox (%d,%d)-(%d,%d) в партитуре (%d,%d) puppet %d/%d тест %d отвечает %d",
++					i, bbox.left, bbox.top, bbox.right, bbox.bottom,
++					scorePos.x, scorePos.y,
++					_channels[i]->_sprite->_puppet, _channels[i]->_sprite->_autoPuppet,
++					test, _channels[i]->_sprite->respondsToMouse());
++		}
++
+ 		if (test == kCollisionYes && _channels[i]->_sprite->respondsToMouse())
+ 			return i;
+ 		else if (test == kCollisionHole)
+diff --git a/engines/director/sprite.cpp b/engines/director/sprite.cpp
+index cd001b88..cd2ed5f3 100644
+--- a/engines/director/sprite.cpp
++++ b/engines/director/sprite.cpp
+@@ -485,6 +485,12 @@ void Sprite::releaseAutoPuppet(uint32 copyBackMask) {
+ 		{ kAPBackColor, kSCBBackColor },
+ 		{ kAPCast,      kSCBCastId },
+ 		{ kAPLoc,       kSCBStartPoint },
++		// locH and locV were missing here, so a sprite moved from Lingo along a
++		// single axis kept its auto-puppet forever and the score never restored
++		// its position. A frame that loops on itself then applies its movement
++		// again on every pass, and the sprite drifts away for good.
++		{ kAPLocH,      kSCBStartPoint },
++		{ kAPLocV,      kSCBStartPoint },
+ 		{ kAPHeight,    kSCBCastId | kSCBHeight },
+ 		{ kAPWidth,     kSCBCastId | kSCBWidth },
+ 		{ kAPMoveable,  kSCBMoveable }
+diff --git a/engines/director/window.cpp b/engines/director/window.cpp
+index 76fc57aa..e7b3d5cf 100644
+--- a/engines/director/window.cpp
++++ b/engines/director/window.cpp
+@@ -602,7 +602,14 @@ bool Window::loadNextMovie() {
+ 	_soundManager->changingMovie();
+ 	_newMovieStarted = true;
+ 	_newMovieFirstDraw = true;
+-	_currentPath = Common::firstPathComponents(_nextMovie.movie, g_director->_dirSeparator);
++	// Имя фильма без каталога ищется относительно текущей папки, и она должна
++	// сохраниться: игры строят от неё все свои пути ("the pathName & что-то").
++	// Безусловное присваивание затирало её пустой строкой, и после перехода вида
++	// `go movie "LogIn"` игра теряла свой каталог со всем содержимым — озвучкой,
++	// соседними фильмами — и подвисала в скриптах, которые этот путь разбирают.
++	Common::String nextPath = Common::firstPathComponents(_nextMovie.movie, g_director->_dirSeparator);
++	if (!nextPath.empty())
++		_currentPath = nextPath;
+ 
+ 	Common::Path archivePath = Common::Path(_currentPath, g_director->_dirSeparator);
+ 	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
