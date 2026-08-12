@@ -243,7 +243,9 @@ class Bridge:
         reply = json.loads(raw.decode("utf-8", "replace"))
         if not reply.get("ok", False):
             raise BridgeError(reply.get("out", "мост ответил отказом"))
-        return reply.get("out", "")
+        # Исходники Lingo хранятся с \r в конце строк — на терминале это
+        # затирание строки поверх предыдущей.
+        return reply.get("out", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def command(line: str, port: int | None = None) -> str:
