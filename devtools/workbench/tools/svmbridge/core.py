@@ -80,13 +80,30 @@ def start(
     audio: bool = False,
     log: str = "bridge-run.log",
     wait: float = 25.0,
+    attempts: int = 3,
 ) -> RunState:
     """Поднимает движок вслепую и ждёт, пока мост начнёт отвечать.
 
     Возврат — состояние прогона. Если мост не ответил за `wait` секунд, процесс
     убивается и поднимается BridgeError с хвостом лога: молча возвращать
     «вроде запустилось» нельзя, это ровно та ошибка, на которой легко потерять час.
+
+    Безоконный режим изредка не поднимается вовсе: лог обрывается сразу после
+    инициализации звука, ошибок нет — похоже на гонку при создании поверхностей
+    в драйвере dummy. Лечится повтором, поэтому `attempts`.
     """
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _start_once(target, port, debuglevel, debugflags, framedump_ms,
+                               dump_lingo, audio, log, wait)
+        except BridgeError as err:
+            last = err
+    raise BridgeError(f"движок не поднялся за {attempts} попыт(ки): {last}")
+
+
+def _start_once(target, port, debuglevel, debugflags, framedump_ms,
+                dump_lingo, audio, log, wait) -> RunState:
     if not SCUMMVM.exists():
         raise BridgeError(f"нет сборки ScummVM: {SCUMMVM}")
 
