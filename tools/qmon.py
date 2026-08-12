@@ -123,6 +123,13 @@ def qmp_click(x: int, y: int, double: bool = False, button: str = "left") -> Non
     qmp(events)
 
 
+# Windows домножает относительные сдвиги на скорость указателя. В снимке
+# clean-desktop она стоит по умолчанию, и каждый сдвиг удваивается: запрос
+# (300,197) уводил курсор в (610,400). Проверено по кадру с видимым курсором.
+# Если применить guest-tools/NOACCEL.REG (MouseSpeed=0), коэффициент станет 1.
+MOUSE_SCALE = float(os.environ.get("QMON_MOUSE_SCALE", "2"))
+
+
 def mouse_to(x: int, y: int) -> None:
     """Поставить курсор в (x, y) экрана гостя.
 
@@ -135,6 +142,8 @@ def mouse_to(x: int, y: int) -> None:
     """
     # В пакет PS/2 влезает сдвиг в пределах ±255, поэтому в угол прижимаемся
     # не одним рывком, а серией — с запасом на 1024 пикселя по каждой оси.
+    x = int(round(x / MOUSE_SCALE))
+    y = int(round(y / MOUSE_SCALE))
     step = 4
     cmds = ["mouse_set 2"] + ["mouse_move -200 -200"] * 12
     for _ in range(x // step):
