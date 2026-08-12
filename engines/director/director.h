@@ -309,6 +309,11 @@ public:
 	uint32 _loadSlowdownCooldownTime;
 	int _fileIOType;
 	bool _vfwPaletteHack;
+	// Буква диска, которую игре разрешено считать компакт-диском. Игры, ищущие
+	// свой диск перебором букв, останавливаются на первой подошедшей — и попадают
+	// на C:, куда FileIO даёт писать, после чего решают, что это винчестер.
+	// Ноль — обход выключен.
+	char _cdDriveLetter;
 
 	uint16 _key;
 	int _keyCode;

@@ -107,6 +107,13 @@ struct CachedFile {
 		"INSTALL.INF",
 			(const byte *)"CDDrive=D:\\\r\nSourcePath=D:\\\r\nDestPath=C:\\", -1
 	},
+	{"sevenwitches", Common::kPlatformWindows,
+		// The startup script reads the location of its preferences file from
+		// hexen.ini in the Windows directory. Without that file it takes the
+		// "installation damaged" branch, and the save state never gets loaded.
+		"WINDOWS/hexen.ini",
+		(const byte *)"[Hexen]\r\npath=C:\\\r\n", -1
+	},
 	{"tkkg1", Common::kPlatformWindows,
 		// TKKG1 checks a file to determine the location of the CD.
 		"PATH.INI",
@@ -239,6 +246,16 @@ static void quirkForceFileIOXtra() {
 	g_director->_fileIOType = kXtraObj;
 }
 
+static void quirkSevenWitches() {
+	// Стартовый скрипт ищет свой компакт-диск, перебирая буквы дисков от C до Z,
+	// и останавливается на первой, где лежит нужный каталог. У нас подходит любая,
+	// то есть игра выбирает C:. Дальше она проверяет носитель на запись: если файл
+	// удалось создать, значит это винчестер, а не компакт-диск, и путь сбрасывается.
+	// FileIO уже изображает диск E:\ доступным только для чтения — остаётся привести
+	// игру к нему.
+	g_director->_cdDriveLetter = 'E';
+}
+
 static void quirkVideoForWindowsPalette() {
 	g_director->_vfwPaletteHack = true;
 }
@@ -319,6 +336,11 @@ const struct Quirk {
 	// transition which would otherwise get skipped past.
 	{ "warlock", Common::kPlatformMacintosh, &quirkWarlock },
 	{ "warlock", Common::kPlatformWindows, &quirkWarlock },
+
+	// Seven Witches scans drive letters for its CD and stops at the first hit,
+	// which lands it on C:. It then rejects the medium because it is writable.
+	// Point the scan at E:, which FileIO already treats as a read-only CD.
+	{ "sevenwitches", Common::kPlatformWindows, &quirkSevenWitches },
 
 	// Eastern Mind sets the score to play back at a high frame rate,
 	// however the developers were using slow hardware, so some
