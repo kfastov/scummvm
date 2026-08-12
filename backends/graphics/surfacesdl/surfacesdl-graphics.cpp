@@ -1370,7 +1370,11 @@ void SurfaceSdlGraphicsManager::internUpdateScreen() {
 #if SDL_VERSION_ATLEAST(2, 0, 0)
 	bool doPresent = false;
 #endif
-	if (actualDirtyRects > 0 || _cursorNeedsRedraw) {
+	// The SDL dummy video driver can leave the display surfaces unavailable
+	// during the first graphics transaction.  Skip that transaction as a
+	// whole: guarding only the blit below still lets SDL_LockSurface(nullptr)
+	// crash before the engine is created.
+	if ((actualDirtyRects > 0 || _cursorNeedsRedraw) && origSurf && srcSurf && _hwScreen) {
 		SDL_Rect *r;
 		SDL_Rect dst;
 		uint32 bpp, srcPitch, dstPitch;
@@ -1980,6 +1984,13 @@ void SurfaceSdlGraphicsManager::clearOverlay() {
 	if (!_overlayVisible)
 		return;
 
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): под видеодрайвером dummy экранных
+	// поверхностей может не быть, а ронять весь прогон из-за оверлея незачем.
+	if (!_screen || !_tmpscreen) {
+		warning("clearOverlay(): нет поверхностей, пропускаю");
+		return;
+	}
+
 	// Clear the overlay by making the game screen "look through" everywhere.
 	SDL_Rect src, dst;
 	src.x = src.y = 0;
@@ -2581,6 +2592,15 @@ void SurfaceSdlGraphicsManager::drawMouse() {
 
 	// Note that SDL_BlitSurface() and addDirtyRect() will both perform any
 	// clipping necessary
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): под видеодрайвером dummy экранной
+	// поверхности может не быть вовсе. Ронять весь движок из-за курсора в
+	// безоконном прогоне бессмысленно — курсор там всё равно никто не увидит.
+	if (!_mouseSurface || !_hwScreen) {
+		warning("drawMouse(): нет поверхности (mouse %p, screen %p), пропускаю",
+				(const void *)_mouseSurface, (const void *)_hwScreen);
+		return;
+	}
 
 	if (!blitSurface(_mouseSurface, nullptr, _hwScreen, &dst))
 		error("SDL_BlitSurface failed: %s", SDL_GetError());
