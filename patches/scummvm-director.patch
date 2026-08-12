@@ -108,10 +108,10 @@ index 1f68611b..bf1f54bb 100644
  			warning("DigitalVideoCastMember::createWidget(): frame has no pixel data");
  		}
 diff --git a/engines/director/channel.cpp b/engines/director/channel.cpp
-index 7587340a..90defa2d 100644
+index 7587340a..2a7e4c21 100644
 --- a/engines/director/channel.cpp
 +++ b/engines/director/channel.cpp
-@@ -535,6 +535,11 @@ void Channel::setClean(Sprite *nextSprite, bool partial) {
+@@ -535,6 +535,25 @@ void Channel::setClean(Sprite *nextSprite, bool partial) {
  		if (_sprite->_puppet || _sprite->_autoPuppet || (!nextSprite->isQDShape() && partial)) {
  			// Updating scripts, etc. does not require a full re-render
  			_sprite->_scriptId = nextSprite->_scriptId;
@@ -120,6 +120,20 @@ index 7587340a..90defa2d 100644
 +			// empty list, respondsToMouse() returns false for D6 and later, and the
 +			// sprite silently stops reacting to clicks while still drawing fine.
 +			_sprite->_behaviors = nextSprite->_behaviors;
++
++			// D6 splits a sprite into spans, and the score hands out a fresh sprite
++			// list entry whenever the playhead crosses into the next one. That entry
++			// carries the frame range the behaviors live in. Keeping the old range
++			// here means createScriptInstances() never sees the channel as being
++			// inside its span, so no behavior is ever instantiated: the sprite draws,
++			// reports that it responds to the mouse, and still gets no mouseUp,
++			// because in D6 events are dispatched per instantiated behavior.
++			if (g_director->getVersion() >= 600) {
++				_sprite->_spriteListIdx = nextSprite->_spriteListIdx;
++				_sprite->_spriteInfo = nextSprite->_spriteInfo;
++				_startFrame = _sprite->_spriteInfo.startFrame;
++				_endFrame = _sprite->_spriteInfo.endFrame;
++			}
  		} else {
  			previousCastId = _sprite->_castId;
  			replaceSprite(nextSprite);
@@ -147,24 +161,66 @@ index cb294329..8d14cd0c 100644
  	// Bilingual English/German
  	MACGAME1("catshats", "", "Cats and Hats", "r:cc27aab06406e53f53bcf7efd154ac1c", 1033729, 602),
 diff --git a/engines/director/director.cpp b/engines/director/director.cpp
-index 845b1727..ce434a13 100644
+index 845b1727..d0375ed0 100644
 --- a/engines/director/director.cpp
 +++ b/engines/director/director.cpp
-@@ -108,6 +108,9 @@ DirectorEngine::DirectorEngine(OSystem *syst, const DirectorGameDescription *gam
+@@ -31,6 +31,7 @@
+ 
+ #include "director/director.h"
+ #include "director/debugger.h"
++#include "director/debug-bridge.h"
+ #include "director/archive.h"
+ #include "director/cast.h"
+ #include "director/movie.h"
+@@ -108,6 +109,10 @@ DirectorEngine::DirectorEngine(OSystem *syst, const DirectorGameDescription *gam
  	_loadSlowdownCooldownTime = 0;
  	_fileIOType = 0;
  	_vfwPaletteHack = false;
 +	_cdDriveLetter = 0;
 +	_inputScriptPos = 0;
 +	_inputScriptLoaded = false;
++	_debugBridge = nullptr;
  
  	_key = 0;
  	_keyCode = 0;
+@@ -180,6 +185,7 @@ DirectorEngine::~DirectorEngine() {
+ 
+ 	delete _surface;
+ 	delete _primitives;
++	delete _debugBridge;
+ }
+ 
+ Movie *DirectorEngine::getCurrentMovie() const { return _currentWindow->getCurrentMovie(); }
+@@ -301,6 +307,16 @@ Common::Error DirectorEngine::run() {
+ 	_wm = new Graphics::MacWindowManager(_wmMode, &_director3QuickDrawPatterns, getLanguage(), _pixelformat);
+ 	_wm->setEngine(this);
+ 
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост. Поднимаем до загрузки
++	// фильма, чтобы можно было расспрашивать движок с самого начала прогона.
++	if (ConfMan.hasKey("debugbridge_port")) {
++		_debugBridge = new DebugBridge();
++		if (!_debugBridge->listen(ConfMan.getInt("debugbridge_port"))) {
++			delete _debugBridge;
++			_debugBridge = nullptr;
++		}
++	}
++
+ 	gameQuirks(_gameDescription->desc.gameId, _gameDescription->desc.platform);
+ 	// Mix in all the saved files for the current target
+ 	// Assign higher priority to save games to load them before original game files
 diff --git a/engines/director/director.h b/engines/director/director.h
-index a454b81d..ab748cbc 100644
+index a454b81d..cf68812a 100644
 --- a/engines/director/director.h
 +++ b/engines/director/director.h
-@@ -251,6 +251,27 @@ public:
+@@ -56,6 +56,7 @@ class Archive;
+ class MacArchive;
+ class Cast;
+ class Debugger;
++class DebugBridge;
+ class DirectorSound;
+ class Lingo;
+ class Movie;
+@@ -251,6 +252,31 @@ public:
  	int getMacTicks();
  	Common::Array<Common::Event> _injectedEvents;
  
@@ -189,10 +245,14 @@ index a454b81d..ab748cbc 100644
 +	void loadInputScript();
 +	void feedScriptedInput();
 +
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост, см. debug-bridge.h.
++	// Поднимается, если в конфиге есть ключ debugbridge_port.
++	DebugBridge *_debugBridge;
++
  	// game-quirks.cpp
  	bool lingoOpenWrapper(const char *target, Common::Platform platform, const Common::String &whichApplication, const Common::String &whichDocument);
  	void gameQuirks(const char *target, Common::Platform platform);
-@@ -309,6 +330,11 @@ public:
+@@ -309,6 +335,11 @@ public:
  	uint32 _loadSlowdownCooldownTime;
  	int _fileIOType;
  	bool _vfwPaletteHack;
@@ -205,7 +265,7 @@ index a454b81d..ab748cbc 100644
  	uint16 _key;
  	int _keyCode;
 diff --git a/engines/director/events.cpp b/engines/director/events.cpp
-index f8437569..bd44627e 100644
+index f8437569..c9ec6867 100644
 --- a/engines/director/events.cpp
 +++ b/engines/director/events.cpp
 @@ -19,7 +19,10 @@
@@ -219,7 +279,15 @@ index f8437569..bd44627e 100644
  #include "common/keyboard.h"
  #include "common/system.h"
  #include "common/translation.h"
-@@ -43,7 +46,122 @@ namespace Director {
+@@ -31,6 +34,7 @@
+ #include "graphics/macgui/macwindowmanager.h"
+ 
+ #include "director/director.h"
++#include "director/debug-bridge.h"
+ #include "director/movie.h"
+ #include "director/score.h"
+ #include "director/channel.h"
+@@ -43,7 +47,128 @@ namespace Director {
  
  int DirectorEngine::getMacTicks() { return (int)(g_system->getMillis() * 60 / 1000.) - _tickBaseline; }
  
@@ -339,6 +407,12 @@ index f8437569..bd44627e 100644
  bool DirectorEngine::pollEvent(Common::Event &event) {
 +	feedScriptedInput();
 +
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост обслуживается отсюда —
++	// pollEvent зовут из всех циклов ожидания движка, значит мост отвечает и
++	// тогда, когда игра стоит в цикле «go the frame».
++	if (_debugBridge)
++		_debugBridge->poll();
++
  	// used by UnitTest XObject
  	if (!_injectedEvents.empty()) {
  		event = _injectedEvents.remove_at(0);
@@ -454,6 +528,18 @@ index 76a2cccf..0bbee0a8 100644
 +}
  
  } // End of namespace Director
+diff --git a/engines/director/module.mk b/engines/director/module.mk
+index f6d5a211..987e1859 100644
+--- a/engines/director/module.mk
++++ b/engines/director/module.mk
+@@ -6,6 +6,7 @@ MODULE_OBJS = \
+ 	cast.o \
+ 	channel.o \
+ 	cursor.o \
++	debug-bridge.o \
+ 	debugger.o \
+ 	director.o \
+ 	events.o \
 diff --git a/engines/director/score.cpp b/engines/director/score.cpp
 index f8040863..2952358e 100644
 --- a/engines/director/score.cpp
@@ -530,3 +616,77 @@ index 76fc57aa..e7b3d5cf 100644
  
  	Common::Path archivePath = Common::Path(_currentPath, g_director->_dirSeparator);
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
+diff --git a/gui/debugger.cpp b/gui/debugger.cpp
+index b37c84ad..279acc93 100644
+--- a/gui/debugger.cpp
++++ b/gui/debugger.cpp
+@@ -53,6 +53,7 @@ Debugger::Debugger() {
+ 	_isActive = false;
+ 	_firstTime = true;
+ 	_defaultCommandProcessor = nullptr;
++	_captureOutput = nullptr;
+ #ifndef USE_TEXT_CONSOLE_FOR_DEBUGGER
+ 	_debuggerDialog = new GUI::ConsoleDialog(1.0f, 0.67f);
+ 	_debuggerDialog->setInputCallback(debuggerInputCallback, this);
+@@ -125,6 +126,15 @@ int Debugger::debugPrintf(const char *format, ...) {
+ 
+ 	va_start(argptr, format);
+ 	int count;
++
++	// ЛОКАЛЬНАЯ ПРАВКА: перехват вывода для runCapturedCommand().
++	if (_captureOutput) {
++		Common::String piece = Common::String::vformat(format, argptr);
++		*_captureOutput += piece;
++		va_end(argptr);
++		return piece.size();
++	}
++
+ #ifndef USE_TEXT_CONSOLE_FOR_DEBUGGER
+ 	count = _debuggerDialog->vprintFormat(1, format, argptr);
+ #else
+@@ -294,6 +304,14 @@ void Debugger::enter() {
+ #endif
+ }
+ 
++void Debugger::runCapturedCommand(const Common::String &cmd, Common::String &output) {
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): см. debugger.h.
++	Common::String *saved = _captureOutput;
++	_captureOutput = &output;
++	parseCommand(cmd.c_str());
++	_captureOutput = saved;
++}
++
+ bool Debugger::handleCommand(int argc, const char **argv, bool &result) {
+ 	assert(argc > 0);
+ 
+diff --git a/gui/debugger.h b/gui/debugger.h
+index a8aa2339..eb4ff5d0 100644
+--- a/gui/debugger.h
++++ b/gui/debugger.h
+@@ -74,6 +74,14 @@ public:
+ 	 */
+ 	bool isActive() const { return _isActive; }
+ 
++	/**
++	 * ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): выполнить команду консоли, не
++	 * открывая консоль, и сложить её вывод в строку. Нужно отладочному мосту
++	 * движка director: в безоконном прогоне консоль показать негде, а команды
++	 * (channels, print, funcs, breakpoints) хочется те же самые.
++	 */
++	void runCapturedCommand(const Common::String &cmd, Common::String &output);
++
+ protected:
+ 	typedef Common::Functor1<const char *, bool> defaultCommand;
+ 	typedef Common::Functor2<int, const char **, bool> Debuglet;
+@@ -211,6 +219,11 @@ private:
+ 	 */
+ 	defaultCommand *_defaultCommandProcessor;
+ 
++	/**
++	 * ЛОКАЛЬНАЯ ПРАВКА: пока не ноль, debugPrintf пишет сюда, а не в консоль.
++	 */
++	Common::String *_captureOutput;
++
+ protected:
+ 	PauseToken _debugPauseToken;
+ 
