@@ -856,10 +856,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..1616ab9a
+index 00000000..5976b7bf
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,474 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1046,19 +1046,33 @@ index 00000000..1616ab9a
 +		img.colors = readU32(&_data[i + 32]);
 +		if (img.colors == 0 && bpp <= 8)
 +			img.colors = 1u << bpp;
-+		img.pixels = i + 40 + img.colors * 4;
-+		uint32 stride = ((w * bpp + 31) / 32) * 4;
-+		img.dataSize = stride * img.height;
++		img.stride = ((w * bpp + 31) / 32) * 4;
++		img.rawSize = img.stride * img.height;
 +
 +		// Несжатой считаем только ту картинку, перед которой стоит файловая
-+		// шапка BM с согласованным bfOffBits: у таких данные проверяемо
-+		// разворачиваются. Всё прочее в книге сжато своим способом.
++		// шапка BM с согласованным bfOffBits: у таких пиксели лежат сразу за
++		// палитрой как есть.
 +		if (i >= 14 && _data[i - 14] == 'B' && _data[i - 13] == 'M') {
 +			uint32 offBits = readU32(&_data[i - 14 + 10]);
 +			img.raw = (offBits == 14 + 40 + img.colors * 4);
 +		}
++		if (img.raw)
++			img.pixels = i + 40 + img.colors * 4;
 +
-+		if (img.pixels + img.dataSize <= n)
++		// Перед заголовком лежит пара размеров: распакованный и сжатый. По ней
++		// и опознаётся сжатый поток — и она же служит проверкой при поиске
++		// начала данных.
++		for (uint32 back = 8; back <= 0x140 && back <= i; back++) {
++			if (readU32(&_data[i - back]) != img.rawSize)
++				continue;
++			uint32 comp = readU32(&_data[i - back + 4]);
++			if (comp > 0 && comp <= img.rawSize * 2) {
++				img.compSize = comp;
++				break;
++			}
++		}
++
++		if (img.rawSize > 0 && (img.raw || img.compSize))
 +			_images.push_back(img);
 +
 +		i += 40;
@@ -1085,11 +1099,9 @@ index 00000000..1616ab9a
 +				break;
 +			if (page.background < 0)
 +				page.background = k;
-+			bool fullScreen = _images[k].width >= 600 && _images[k].height >= 440;
-+			if (fullScreen) {
++			if (_images[k].width >= 600 && _images[k].height >= 440) {
 +				page.background = k;
-+				if (_images[k].raw)
-+					break;
++				break;
 +			}
 +		}
 +
@@ -1161,20 +1173,95 @@ index 00000000..1616ab9a
 +	}
 +}
 +
-+Graphics::Surface *Book::decodeImage(const Image &img, Graphics::Palette &palette) const {
-+	if (!img.raw) {
-+		// Сжатие книги не разобрано; показывать такие данные как пиксели нельзя.
-+		return nullptr;
++// Распаковка потока картинки, см. book.h и ledger/0021.
++static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
++		uint32 stride, uint32 *usedOut) {
++	uint32 in = 0, out = 0, col = 0;
++
++	while (in < srcLen && out < dstLen) {
++		byte c = src[in++];
++		uint32 n;
++
++		if (c <= 0xf5) {
++			if (in >= srcLen)
++				break;
++			byte v = src[in++];
++			n = MIN<uint32>(MIN<uint32>(c + 3, stride - col), dstLen - out);
++			memset(dst + out, v, n);
++			// Хвост серии, не влезший в строку, отбрасывается: серия не
++			// переходит на следующую строку.
++			out += n;
++			n = MIN<uint32>(c + 3, stride - col);
++		} else {
++			uint32 k = c - 0xf5;
++			n = MIN<uint32>(k, dstLen - out);
++			for (uint32 j = 0; j < n && in < srcLen; j++)
++				dst[out++] = src[in++];
++			in += (k > n) ? (k - n) : 0;
++			n = k;
++		}
++		col = (col + n) % stride;
 +	}
++
++	if (usedOut)
++		*usedOut = in;
++	return out;
++}
++
++bool Book::locatePixels(Image &img) {
++	if (img.pixels)
++		return true;
++	if (!img.compSize || !img.rawSize)
++		return false;
++
++	const uint32 afterPalette = img.offset + 40 + img.colors * 4;
++	// У части картинок между палитрой и данными вклиниваются другие записи,
++	// поэтому начало ищется перебором. Признак верного начала — распаковка
++	// даёт ровно rawSize байт, израсходовав примерно compSize.
++	const uint32 kSearch = 0x10000;
++	Common::Array<byte> tmp;
++	tmp.resize(img.rawSize);
++
++	for (uint32 off = 0; off < kSearch; off++) {
++		uint32 start = afterPalette + off;
++		if (start + img.compSize > _data.size())
++			break;
++
++		uint32 used = 0;
++		uint32 got = unpackRLE(&_data[start], MIN<uint32>(img.compSize + 512, _data.size() - start),
++				tmp.begin(), img.rawSize, img.stride, &used);
++
++		if (got == img.rawSize && used + img.height / 2 + 16 >= img.compSize &&
++				used <= img.compSize + img.height / 2 + 16) {
++			img.pixels = start;
++			return true;
++		}
++	}
++	return false;
++}
++
++Graphics::Surface *Book::decodeImage(Image &img, Graphics::Palette &palette) {
++	if (!locatePixels(img))
++		return nullptr;
 +	if (img.depth != 8 && img.depth != 24) {
 +		warning("ToolBook: картинка %d бит пока не разворачивается", img.depth);
 +		return nullptr;
 +	}
-+	if (img.pixels + img.dataSize > _data.size())
-+		return nullptr;
++	Common::Array<byte> pixels;
++	pixels.resize(img.rawSize);
++	memset(pixels.begin(), 0, img.rawSize);
++
++	if (img.raw) {
++		if (img.pixels + img.rawSize > _data.size())
++			return nullptr;
++		memcpy(pixels.begin(), &_data[img.pixels], img.rawSize);
++	} else {
++		unpackRLE(&_data[img.pixels], MIN<uint32>(img.compSize + 512, _data.size() - img.pixels),
++				pixels.begin(), img.rawSize, img.stride, nullptr);
++	}
 +
 +	Graphics::Surface *surf = new Graphics::Surface();
-+	uint32 stride = ((img.width * img.depth + 31) / 32) * 4;
++	uint32 stride = img.stride;
 +
 +	if (img.depth == 8) {
 +		surf->create(img.width, img.height, Graphics::PixelFormat::createFormatCLUT8());
@@ -1186,13 +1273,13 @@ index 00000000..1616ab9a
 +		}
 +		// DIB хранится снизу вверх.
 +		for (int y = 0; y < img.height; y++) {
-+			const byte *src = &_data[img.pixels + (img.height - 1 - y) * stride];
++			const byte *src = pixels.begin() + (img.height - 1 - y) * stride;
 +			memcpy(surf->getBasePtr(0, y), src, MIN<uint32>(stride, (uint32)img.width));
 +		}
 +	} else {
 +		surf->create(img.width, img.height, Graphics::PixelFormat(4, 8, 8, 8, 8, 16, 8, 0, 24));
 +		for (int y = 0; y < img.height; y++) {
-+			const byte *src = &_data[img.pixels + (img.height - 1 - y) * stride];
++			const byte *src = pixels.begin() + (img.height - 1 - y) * stride;
 +			uint32 *dst = (uint32 *)surf->getBasePtr(0, y);
 +			for (int x = 0; x < img.width; x++, src += 3)
 +				*dst++ = surf->format.ARGBToColor(0xff, src[2], src[1], src[0]);
@@ -1249,10 +1336,10 @@ index 00000000..1616ab9a
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..c5f5dbd7
+index 00000000..69dbdd9e
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,149 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1291,11 +1378,13 @@ index 00000000..c5f5dbd7
 +//   * перед заголовком записи лежит её шестнадцатибитное смещение от начала
 +//     сегмента: наследство 16-битного адресного пространства. Разница между
 +//     файловым смещением и этим числом даёт базу сегмента;
-+//   * картинки описаны обычными DIB (BITMAPINFOHEADER + палитра). Там, где
-+//     перед заголовком стоит файловая шапка BM, пиксели лежат несжатыми и
-+//     разворачиваются штатно; у остальных после палитры идёт свой поток,
-+//     начинающийся с `01 00 00 00 01 00 00 00 00 00`. Стандартным RLE8 он не
-+//     разворачивается — проверено, — и пока не разобран;
++//   * картинки описаны обычными DIB (BITMAPINFOHEADER + палитра), а пиксели
++//     сжаты своим RLE. Перед заголовком лежит пара размеров: распакованный и
++//     сжатый. Разбор потока (ledger/0020): запись — пара «счётчик, значение»,
++//     счётчик c <= 0xf5 даёт серию длиной c+3; c > 0xf5 означает c-0xf5
++//     литеральных байт следом. Серия обрывается на конце строки картинки.
++//     Данные лежат не всегда сразу за палитрой, поэтому начало ищется перебором
++//     со сверкой по обоим размерам;
 +//   * страницы опознаются по свойству `ASYM_TpID`: следом за ним лежит
 +//     полноэкранный DIB — фон страницы, а перед ним имена страницы и её
 +//     обработчиков;
@@ -1324,14 +1413,13 @@ index 00000000..c5f5dbd7
 +	int height = 0;
 +	int depth = 0;
 +	uint32 colors = 0;   ///< число цветов палитры
-+	uint32 pixels = 0;   ///< смещение пиксельных данных
-+	uint32 dataSize = 0; ///< размер пиксельных данных
++	uint32 pixels = 0;   ///< смещение пиксельных данных (0 — ещё не найдено)
++	uint32 rawSize = 0;  ///< размер распакованных пикселей
++	uint32 compSize = 0; ///< размер сжатого потока
++	uint32 stride = 0;   ///< длина строки в байтах, выровненная на 4
 +
-+	/// Правда, если перед заголовком стоит файловая шапка BM и данные лежат
-+	/// несжатыми. У остальных картинок книги после палитры идёт свой,
-+	/// неразобранный поток: он начинается с `01 00 00 00 01 00 00 00 00 00`,
-+	/// стандартным RLE8 не разворачивается, и рисовать его нельзя — получается
-+	/// шум. Такие картинки движок пропускает, а не показывает как попало.
++	/// Правда, если перед заголовком стоит файловая шапка BM: тогда пиксели
++	/// лежат несжатыми сразу за палитрой.
 +	bool raw = false;
 +};
 +
@@ -1373,7 +1461,13 @@ index 00000000..c5f5dbd7
 +	uint segmentCount() const { return _segmentCount; }
 +
 +	/// Разворачивает картинку в поверхность. Владение переходит вызывающему.
-+	Graphics::Surface *decodeImage(const Image &img, Graphics::Palette &palette) const;
++	/// Ноль — данные не нашлись или глубина не поддержана.
++	Graphics::Surface *decodeImage(Image &img, Graphics::Palette &palette);
++
++	/// Ищет начало пиксельных данных: у части картинок они лежат не сразу за
++	/// палитрой. Признак верного начала — распаковка даёт ровно rawSize байт,
++	/// израсходовав примерно compSize. Результат запоминается в img.pixels.
++	bool locatePixels(Image &img);
 +
 +private:
 +	void scanRecords();
@@ -1574,10 +1668,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..62d67efa
+index 00000000..c46b3199
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,288 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1656,12 +1750,9 @@ index 00000000..62d67efa
 +		classes += _book->classNames()[i] + " ";
 +	debug(1, "ToolBook: классы объектов: %s", classes.c_str());
 +
-+	for (uint i = 0; i < _book->images().size(); i++) {
-+		if (_book->images()[i].raw)
-+			_rawImages.push_back(i);
-+	}
-+	debug(0, "ToolBook: картинок, которые разворачиваются: %u из %u",
-+			_rawImages.size(), _book->images().size());
++	for (uint i = 0; i < _book->images().size(); i++)
++		_rawImages.push_back(i);
++	debug(0, "ToolBook: картинок: %u", _rawImages.size());
 +
 +	showPage(0);
 +
@@ -1758,7 +1849,7 @@ index 00000000..62d67efa
 +	bool drawn = false;
 +	if (page.background >= 0) {
 +		Graphics::Palette palette(256);
-+		Graphics::Surface *img = _book->decodeImage(_book->images()[page.background], palette);
++		Graphics::Surface *img = _book->decodeImage(const_cast<Image &>(_book->images()[page.background]), palette);
 +		if (img) {
 +			if (img->format.isCLUT8())
 +				_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
@@ -1796,7 +1887,7 @@ index 00000000..62d67efa
 +	if (index < 0 || index >= (int)_rawImages.size())
 +		return;
 +
-+	const Image &img = _book->images()[_rawImages[index]];
++	Image &img = const_cast<Image &>(_book->images()[_rawImages[index]]);
 +	Graphics::Palette palette(256);
 +	Graphics::Surface *surf = _book->decodeImage(img, palette);
 +
@@ -1849,7 +1940,7 @@ index 00000000..62d67efa
 +	if (page.background >= 0) {
 +		const Image &img = _book->images()[page.background];
 +		font->drawString(screen, Common::String::format(
-+				"fon %dx%d %d bit - szhat, ne razobran", img.width, img.height, img.depth),
++				"fon %dx%d %d bit - dannye ne naydeny", img.width, img.height, img.depth),
 +				20, y, screen->w - 40, grey);
 +	} else {
 +		font->drawString(screen, "fon ne nayden", 20, y, screen->w - 40, grey);
