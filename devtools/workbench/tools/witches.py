@@ -157,7 +157,8 @@ def tour() -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("where", choices=sorted(WAYPOINTS) + ["tour"], help="куда довести")
+    ap.add_argument("where", choices=sorted(WAYPOINTS) + ["tour"] + [n for n, _, _ in LOCATIONS],
+                    help="куда довести")
     ap.add_argument("--dump", action="store_true", help="выгрузить Lingo и картинки")
     ap.add_argument("--flags", default="", help="--debugflags движка")
     ap.add_argument("--level", type=int, default=1)
@@ -172,6 +173,24 @@ def main() -> int:
                             framedump_ms=args.framedump, dump_lingo=args.dump,
                             audio=args.audio)
             print(f"pid {st.pid}, порт {st.port}, лог {st.log}")
+
+        if args.where in [n for n, _, _ in LOCATIONS]:
+            if not args.keep:
+                for title, pattern, action in WAYPOINTS["main"]:
+                    if pattern:
+                        wait_for(pattern)
+                    print(f"  ✓ {title}")
+                    if action:
+                        time.sleep(2.5)
+                        core.command(action)
+            goto_main()
+            name, x, y = next(t for t in LOCATIONS if t[0] == args.where)
+            core.command(f"move {x} {y}")
+            time.sleep(2)
+            core.command(f"click {x} {y}")
+            print(wait_for(rf"movie: (Datas/)?{name}/", timeout=90))
+            time.sleep(6)
+            return 0
 
         if args.where == "tour":
             if not args.keep:
