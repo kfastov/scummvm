@@ -762,6 +762,11 @@ void FileIO::m_delete(int nargs) {
 // Non-standard extensions
 XOBJSTUBNR(FileIO::m_setOverrideDrive)
 
-XOBJSTUB(FileIO::m_getOSDirectory, "")
+void FileIO::m_getOSDirectory(int nargs) {
+	// Was a stub returning an empty string, which left games building paths like
+	// "\\config.ini" and looking for them in the wrong place.
+	g_lingo->push(Datum(g_director->getPlatform() == Common::kPlatformWindows
+			? "C:\\WINDOWS" : "System Folder"));
+}
 
 } // End of namespace Director
