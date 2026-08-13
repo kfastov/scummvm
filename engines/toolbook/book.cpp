@@ -231,46 +231,119 @@ void Book::scanImages() {
 static const int kUnit = 15;
 
 void Book::scanObjects() {
-	const uint n = _data.size();
-
-	// Запись объекта кончается на `<u16 next><u32 self><имя\0>`; прямоугольник
-	// из четырёх u16 лежит перед ней, но на расстоянии, зависящем от класса
-	// объекта. Опознаётся по кратности координат пятнадцати (ledger/0028).
-	for (uint i = 64; i + 2 < n; i++) {
-		byte c = _data[i];
-		if (!Common::isAlpha(c) && c != '_')
+	// Книга — куча блоков `[u16 конец][u16 тип][данные]`, где «конец» считается
+	// от базы сегмента (ledger/0031). Объект лежит тремя блоками подряд:
+	//
+	//     [свойства, тип 0x10/0x08/0x15]  рамка и число вершин
+	//     [имя, тип 0]                    `[u32 самоссылка][имя\0]`
+	//     [обвод либо DIB, тип 0]         список вершин или картинка
+	//
+	// Вход в цепочку — блок с заголовком DIB: его длина известна (4 + 40 +
+	// палитра), отсюда база сегмента. Объекты, лежащие в сегменте до первой
+	// картинки, так не находятся — это осознанное ограничение.
+	Common::Array<uint32> bases;
+	for (uint k = 0; k < _images.size(); k++) {
+		if (!_images[k].segBase)
 			continue;
-		if (Common::isAlnum(_data[i - 1]) || _data[i - 1] == '_')
+		bool seen = false;
+		for (uint j = 0; j < bases.size(); j++)
+			if (bases[j] == _images[k].segBase)
+				seen = true;
+		if (!seen)
+			bases.push_back(_images[k].segBase);
+	}
+
+	for (uint b = 0; b < bases.size(); b++) {
+		uint32 segBase = bases[b];
+
+		// самая ранняя картинка сегмента — точка входа
+		uint32 entry = 0;
+		for (uint k = 0; k < _images.size(); k++)
+			if (_images[k].segBase == segBase && (!entry || _images[k].offset - 4 < entry))
+				entry = _images[k].offset - 4;
+		if (!entry)
 			continue;
 
-		uint e = i;
-		while (e < n && (Common::isAlnum(_data[e]) || _data[e] == '_'))
-			e++;
-		if (e >= n || _data[e] != 0 || e - i < 2 || e - i > 24)
-			continue;
+		Common::Array<uint32> starts, lens, types;
+		uint32 p = entry;
+		for (uint step = 0; step < 4000; step++) {
+			if (p + 4 > _data.size())
+				break;
+			uint32 next = segBase + readU16(&_data[p]);
+			if (next <= p || next - p > 0xffff || next + 4 > _data.size())
+				break;
+			starts.push_back(p);
+			types.push_back(readU16(&_data[p + 2]));
+			lens.push_back(next - p);
+			p = next;
+		}
 
-		uint32 self = readU32(&_data[i - 4]);
-		if (self == 0 || self >= 0x10000)
-			continue;
-
-		for (uint back = 6; back < 48; back++) {
-			const byte *p = &_data[i - 4 - back];
-			int l = readU16(p), t = readU16(p + 2), r = readU16(p + 4), b = readU16(p + 6);
-			if (l % kUnit || t % kUnit || r % kUnit || b % kUnit)
+		for (uint i = 1; i + 1 < starts.size(); i++) {
+			if (types[i] != 0 || lens[i] < 6 || lens[i] > 32)
 				continue;
-			if (l >= r || t >= b || r > 640 * kUnit || b > 480 * kUnit)
-				continue;
-			if (r - l < 2 * kUnit || b - t < 2 * kUnit)
+
+			// имя: `[u32 самоссылка][имя\0]`
+			uint32 np = starts[i] + 4;
+			uint32 e = np;
+			while (e < starts[i] + lens[i] && _data[e] >= 32 && _data[e] < 127)
+				e++;
+			if (e == np || e >= starts[i] + lens[i] || _data[e] != 0)
 				continue;
 
 			Object obj;
-			obj.offset = i;
-			obj.name = Common::String((const char *)&_data[i], e - i);
-			obj.rect = Common::Rect(l / kUnit, t / kUnit, r / kUnit, b / kUnit);
+			obj.offset = np;
+			obj.name = Common::String((const char *)&_data[np], e - np);
+
+			// свойства лежат в предыдущем блоке: ищем в нём рамку —
+			// четыре u16, кратные 15, дающие осмысленный прямоугольник.
+			const uint32 pp = starts[i - 1] + 4, plen = lens[i - 1] - 4;
+			uint32 nverts = 0;
+			bool haveRect = false;
+			if (plen >= 12) {
+				for (int off = (int)plen - 10; off >= 0; off -= 2) {
+					const byte *q = &_data[pp + off];
+					int l = readU16(q), t = readU16(q + 2), r = readU16(q + 4), bt = readU16(q + 6);
+					if (l % 15 || t % 15 || r % 15 || bt % 15)
+						continue;
+					if (l >= r || t >= bt || r > 640 * 15 || bt > 480 * 15)
+						continue;
+					obj.rect = Common::Rect(l / 15, t / 15, r / 15, bt / 15);
+					nverts = readU16(q + 8);
+					haveRect = true;
+					break;
+				}
+			}
+			if (!haveRect)
+				continue;
+
+			// следом либо картинка, либо список вершин
+			const uint32 dp = starts[i + 1] + 4, dlen = lens[i + 1] - 4;
+			if (dlen >= 40 && _data[dp] == 0x28 && _data[dp + 1] == 0) {
+				obj.picture = true;
+			} else if (nverts && dlen >= nverts * 4) {
+				for (uint32 v = 0; v < nverts; v++) {
+					int x = readU16(&_data[dp + v * 4]);
+					int y = readU16(&_data[dp + v * 4 + 2]);
+					if (x % 15 || y % 15)
+						break;
+					obj.outline.push_back(Common::Point(x / 15, y / 15));
+				}
+			}
+
 			_objects.push_back(obj);
-			break;
 		}
-		i = e;
+	}
+
+	// Сегменты обходятся в порядке картинок, а не файла, поэтому объекты
+	// нужно упорядочить: разбиение по страницам идёт по смещению.
+	for (uint i = 1; i < _objects.size(); i++) {
+		Object tmp = _objects[i];
+		uint j = i;
+		while (j > 0 && _objects[j - 1].offset > tmp.offset) {
+			_objects[j] = _objects[j - 1];
+			j--;
+		}
+		_objects[j] = tmp;
 	}
 }
 

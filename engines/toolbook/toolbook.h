@@ -65,6 +65,7 @@ private:
 	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
 	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
 	const struct Object *objectAt(int x, int y) const;
+	static bool pointInOutline(const struct Object &obj, int x, int y);
 	void handleEvents();
 
 	const ADGameDescription *_desc;
