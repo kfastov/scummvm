@@ -30,6 +30,11 @@
 namespace ToolBook {
 
 static const byte kSignature[4] = { 0x03, 'J', 'B', 'O' };
+// Пролог кода обработчика OpenScript, общий для всех 988 обработчиков книги.
+static const byte kHandlerPrologue[] = {
+	0x26, 0x0f, 0xf8, 0xff, 0x3b, 0x03, 0x0d, 0xfc, 0xff, 0x3b, 0x04, 0x0d, 0xf8, 0xff
+};
+static const uint kPrologue = sizeof(kHandlerPrologue);
 static const char kPageAnchor[] = "ASYM_TpID";
 
 static inline uint16 readU16(const byte *p) { return p[0] | (p[1] << 8); }
@@ -230,6 +235,63 @@ void Book::scanImages() {
 // Единица координат книги: 1/1440 дюйма, книга 640×480 при 96 точках на дюйм.
 static const int kUnit = 15;
 
+// Таблица строк обработчика: за кодом идёт маркер 27 1d 66, поле смещения и
+// строки. Имена (сообщения, свойства) идут с двухбайтовым хешем впереди,
+// строковые литералы — без него; последняя строка таблицы — имя обработчика.
+void Book::readHandlerStrings(uint32 code, Handler &hd) {
+	uint32 m = code;
+	while (m + 3 < _data.size() && m < code + 8000) {
+		if (_data[m] == 0x27 && _data[m + 1] == 0x1d && _data[m + 2] == 0x66)
+			break;
+		m++;
+	}
+	if (m + 5 >= _data.size() || m >= code + 8000)
+		return;
+	if (readU16(&_data[m + 3]) != (m - code) + 7)
+		return;
+
+	uint32 p = m + 5;
+	Common::Array<Common::String> all;
+	Common::Array<bool> hashed;
+	while (p < _data.size()) {
+		uint32 e = p;
+		while (e < _data.size() && _data[e])
+			e++;
+		if (e == p || e - p > 120)
+			break;
+		Common::String s((const char *)&_data[p], e - p);
+		bool isName = true;
+		for (uint i = 0; i < s.size(); i++)
+			if (!Common::isAlnum(s[i]) && s[i] != '_')
+				isName = false;
+		if (!isName && s.size() > 2) {
+			Common::String tail(s.c_str() + 2);
+			bool ok = !tail.empty();
+			for (uint i = 0; i < tail.size(); i++)
+				if (!Common::isAlnum(tail[i]) && tail[i] != '_')
+					ok = false;
+			if (ok) {
+				all.push_back(tail);
+				hashed.push_back(true);
+				p = e + 1;
+				continue;
+			}
+		}
+		all.push_back(s);
+		hashed.push_back(isName);
+		p = e + 1;
+	}
+	if (all.empty())
+		return;
+	hd.name = all[all.size() - 1];
+	for (uint i = 0; i + 1 < all.size(); i++) {
+		if (hashed[i])
+			hd.messages.push_back(all[i]);
+		else
+			hd.literals.push_back(all[i]);
+	}
+}
+
 void Book::scanObjects() {
 	// Книга — куча блоков `[u16 конец][u16 тип][данные]`, где «конец» считается
 	// от базы сегмента (ledger/0031). Объект лежит тремя блоками подряд:
@@ -327,6 +389,24 @@ void Book::scanObjects() {
 					if (x % 15 || y % 15)
 						break;
 					obj.outline.push_back(Common::Point(x / 15, y / 15));
+				}
+			}
+
+			// Скрипт объекта лежит следующими блоками той же цепочки: код
+			// обработчика опознаётся по общему прологу (ledger/0023).
+			for (uint k = i + 1; k < starts.size() && k <= i + 4; k++) {
+				if (lens[k] < 40)
+					continue;
+				uint32 bp = starts[k] + 4, blen = lens[k] - 4;
+				for (uint32 q = 0; q + kPrologue < blen; q++) {
+					if (memcmp(&_data[bp + q], kHandlerPrologue, kPrologue) != 0)
+						continue;
+					Handler hd;
+					hd.code = bp + q;
+					readHandlerStrings(bp + q, hd);
+					if (!hd.name.empty())
+						obj.handlers.push_back(hd);
+					q += 8;
 				}
 			}
 
