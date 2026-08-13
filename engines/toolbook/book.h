@@ -51,6 +51,7 @@
 //   * скрипты хранятся скомпилированными, опкоды не разобраны.
 
 #include "common/array.h"
+#include "common/array.h"
 #include "common/rect.h"
 #include "common/str.h"
 
@@ -100,6 +101,9 @@ struct Object {
 	uint32 offset = 0;      ///< смещение имени в книге
 	Common::String name;
 	Common::Rect rect;      ///< в точках экрана
+	/// Обвод для многоугольных областей (ledger/0037). Пусто у прямоугольных.
+	Common::Array<Common::Point> outline;
+	bool picture = false;   ///< за именем идёт блок DIB, а не список вершин
 };
 
 /// Страница книги.

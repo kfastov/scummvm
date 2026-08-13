@@ -268,6 +268,10 @@ const Object *ToolBookEngine::objectAt(int x, int y) const {
 	for (uint i = 0; i < objs.size(); i++) {
 		if (!objs[i].rect.contains(x, y))
 			continue;
+		// У многоугольных областей рамка — только грубая отсечка: попадание
+		// считается по обводу, иначе кнопки на карте перекрывают друг друга.
+		if (!objs[i].outline.empty() && !pointInOutline(objs[i], x, y))
+			continue;
 		int area = objs[i].rect.width() * objs[i].rect.height();
 		if (!best || area < bestArea) {
 			best = &objs[i];
@@ -277,11 +281,35 @@ const Object *ToolBookEngine::objectAt(int x, int y) const {
 	return best;
 }
 
+// Классический тест «луч вправо»: точка внутри, если пересечений нечётное число.
+bool ToolBookEngine::pointInOutline(const Object &obj, int x, int y) {
+	const Common::Array<Common::Point> &p = obj.outline;
+	bool in = false;
+	for (uint i = 0, j = p.size() - 1; i < p.size(); j = i++) {
+		if ((p[i].y > y) == (p[j].y > y))
+			continue;
+		int dx = p[j].x - p[i].x, dy = p[j].y - p[i].y;
+		if (dy && x < p[i].x + (int)((int64)(y - p[i].y) * dx / dy))
+			in = !in;
+	}
+	return in;
+}
+
 void ToolBookEngine::drawObjectFrames(Graphics::Surface *screen, const Page &page) {
 	// Рамки объектов: пока интерпретатора нет, это единственный способ увидеть,
 	// правильно ли разобраны прямоугольники (клавиша o).
 	const uint32 color = screen->format.isCLUT8() ? 255 : screen->format.RGBToColor(0xff, 0, 0xff);
 	for (uint i = 0; i < page.objects.size(); i++) {
+		const Common::Array<Common::Point> &o = page.objects[i].outline;
+		if (!o.empty()) {
+			for (uint k = 0; k < o.size(); k++) {
+				const Common::Point &a = o[k], &b = o[(k + 1) % o.size()];
+				if (a.x >= 0 && a.x < screen->w && b.x >= 0 && b.x < screen->w &&
+						a.y >= 0 && a.y < screen->h && b.y >= 0 && b.y < screen->h)
+					screen->drawLine(a.x, a.y, b.x, b.y, color);
+			}
+			continue;
+		}
 		Common::Rect r = page.objects[i].rect;
 		r.clip(Common::Rect(0, 0, screen->w, screen->h));
 		if (r.isEmpty())
