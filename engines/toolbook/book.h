@@ -224,6 +224,8 @@ public:
 	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
 	const ScriptObject *findScriptObjectByRecord(uint32 record) const;
 	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
+	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
+	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
 	uint segmentCount() const { return _segmentCount; }
 	uint16 readUint16(uint32 offset) const;
