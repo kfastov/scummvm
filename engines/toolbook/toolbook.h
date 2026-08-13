@@ -62,6 +62,7 @@ public:
 private:
 	void showPage(int index);
 	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
+	const struct Object *objectAt(int x, int y) const;
 	void handleEvents();
 
 	const ADGameDescription *_desc;
