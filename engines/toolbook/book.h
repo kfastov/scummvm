@@ -51,7 +51,6 @@
 //   * скрипты хранятся скомпилированными, опкоды не разобраны.
 
 #include "common/array.h"
-#include "common/array.h"
 #include "common/rect.h"
 #include "common/str.h"
 
@@ -88,6 +87,10 @@ struct Image {
 	/// Поток найден в виде кусков `[u16 записей][записи]` — так его пишет сама
 	/// среда ToolBook (ledger/0039).
 	bool chunked = false;
+	/// Большой поток хранится как huge-массив 16-битной среды: группы записей
+	/// идут подряд, но после смещения > 0xfffc источник переносится на начало
+	/// следующей 64-КБ страницы. Пропущенный хвост входит в compSize.
+	bool hugeSpan = false;
 
 	/// База сегмента кучи, в котором лежит блок с этим DIB. Выводится из
 	/// заголовка блока: длина блока известна (4 + 40 + палитра), значит
@@ -95,37 +98,90 @@ struct Image {
 	uint32 segBase = 0;
 };
 
+/// Формальная куча одной страницы/фона ToolBook. Ссылки внутри неё —
+/// 16-битные handles; адрес блока равен ``segmentBase + handle - 3``.
+struct HeapSegment {
+	uint32 base = 0;
+	uint32 end = 0;       ///< первый байт после цепочки блоков
+	uint16 type = 0;      ///< 4 = Background, 5 = Page
+	uint32 id = 0;
+	uint16 selector = 0;  ///< дальний selector, уникален среди root одного типа
+	Common::String name;
+};
+
 /// Обработчик события объекта: имя события и строки из его таблицы.
 struct Handler {
 	uint32 code = 0;                 ///< смещение кода в книге
+	uint32 codeSize = 0;             ///< длина кода до маркера таблицы строк
+	uint16 eventHash = 0;            ///< hash from the owning script directory
 	Common::String name;             ///< buttonClick, mouseEnter, enterPage…
 	Common::Array<Common::String> literals;  ///< строковые литералы
 	Common::Array<Common::String> messages;  ///< имена (с хешем) — сообщения и свойства
 };
 
+/// A top-level ToolBook script record. These records use the same event
+/// directory as local page/object scripts, but are addressed through a far
+/// handle/selector pair by the compiled OpenScript dispatcher.
+struct ScriptObject {
+	uint32 record = 0;       ///< outer type-1 record header
+	uint32 script = 0;       ///< serialized script header at record + 0x10
+	uint16 handle = 0;       ///< far handle from the formal ScriptObject id table
+	uint16 selector = 0;     ///< filled from a formal far-reference table
+	uint32 id = 0;           ///< serialized object id, if indexed
+	Common::Array<Handler> handlers;
+};
+
 /// Объект на странице: кнопка, многоугольник, картинка.
 ///
-/// Координаты в книге — в 1/1440 дюйма; книга 640×480 точек при 96 точках на
-/// дюйм, поэтому единица = 15 и **все координаты кратны 15**. Кратность и
-/// служит проверкой при поиске прямоугольника (ledger/0028).
+/// Координаты в книге — знаковые величины в 1/1440 дюйма; книга 640×480
+/// точек при 96 точках на дюйм, поэтому 15 единиц дают один пиксель. Реальные
+/// объекты могут иметь субпиксельные и отрицательные координаты.
 struct Object {
 	uint32 offset = 0;      ///< смещение имени в книге
+	uint32 block = 0;       ///< начало typed object block
+	uint32 segmentBase = 0;
+	uint16 handle = 0;
+	uint16 parentHandle = 0;
+	uint16 type = 0;
+	uint32 id = 0;
 	Common::String name;
 	Common::Rect rect;      ///< в точках экрана
 	/// Обвод для многоугольных областей (ledger/0037). Пусто у прямоугольных.
 	Common::Array<Common::Point> outline;
 	bool picture = false;   ///< за именем идёт блок DIB, а не список вершин
-	/// Обработчики объекта: имя события и строковые литералы из таблицы
-	/// (ledger/0038). Код не исполняется — опкоды ещё не разобраны.
+	int image = -1;         ///< индекс DIB для Picture
+	bool field = false;
+	uint32 textBlock = 0;
+	uint16 textCapacity = 0;
+	Common::String initialText;
+	bool ownVisible = true; ///< serialized flags+0x23 bit 0, without ancestors
+	bool visible = true;    ///< initial effective visibility, including ancestors
+	/// Обработчики объекта: bytecode, event selector and string table,
+	/// resolved through the object's formal local script handle.
 	Common::Array<Handler> handlers;
 };
 
 /// Страница книги.
 struct Page {
+	uint32 segmentBase = 0;
+	uint32 backgroundSegmentBase = 0;
+	uint32 id = 0;
+	uint16 selector = 0;       ///< far selector of the serialized Page root
+	uint32 backgroundId = 0;
+	int nextPage = -1;         ///< index resolved from the formal page-order table
+	uint16 canvasWidth = 640;   ///< referenced Background client size, pixels
+	uint16 canvasHeight = 480;
+	/// Viewer placement is runtime state, not implied by a small Background's
+	/// client size. It remains unset until a formal viewer/transition property
+	/// supplies an origin.
+	bool hasCanvasOrigin = false;
+	int16 canvasX = 0;
+	int16 canvasY = 0;
 	uint32 anchor = 0;         ///< смещение свойства ASYM_TpID
 	int background = -1;       ///< индекс в списке картинок, -1 если не найден
 	Common::String name;       ///< имя страницы, если распознано
 	Common::Array<Common::String> handlers; ///< имена обработчиков рядом с якорем
+	Common::Array<Handler> eventHandlers;   ///< формально привязанные root handlers
 	Common::Array<Common::String> text;     ///< текст страницы (CP1251 → UTF-8)
 	Common::Array<Object> objects;          ///< объекты, лежащие до следующего фона
 };
@@ -154,10 +210,23 @@ public:
 
 	const Common::Array<Image> &images() const { return _images; }
 	const Common::Array<Page> &pages() const { return _pages; }
+	int initialPage() const { return _initialPage; }
+	const Common::Array<int> &pageOrder() const { return _pageOrder; }
 	const Common::Array<Record> &records() const { return _records; }
 	const Common::Array<Object> &objects() const { return _objects; }
+	const Common::Array<HeapSegment> &heapSegments() const { return _heapSegments; }
+	/// Все обработчики с целой таблицей строк. Пока не привязаны к страницам:
+	/// одного соседства в файле для доказуемой привязки недостаточно.
+	const Common::Array<Handler> &handlers() const { return _handlers; }
+	const Common::Array<ScriptObject> &scriptObjects() const { return _scriptObjects; }
+	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
 	uint segmentCount() const { return _segmentCount; }
+	uint16 readUint16(uint32 offset) const;
+	uint32 readUint32(uint32 offset) const;
+	const byte *bytes(uint32 offset, uint32 size = 1) const;
+	Common::String readString(uint32 offset, uint32 maxLength = 4096) const;
+	Common::String handlerString(const Handler &handler, uint32 target) const;
 
 	/// Разворачивает картинку в поверхность. Владение переходит вызывающему.
 	/// Ноль — данные не нашлись или глубина не поддержана.
@@ -173,16 +242,36 @@ private:
 	void scanRecords();
 	void scanImages();
 	void scanPages();
+	void scanPageOrder();
 	void scanPageText();
 	void scanObjects();
-	void readHandlerStrings(uint32 code, Handler &hd);
+	void scanHeapSegments();
+	void scanHandlers();
+	void scanScriptObjects();
+	void scanScriptObjectIndex();
+	void readHandlerStrings(uint32 code, Handler &hd) const;
+	void appendScriptHandlers(uint32 script, uint32 scriptEnd,
+			Common::Array<Handler> &out) const;
+	bool resolveLocalScript(uint32 segmentBase, uint32 segmentEnd, uint16 handle,
+			uint32 &script, uint32 &scriptEnd) const;
+	bool appendScriptBinding(uint32 segmentBase, uint32 segmentEnd, uint16 binding,
+			Common::Array<Handler> &out) const;
 	void scanClassNames();
+	void appendSegmentObjects(uint32 segmentBase, Common::Array<Object> &out) const;
+	void appendObjectTree(uint32 segmentBase, uint16 handle, bool parentVisible,
+			Common::Array<Object> &out, uint depth) const;
+	void appendRootHandlers(uint32 segmentBase, Common::Array<Handler> &out) const;
 
 	Common::Array<Object> _objects;
+	Common::Array<HeapSegment> _heapSegments;
+	Common::Array<Handler> _handlers;
+	Common::Array<ScriptObject> _scriptObjects;
 
 	Common::Array<byte> _data;
 	Common::Array<Image> _images;
 	Common::Array<Page> _pages;
+	Common::Array<int> _pageOrder;
+	int _initialPage = -1;
 	Common::Array<Record> _records;
 	Common::Array<Common::String> _classNames;
 	uint _segmentCount = 0;

@@ -24,15 +24,14 @@
 
 // Движок для книг Asymetrix Multimedia ToolBook 4.0.
 //
-// Пока умеет ровно то, что разобрано в формате: открыть книгу, собрать список
-// страниц с фонами и текстом и показывать их. Байт-код OpenScript не разобран,
-// поэтому собственной логики игры (кнопки, мини-игры, MCI-команды) здесь нет —
-// см. book.h и ledger/0015, там записано, что именно установлено и что нет.
+// The engine reads the formal ToolBook heap, decodes the book's image streams
+// and executes the machine-confirmed subset of OpenScript needed by the game.
 
 #include "engines/engine.h"
 #include "common/array.h"
 #include "common/error.h"
 #include "common/events.h"
+#include "common/hashmap.h"
 #include "common/rect.h"
 
 struct ADGameDescription;
@@ -40,6 +39,7 @@ struct ADGameDescription;
 namespace Graphics {
 struct Surface;
 class Palette;
+class Font;
 }
 
 namespace ToolBook {
@@ -61,15 +61,43 @@ public:
 	const char *getGameId() const;
 
 private:
+	struct NativeBinding {
+		Common::String name;
+		uint32 descriptor = 0;
+		uint32 thunk = 0;
+		uint16 ordinal = 0;
+		uint8 argumentBytes = 0;
+		uint8 thunkLength = 0;
+		uint8 signatureLength = 0;
+		bool byName = false;
+	};
+	struct NativeFontFace {
+		Common::String name;
+		Common::Array<uint16> points;
+	};
+
 	void showPage(int index);
 	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
 	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
 	const struct Object *objectAt(int x, int y) const;
+	const struct Object *findCurrentObject(const Common::String &name) const;
+	const struct Object *findCurrentObject(uint32 block) const;
+	bool objectVisible(const struct Page &page, const struct Object &object,
+			uint depth = 0) const;
+	void setObjectVisible(const Common::String &name, bool visible);
+	Common::String fieldText(const struct Object &object) const;
+	Common::Point pageOrigin(const struct Page &page) const;
 	static bool pointInOutline(const struct Object &obj, int x, int y);
 	void handleEvents();
+	int findPageIndex(const Common::String &name) const;
+	void navigateTo(const Common::String &name);
+	bool runHandler(const struct Handler &handler);
+	void dispatchPageEvent(uint16 eventHash);
+	void dispatchObjectEvent(const struct Object &object, uint16 eventHash);
 
 	const ADGameDescription *_desc;
 	Book *_book = nullptr;
+	const Graphics::Font *_fieldFont = nullptr;
 
 	void showImage(int index);
 	Common::Array<int> _rawImages; ///< индексы картинок, которые умеем разворачивать
@@ -80,6 +108,17 @@ private:
 	bool _quit = false;
 	bool _needsRedraw = true;
 	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
+	Common::HashMap<uint32, bool> _visibilityOverrides;
+	Common::HashMap<uint32, Common::String> _fieldValues;
+	Common::HashMap<Common::String, Common::String> _scriptGlobals;
+	Common::HashMap<Common::String, Common::Array<NativeBinding> > _nativeBindings;
+	Common::HashMap<Common::String, NativeBinding> _nativeFunctions;
+	Common::HashMap<Common::String, NativeFontFace> _nativeFonts;
+	bool _runtimeAction12 = false;
+	uint32 _hoveredObject = 0;
+	uint32 _focusedField = 0;
+	bool _fieldSelectAll = false;
+	bool _pendingFirstIdle = false;
 
 	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных
 	// прогонов; ключ конфига inputscript, см. toolbook.cpp.
