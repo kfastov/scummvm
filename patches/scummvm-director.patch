@@ -856,10 +856,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..5976b7bf
+index 00000000..5e91c03d
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,556 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -973,6 +973,7 @@ index 00000000..5976b7bf
 +
 +	scanRecords();
 +	scanImages();
++	scanObjects();
 +	scanPages();
 +	scanClassNames();
 +
@@ -1079,7 +1080,91 @@ index 00000000..5976b7bf
 +	}
 +}
 +
++// Единица координат книги: 1/1440 дюйма, книга 640×480 при 96 точках на дюйм.
++static const int kUnit = 15;
++
++void Book::scanObjects() {
++	const uint n = _data.size();
++
++	// Запись объекта кончается на `<u16 next><u32 self><имя\0>`; прямоугольник
++	// из четырёх u16 лежит перед ней, но на расстоянии, зависящем от класса
++	// объекта. Опознаётся по кратности координат пятнадцати (ledger/0028).
++	for (uint i = 64; i + 2 < n; i++) {
++		byte c = _data[i];
++		if (!Common::isAlpha(c) && c != '_')
++			continue;
++		if (Common::isAlnum(_data[i - 1]) || _data[i - 1] == '_')
++			continue;
++
++		uint e = i;
++		while (e < n && (Common::isAlnum(_data[e]) || _data[e] == '_'))
++			e++;
++		if (e >= n || _data[e] != 0 || e - i < 2 || e - i > 24)
++			continue;
++
++		uint32 self = readU32(&_data[i - 4]);
++		if (self == 0 || self >= 0x10000)
++			continue;
++
++		for (uint back = 6; back < 48; back++) {
++			const byte *p = &_data[i - 4 - back];
++			int l = readU16(p), t = readU16(p + 2), r = readU16(p + 4), b = readU16(p + 6);
++			if (l % kUnit || t % kUnit || r % kUnit || b % kUnit)
++				continue;
++			if (l >= r || t >= b || r > 640 * kUnit || b > 480 * kUnit)
++				continue;
++			if (r - l < 2 * kUnit || b - t < 2 * kUnit)
++				continue;
++
++			Object obj;
++			obj.offset = i;
++			obj.name = Common::String((const char *)&_data[i], e - i);
++			obj.rect = Common::Rect(l / kUnit, t / kUnit, r / kUnit, b / kUnit);
++			_objects.push_back(obj);
++			break;
++		}
++		i = e;
++	}
++}
++
 +void Book::scanPages() {
++	// Страницы разделяются полноэкранными фонами: объекты, лежащие между двумя
++	// соседними фонами, принадлежат одной странице.
++	Common::Array<uint> fullscreen;
++	for (uint k = 0; k < _images.size(); k++)
++		if (_images[k].width == 640 && _images[k].height == 480 && _images[k].depth == 8)
++			fullscreen.push_back(k);
++
++	uint obj = 0;
++	for (uint f = 0; f < fullscreen.size(); f++) {
++		Page page;
++		page.background = fullscreen[f];
++		uint32 from = _images[fullscreen[f]].offset;
++		uint32 to = (f + 1 < fullscreen.size()) ? _images[fullscreen[f + 1]].offset : _data.size();
++
++		while (obj < _objects.size() && _objects[obj].offset < from)
++			obj++;
++		for (uint k = obj; k < _objects.size() && _objects[k].offset < to; k++)
++			page.objects.push_back(_objects[k]);
++
++		// Имя страницы: объект во весь экран обычно назван по странице.
++		for (uint k = 0; k < page.objects.size(); k++) {
++			const Common::Rect &r = page.objects[k].rect;
++			if (r.width() >= 620 && r.height() >= 460) {
++				page.name = page.objects[k].name;
++				break;
++			}
++		}
++		if (page.name.empty() && !page.objects.empty())
++			page.name = page.objects[0].name;
++
++		_pages.push_back(page);
++	}
++
++	scanPageText();
++}
++
++void Book::scanPageText() {
 +	const uint n = _data.size();
 +	const uint anchorLen = sizeof(kPageAnchor) - 1;
 +
@@ -1087,25 +1172,21 @@ index 00000000..5976b7bf
 +		if (_data[i] != 'A' || memcmp(&_data[i], kPageAnchor, anchorLen) != 0 || _data[i + anchorLen] != 0)
 +			continue;
 +
-+		Page page;
-+		page.anchor = i;
-+
-+		// Фон — ближайший следующий DIB; полноэкранному отдаём предпочтение,
-+		// а среди них — тому, который умеем развернуть.
-+		for (uint k = 0; k < _images.size(); k++) {
-+			if (_images[k].offset <= i)
++		// Якорь ASYM_TpID есть не у всех страниц (51 против 57 фонов), но там,
++		// где он есть, рядом лежат имена обработчиков и текст.
++		Page *page = nullptr;
++		for (uint k = 0; k < _pages.size(); k++) {
++			if (_pages[k].background < 0)
 +				continue;
-+			if (_images[k].offset - i > 8192)
++			if (_images[_pages[k].background].offset > i)
 +				break;
-+			if (page.background < 0)
-+				page.background = k;
-+			if (_images[k].width >= 600 && _images[k].height >= 440) {
-+				page.background = k;
-+				break;
-+			}
++			page = &_pages[k];
 +		}
++		if (!page || page->anchor)
++			continue;
++		page->anchor = i;
 +
-+		// Имена перед якорем: имя страницы и имена обработчиков.
++		// Имена перед якорем: имена обработчиков страницы.
 +		uint lo = i > 600 ? i - 600 : 0;
 +		for (uint p = lo; p < i; ) {
 +			Common::String id;
@@ -1113,14 +1194,12 @@ index 00000000..5976b7bf
 +			if (identifierAt(_data, p, id, end)) {
 +				if (!id.equals("true") && !id.equals("false") && !id.equals("script") &&
 +						!id.hasPrefix("ASYM_"))
-+					page.handlers.push_back(id);
++					page->handlers.push_back(id);
 +				p = end;
 +			} else {
 +				p++;
 +			}
 +		}
-+		if (!page.handlers.empty())
-+			page.name = page.handlers[page.handlers.size() - 1];
 +
 +		// Текст страницы: русские строки в CP1251 рядом с якорем.
 +		uint tlo = i > 4096 ? i - 4096 : 0;
@@ -1134,14 +1213,12 @@ index 00000000..5976b7bf
 +				run += (char)(c == '\r' || c == '\n' ? ' ' : c);
 +			} else {
 +				if (run.size() >= 24)
-+					page.text.push_back(cp1251ToUtf8(run));
++					page->text.push_back(cp1251ToUtf8(run));
 +				run.clear();
 +			}
 +		}
 +		if (run.size() >= 24)
-+			page.text.push_back(cp1251ToUtf8(run));
-+
-+		_pages.push_back(page);
++			page->text.push_back(cp1251ToUtf8(run));
 +	}
 +}
 +
@@ -1211,14 +1288,19 @@ index 00000000..5976b7bf
 +bool Book::locatePixels(Image &img) {
 +	if (img.pixels)
 +		return true;
-+	if (!img.compSize || !img.rawSize)
++	if (!img.compSize || !img.rawSize || img.searched)
 +		return false;
++	img.searched = true;
 +
 +	const uint32 afterPalette = img.offset + 40 + img.colors * 4;
 +	// У части картинок между палитрой и данными вклиниваются другие записи,
 +	// поэтому начало ищется перебором. Признак верного начала — распаковка
 +	// даёт ровно rawSize байт, израсходовав примерно compSize.
-+	const uint32 kSearch = 0x10000;
++	//
++	// Окно намеренно узкое: на корпусе из 400 картинок данные лежали сразу за
++	// палитрой у 396, а каждая проверка стоит полной распаковки. С окном в
++	// 64 КБ перелистывание страницы подвисало на секунды (ledger/0029).
++	const uint32 kSearch = 0x600;
 +	Common::Array<byte> tmp;
 +	tmp.resize(img.rawSize);
 +
@@ -1336,10 +1418,10 @@ index 00000000..5976b7bf
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..69dbdd9e
+index 00000000..088eeac0
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,170 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1421,6 +1503,21 @@ index 00000000..69dbdd9e
 +	/// Правда, если перед заголовком стоит файловая шапка BM: тогда пиксели
 +	/// лежат несжатыми сразу за палитрой.
 +	bool raw = false;
++	/// Начало данных уже искали и не нашли — второй раз не искать. Перебор
++	/// стоит десятки тысяч распаковок, и без этого перерисовка страницы
++	/// подвисает на секунды.
++	bool searched = false;
++};
++
++/// Объект на странице: кнопка, многоугольник, картинка.
++///
++/// Координаты в книге — в 1/1440 дюйма; книга 640×480 точек при 96 точках на
++/// дюйм, поэтому единица = 15 и **все координаты кратны 15**. Кратность и
++/// служит проверкой при поиске прямоугольника (ledger/0028).
++struct Object {
++	uint32 offset = 0;      ///< смещение имени в книге
++	Common::String name;
++	Common::Rect rect;      ///< в точках экрана
 +};
 +
 +/// Страница книги.
@@ -1430,6 +1527,7 @@ index 00000000..69dbdd9e
 +	Common::String name;       ///< имя страницы, если распознано
 +	Common::Array<Common::String> handlers; ///< имена обработчиков рядом с якорем
 +	Common::Array<Common::String> text;     ///< текст страницы (CP1251 → UTF-8)
++	Common::Array<Object> objects;          ///< объекты, лежащие до следующего фона
 +};
 +
 +/// Запись книги.
@@ -1457,6 +1555,7 @@ index 00000000..69dbdd9e
 +	const Common::Array<Image> &images() const { return _images; }
 +	const Common::Array<Page> &pages() const { return _pages; }
 +	const Common::Array<Record> &records() const { return _records; }
++	const Common::Array<Object> &objects() const { return _objects; }
 +	const Common::Array<Common::String> &classNames() const { return _classNames; }
 +	uint segmentCount() const { return _segmentCount; }
 +
@@ -1473,7 +1572,11 @@ index 00000000..69dbdd9e
 +	void scanRecords();
 +	void scanImages();
 +	void scanPages();
++	void scanPageText();
++	void scanObjects();
 +	void scanClassNames();
++
++	Common::Array<Object> _objects;
 +
 +	Common::Array<byte> _data;
 +	Common::Array<Image> _images;
@@ -1668,10 +1771,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..c46b3199
+index 00000000..fca39abc
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,288 @@
+@@ -0,0 +1,426 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1725,6 +1828,7 @@ index 00000000..c46b3199
 +
 +Common::Error ToolBookEngine::run() {
 +	initGraphics(640, 480);
++	_startMs = _system->getMillis();
 +
 +	Common::File file;
 +	const char *candidates[] = { "KNTOWER.EXE", "kntower.tbk", "RESOURCE.TBK", nullptr };
@@ -1752,7 +1856,17 @@ index 00000000..c46b3199
 +
 +	for (uint i = 0; i < _book->images().size(); i++)
 +		_rawImages.push_back(i);
-+	debug(0, "ToolBook: картинок: %u", _rawImages.size());
++	debug(0, "ToolBook: картинок: %u, объектов с прямоугольником: %u",
++			_rawImages.size(), _book->objects().size());
++
++	for (uint i = 0; i < _book->pages().size(); i++) {
++		const Page &p = _book->pages()[i];
++		Common::String names;
++		for (uint k = 0; k < p.objects.size() && k < 6; k++)
++			names += p.objects[k].name + " ";
++		debug(1, "ToolBook: страница %2u «%s»: объектов %u — %s",
++				i, p.name.c_str(), p.objects.size(), names.c_str());
++	}
 +
 +	showPage(0);
 +
@@ -1772,9 +1886,76 @@ index 00000000..c46b3199
 +	return Common::kNoError;
 +}
 +
++// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных прогонов,
++// такой же по смыслу, как в движке director. Строки вида
++//     1500 click 232 215
++//     4000 key 111
++// где первое число — миллисекунды от старта. Нужен, чтобы обход игры был
++// воспроизводимым и снимал одни и те же кадры для сверки с эталоном.
++void ToolBookEngine::loadInputScript() {
++	_inputScriptLoaded = true;
++	if (!ConfMan.hasKey("inputscript"))
++		return;
++
++	Common::File f;
++	if (!f.open(Common::FSNode(ConfMan.getPath("inputscript")))) {
++		warning("ToolBook: не открывается сценарий ввода %s",
++				ConfMan.get("inputscript").c_str());
++		return;
++	}
++	while (!f.eos()) {
++		Common::String line = f.readLine();
++		if (line.empty() || line[0] == '#')
++			continue;
++		uint32 t = 0;
++		char verb[16] = { 0 };
++		int a = 0, b = 0;
++		if (sscanf(line.c_str(), "%u %15s %d %d", &t, verb, &a, &b) < 2)
++			continue;
++		ScriptedInput in;
++		in.timeMs = t;
++		in.x = a;
++		in.y = b;
++		if (!strcmp(verb, "click"))
++			in.action = kInputClick;
++		else if (!strcmp(verb, "key"))
++			in.action = kInputKey;
++		else
++			continue;
++		_inputScript.push_back(in);
++	}
++	debug(0, "ToolBook: сценарий ввода: %u строк", _inputScript.size());
++}
++
++void ToolBookEngine::feedScriptedInput() {
++	if (!_inputScriptLoaded)
++		loadInputScript();
++
++	uint32 now = _system->getMillis() - _startMs;
++	while (_inputScriptPos < _inputScript.size() &&
++			_inputScript[_inputScriptPos].timeMs <= now) {
++		const ScriptedInput &in = _inputScript[_inputScriptPos++];
++		Common::Event ev;
++		if (in.action == kInputClick) {
++			ev.type = Common::EVENT_LBUTTONUP;
++			ev.mouse = Common::Point(in.x, in.y);
++		} else {
++			ev.type = Common::EVENT_KEYDOWN;
++			ev.kbd = Common::KeyState((Common::KeyCode)in.x, in.x);
++		}
++		_injected.push_back(ev);
++	}
++}
++
 +void ToolBookEngine::handleEvents() {
++	feedScriptedInput();
++
 +	Common::Event event;
-+	while (_system->getEventManager()->pollEvent(event)) {
++	while (!_injected.empty() || _system->getEventManager()->pollEvent(event)) {
++		if (!_injected.empty()) {
++			event = _injected[0];
++			_injected.remove_at(0);
++		}
 +		switch (event.type) {
 +		case Common::EVENT_KEYDOWN:
 +			switch (event.kbd.keycode) {
@@ -1813,13 +1994,27 @@ index 00000000..c46b3199
 +				_imageMode = !_imageMode;
 +				_needsRedraw = true;
 +				break;
++			case Common::KEYCODE_o:
++				// Рамки объектов страницы — проверка разбора прямоугольников.
++				_showHotspots = !_showHotspots;
++				_needsRedraw = true;
++				break;
 +			default:
 +				break;
 +			}
 +			break;
-+		case Common::EVENT_LBUTTONUP:
-+			// Правая половина экрана — вперёд, левая — назад. Настоящие кнопки
-+			// страницы появятся, когда будет разобран байт-код OpenScript.
++		case Common::EVENT_LBUTTONUP: {
++			// Сначала спрашиваем объекты страницы: у них теперь есть настоящие
++			// прямоугольники. Пока это только сообщение в лог — исполнять
++			// обработчик нечем, интерпретатора нет.
++			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
++			if (hit) {
++				debug(0, "ToolBook: щелчок по объекту «%s» (%d,%d)-(%d,%d)",
++						hit->name.c_str(), hit->rect.left, hit->rect.top,
++						hit->rect.right, hit->rect.bottom);
++				break;
++			}
++			// Промах — листаем: правая половина вперёд, левая назад.
 +			if (event.mouse.x > 320) {
 +				if (_currentPage + 1 < (int)_book->pages().size()) {
 +					_currentPage++;
@@ -1830,9 +2025,48 @@ index 00000000..c46b3199
 +				_needsRedraw = true;
 +			}
 +			break;
++		}
 +		default:
 +			break;
 +		}
++	}
++}
++
++const Object *ToolBookEngine::objectAt(int x, int y) const {
++	const Common::Array<Page> &pages = _book->pages();
++	if (_imageMode || _currentPage < 0 || _currentPage >= (int)pages.size())
++		return nullptr;
++
++	// Меньший объект выигрывает: полноэкранные прямоугольники вроде popkaRec
++	// лежат под всеми и не должны перехватывать щелчок.
++	const Object *best = nullptr;
++	int bestArea = 0;
++	const Common::Array<Object> &objs = pages[_currentPage].objects;
++	for (uint i = 0; i < objs.size(); i++) {
++		if (!objs[i].rect.contains(x, y))
++			continue;
++		int area = objs[i].rect.width() * objs[i].rect.height();
++		if (!best || area < bestArea) {
++			best = &objs[i];
++			bestArea = area;
++		}
++	}
++	return best;
++}
++
++void ToolBookEngine::drawObjectFrames(Graphics::Surface *screen, const Page &page) {
++	// Рамки объектов: пока интерпретатора нет, это единственный способ увидеть,
++	// правильно ли разобраны прямоугольники (клавиша o).
++	const uint32 color = screen->format.isCLUT8() ? 255 : screen->format.RGBToColor(0xff, 0, 0xff);
++	for (uint i = 0; i < page.objects.size(); i++) {
++		Common::Rect r = page.objects[i].rect;
++		r.clip(Common::Rect(0, 0, screen->w, screen->h));
++		if (r.isEmpty())
++			continue;
++		screen->drawLine(r.left, r.top, r.right - 1, r.top, color);
++		screen->drawLine(r.left, r.bottom - 1, r.right - 1, r.bottom - 1, color);
++		screen->drawLine(r.left, r.top, r.left, r.bottom - 1, color);
++		screen->drawLine(r.right - 1, r.top, r.right - 1, r.bottom - 1, color);
 +	}
 +}
 +
@@ -1874,11 +2108,18 @@ index 00000000..c46b3199
 +		drawPageInfo(screen, index, page);
 +	}
 +
++	if (_showHotspots)
++		drawObjectFrames(screen, page);
++
 +	_system->unlockScreen();
 +
-+	debug(1, "ToolBook: страница %d/%d «%s», фон %d, обработчиков %u, строк текста %u",
++	debug(1, "ToolBook: страница %d/%d «%s», фон %d, объектов %u, обработчиков %u, строк текста %u",
 +			index + 1, (int)pages.size(), page.name.c_str(), page.background,
-+			page.handlers.size(), page.text.size());
++			page.objects.size(), page.handlers.size(), page.text.size());
++	for (uint i = 0; i < page.objects.size() && i < 8; i++)
++		debug(2, "  объект %s (%d,%d)-(%d,%d)", page.objects[i].name.c_str(),
++				page.objects[i].rect.left, page.objects[i].rect.top,
++				page.objects[i].rect.right, page.objects[i].rect.bottom);
 +	for (uint i = 0; i < page.text.size() && i < 3; i++)
 +		debug(2, "  текст: %s", page.text[i].c_str());
 +}
@@ -1962,10 +2203,10 @@ index 00000000..c46b3199
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..04336551
+index 00000000..2e967568
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,103 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2000,6 +2241,7 @@ index 00000000..04336551
 +#include "engines/engine.h"
 +#include "common/array.h"
 +#include "common/error.h"
++#include "common/events.h"
 +#include "common/rect.h"
 +
 +struct ADGameDescription;
@@ -2030,6 +2272,8 @@ index 00000000..04336551
 +private:
 +	void showPage(int index);
 +	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
++	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
++	const struct Object *objectAt(int x, int y) const;
 +	void handleEvents();
 +
 +	const ADGameDescription *_desc;
@@ -2043,6 +2287,24 @@ index 00000000..04336551
 +	int _currentPage = 0;
 +	bool _quit = false;
 +	bool _needsRedraw = true;
++	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
++
++	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных
++	// прогонов; ключ конфига inputscript, см. toolbook.cpp.
++	enum ScriptedInputAction { kInputClick, kInputKey };
++	struct ScriptedInput {
++		uint32 timeMs;
++		ScriptedInputAction action;
++		int x, y;
++	};
++	Common::Array<ScriptedInput> _inputScript;
++	Common::Array<Common::Event> _injected;
++	uint _inputScriptPos = 0;
++	bool _inputScriptLoaded = false;
++	uint32 _startMs = 0;
++
++	void loadInputScript();
++	void feedScriptedInput();
 +};
 +
 +} // End of namespace ToolBook
