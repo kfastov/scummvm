@@ -1657,10 +1657,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..0ad2b2c9
+index 00000000..b4274844
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,798 @@
+@@ -0,0 +1,883 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2214,6 +2214,42 @@ index 00000000..0ad2b2c9
 +}
 +
 +// Распаковка потока картинки, см. book.h и ledger/0021.
++// Распаковка ровно так, как делает MTB40BAS.DLL (ledger/0039, 0042): поток —
++// это куски вида `[u16 число записей][записи…]`, цикл идёт заданное число раз,
++// а не «пока не заполнится приёмник».
++static uint32 unpackChunks(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
++		uint32 *usedOut) {
++	uint32 in = 0, out = 0;
++	while (out < dstLen && in + 2 <= srcLen) {
++		uint32 records = src[in] | (src[in + 1] << 8);
++		in += 2;
++		if (!records || records > 0xfff0)
++			break;
++		for (uint32 k = 0; k < records && in < srcLen; k++) {
++			byte c = src[in++];
++			if (c <= 0xf5) {
++				if (in >= srcLen)
++					break;
++				byte v = src[in++];
++				uint32 n = MIN<uint32>(c + 3, dstLen - out);
++				memset(dst + out, v, n);
++				out += n;
++			} else {
++				uint32 need = c - 0xf5;
++				uint32 n = MIN<uint32>(need, dstLen - out);
++				for (uint32 j = 0; j < n && in < srcLen; j++)
++					dst[out++] = src[in++];
++				in += (need > n) ? (need - n) : 0;
++			}
++			if (out >= dstLen)
++				break;
++		}
++	}
++	if (usedOut)
++		*usedOut = in;
++	return out;
++}
++
 +static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
 +		uint32 stride, uint32 *usedOut) {
 +	(void)stride;
@@ -2268,10 +2304,56 @@ index 00000000..0ad2b2c9
 +	usedLen = in;
 +}
 +
++// Сколько байт выхода даст поток, если считать его кусками с числом записей.
++static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
++	uint32 in = 0, out = 0;
++	while (out < want && in + 2 <= srcLen) {
++		uint32 records = src[in] | (src[in + 1] << 8);
++		in += 2;
++		if (!records || records > 0xfff0)
++			return 0;
++		for (uint32 k = 0; k < records; k++) {
++			if (in >= srcLen)
++				return 0;
++			byte c = src[in++];
++			if (c <= 0xf5) {
++				in++;
++				out += c + 3;
++			} else {
++				uint32 n = c - 0xf5;
++				in += n;
++				out += n;
++			}
++			if (out > want)
++				return 0;
++		}
++	}
++	return out;
++}
++
 +bool Book::locatePixels(Image &img) {
 +	if (img.pixels)
 +		return true;
-+	if (!img.compSize || !img.rawSize)
++	if (!img.rawSize)
++		return false;
++
++	// Основной путь (ledger/0044): поток лежит блоком сразу за блоком DIB и
++	// начинается с числа записей. Проверяем несколько ближайших положений.
++	const uint32 afterPal = img.offset + 40 + img.colors * 4;
++	for (uint32 shift = 4; shift <= 64; shift += 2) {
++		uint32 s = afterPal + shift;
++		if (s + 8 >= _data.size())
++			break;
++		uint32 got = probeChunks(&_data[s], MIN<uint32>(_data.size() - s, img.rawSize + 65536),
++				img.rawSize);
++		if (got == img.rawSize) {
++			img.pixels = s;
++			img.chunked = true;
++			return true;
++		}
++	}
++
++	if (!img.compSize)
 +		return false;
 +	if (img.segBase) {
 +		locateSegmentPixels(img.segBase);
@@ -2380,6 +2462,9 @@ index 00000000..0ad2b2c9
 +		if (img.pixels + img.rawSize > _data.size())
 +			return nullptr;
 +		memcpy(pixels.begin(), &_data[img.pixels], img.rawSize);
++	} else if (img.chunked) {
++		unpackChunks(&_data[img.pixels], _data.size() - img.pixels,
++				pixels.begin(), img.rawSize, nullptr);
 +	} else {
 +		unpackRLE(&_data[img.pixels], MIN<uint32>(img.compSize + 512, _data.size() - img.pixels),
 +				pixels.begin(), img.rawSize, img.stride, nullptr);
@@ -2461,10 +2546,10 @@ index 00000000..0ad2b2c9
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..fd8e0949
+index 00000000..c3b90d9b
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,200 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2552,6 +2637,9 @@ index 00000000..fd8e0949
 +	/// стоит десятки тысяч распаковок, и без этого перерисовка страницы
 +	/// подвисает на секунды.
 +	bool searched = false;
++	/// Поток найден в виде кусков `[u16 записей][записи]` — так его пишет сама
++	/// среда ToolBook (ledger/0039).
++	bool chunked = false;
 +
 +	/// База сегмента кучи, в котором лежит блок с этим DIB. Выводится из
 +	/// заголовка блока: длина блока известна (4 + 40 + палитра), значит
