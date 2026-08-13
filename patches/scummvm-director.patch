@@ -858,10 +858,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..796f08e4
+index 00000000..75b5de6f
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,1669 @@
+@@ -0,0 +1,1693 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1363,6 +1363,30 @@ index 00000000..796f08e4
 +	for (uint i = 0; i < owner->handlers.size(); i++)
 +		if (owner->handlers[i].eventHash == selector)
 +			return &owner->handlers[i];
++	return nullptr;
++}
++
++const Handler *Book::findMessageHandler(const Common::String &receiver, uint16 selector) const {
++	// Посылка 0x6c адресная: получатель лежит на стеке (RUN31:0x0194 кладёт его
++	// в описатель посылки). Ищем сегмент кучи с таким именем и разбираем его
++	// привязку скрипта тем же правилом, что и корневую (ledger/0055).
++	for (uint i = 0; i < _heapSegments.size(); i++) {
++		if (!_heapSegments[i].name.equalsIgnoreCase(receiver))
++			continue;
++		uint32 root = _heapSegments[i].base + 0x11;
++		if (root + 0x30 > _data.size())
++			continue;
++		uint16 binding = readU16(&_data[root + 0x2e]);
++		if (!binding)
++			continue;
++		for (uint k = 0; k < _scriptObjects.size(); k++) {
++			if (_scriptObjects[k].id != (uint32)(binding - 1))
++				continue;
++			for (uint n = 0; n < _scriptObjects[k].handlers.size(); n++)
++				if (_scriptObjects[k].handlers[n].eventHash == selector)
++					return &_scriptObjects[k].handlers[n];
++		}
++	}
 +	return nullptr;
 +}
 +
@@ -2533,10 +2557,10 @@ index 00000000..796f08e4
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..22915251
+index 00000000..209ae6e9
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,289 @@
+@@ -0,0 +1,291 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2763,6 +2787,8 @@ index 00000000..22915251
 +	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
 +	const ScriptObject *findScriptObjectByRecord(uint32 record) const;
 +	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
++	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
++	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 +	const Common::Array<Common::String> &classNames() const { return _classNames; }
 +	uint segmentCount() const { return _segmentCount; }
 +	uint16 readUint16(uint32 offset) const;
@@ -3005,10 +3031,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..8660b259
+index 00000000..a1cc087a
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,1754 @@
+@@ -0,0 +1,1800 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3810,6 +3836,29 @@ index 00000000..8660b259
 +			}
 +			break;
 +		}
++		case 0x35: {
++			// RUN34:0x44bc: `lodsb` — единица измерения, затем со стека снимаются
++			// два слова (`pop cx` — верхняя граница, `pop dx` — нижняя) и строка.
++			// Дальше считается длина и вызывается вырезка. Достигнута только
++			// единица 0 — символы; границы включительные и считаются с единицы,
++			// что видно по результату: `chars 1 to 15` от
++			// `C:\NMG\KNTOWER\KNTOWER.TBC` даёт каталог (ledger/0054).
++			uint8 unit = code[ip++];
++			Value to = pop();
++			Value from = pop();
++			Value text = pop();
++			if (unit != 0 || !text.isString) {
++				debug(1, "ToolBook: опкод 0x35 единица %u/строка %d 	0x%x",
++						unit, text.isString, handler.code + ip - 2);
++				return false;
++			}
++			uint32 first = from.number > 0 ? from.number - 1 : 0;
++			uint32 last = MIN<uint32>(to.number, text.string.size());
++			pushString(last > first ?
++					Common::String(text.string.c_str() + first, last - first) :
++					Common::String());
++			break;
++		}
 +		case 0x3b: {
 +			uint8 slot = code[ip++];
 +			if (slot == 0) {
@@ -3922,27 +3971,35 @@ index 00000000..8660b259
 +			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
 +			uint8 count = code[ip + 2];
 +			ip += 3;
-+			uint16 selector = _book->readUint16(nameTarget);
++uint16 selector = _book->readUint16(nameTarget);
 +			Common::String name = _book->readString(nameTarget + 2, 255);
 +			if (count) {
 +				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
-+				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
++				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано 	0x%x",
 +						name.c_str(), count, handler.code + ip - 3);
 +				return false;
 +			}
-+			const Handler *messageTarget = handler.ownerScriptRecord ?
-+					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
++			// Получателя кладут предыдущие инструкции: RUN31:0x0194 снимает со стека
++			// два дальних указателя (сам вызов 0x6c кладёт только 12 байт из 20) и
++			// записывает их в описатель посылки как получателя и контекст. Поэтому
++			// сообщение адресное: обработчик ищется у названного объекта, и лишь
++			// затем у себя (ledger/0055).
++			Value messageContext = pop();
++			Value messageReceiver = pop();
++			Common::String receiverName = messageReceiver.string;
++			const Handler *messageTarget = receiverName.empty() ? nullptr :
++					_book->findMessageHandler(receiverName, selector);
++			if (!messageTarget && handler.ownerScriptRecord)
++				messageTarget = _book->findScriptHandler(handler.ownerScriptRecord, selector);
 +			if (!messageTarget) {
-+				// Обработчик лежит в другом объекте: получатель приходит со стека
-+				// (два дальних указателя), порядок обхода ещё не наблюдался
-+				// (ledger/0053).
-+				debug(1, "ToolBook: сообщение %s (селектор %04x) не разрешено @0x%x",
-+						name.c_str(), selector, handler.code + ip - 3);
++				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено 	0x%x",
++						name.c_str(), selector, receiverName.c_str(), handler.code + ip - 3);
 +				return false;
 +			}
-+			Common::Array<Value> noArguments;
++			(void)messageContext;
++						Common::Array<Value> noArguments;
 +			Value messageResult;
-+			if (!runHandler(*messageTarget, noArguments, receiver,
++			if (!runHandler(*messageTarget, noArguments, messageReceiver,
 +					messageTarget->returnsValue ? &messageResult : nullptr, depth + 1))
 +				return false;
 +			if (messageTarget->returnsValue)
@@ -4087,6 +4144,16 @@ index 00000000..8660b259
 +					debug(2, "ToolBook: fileExists %s -> %s", probe.c_str(),
 +							present ? "true" : "false");
 +					pushString(present ? "true" : "false");
++								} else if (key == "SETFILEATTRIBUTES") {
++					// TB40DOS: смена атрибутов файла. Своей файловой системы у движка
++					// нет — атрибуты DOS ни на что не влияют, а на эталонном стенде
++					// вызов удаётся, поэтому возвращаем тот же успех. Ветку выбирает
++					// книга, и она должна выбрать ту же, что на стенде.
++					if (args.size() != 2)
++						return false;
++					debug(2, "ToolBook: setFileAttributes %s «%s» (пропущено)",
++							valueString(args[1]).c_str(), valueString(args[0]).c_str());
++					pushNumber(1);
 +								} else if (key == "GETINIVAR") {
 +					// TB40WIN: чтение переменной из INI-файла. Порядок аргументов взят не
 +					// из догадки, а из настоящего файла эталонного стенда
@@ -4276,6 +4343,11 @@ index 00000000..8660b259
 +			break;
 +		default:
 +			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, handler.code + ip - 1);
++			// Верхушка стека — то, с чем зовут неизвестный опкод.
++			for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 6; v--, n++)
++				debug(1, "    стек [-%d]: ширина %u тип %02x число %u стр «%s»",
++						n, stack[v].width, stack[v].type, stack[v].number,
++						valueString(stack[v]).c_str());
 +			return false;
 +		}
 +	}
