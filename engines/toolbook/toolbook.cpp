@@ -816,6 +816,43 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		}
 		case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
 		case 0x59: ip += 2; pushNumber(0, 2); break;
+		case 0x6c: {
+			// Посылка сообщения по имени неявному получателю. RUN34:0x4960
+			// читает u16 (смещение от байта, следующего за ним, — та же
+			// договорённость, что у 0x6d) и байт числа аргументов, после чего
+			// зовёт RUN31:0x0194 с описателем посылки: в него кладутся число
+			// аргументов (+6), u16 по цели (+8) и указатель на строку цель+2
+			// (+2/+4). То есть по цели лежит `[u16 селектор][имя\0]`.
+			uint16 rel = read16(ip);
+			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
+			uint8 count = code[ip + 2];
+			ip += 3;
+			uint16 selector = _book->readUint16(nameTarget);
+			Common::String name = _book->readString(nameTarget + 2, 255);
+			if (count) {
+				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
+				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
+						name.c_str(), count, handler.code + ip - 3);
+				return false;
+			}
+			const Handler *messageTarget = handler.ownerScriptRecord ?
+					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
+			if (!messageTarget) {
+				// Обработчик лежит в другом объекте: посылка идёт вверх по
+				// цепочке, а её порядок ещё не наблюдался (ledger/0053).
+				debug(1, "ToolBook: сообщение %s (селектор %04x) не разрешено @0x%x",
+						name.c_str(), selector, handler.code + ip - 3);
+				return false;
+			}
+			Common::Array<Value> noArguments;
+			Value messageResult;
+			if (!runHandler(*messageTarget, noArguments, receiver,
+					messageTarget->returnsValue ? &messageResult : nullptr, depth + 1))
+				return false;
+			if (messageTarget->returnsValue)
+				stack.push_back(messageResult);
+			break;
+		}
 		case 0x6d: {
 			uint16 rel = read16(ip);
 			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
