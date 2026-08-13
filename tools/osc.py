@@ -13,11 +13,11 @@
   `длина_кода + 7` (3 байта маркера, 2 поля, 2 байта хеша). Это и служит
   проверкой, что блок найден правильно.
 
-* Код всех без исключения обработчиков начинается одинаково::
-
-      26 | 0f f8 ff | 3b 03 | 0d fc ff | 3b 04 | 0d f8 ff
-
-  Пролог найден в 988 местах книги — столько в игре обработчиков.
+* Код обработчика начинается парой ``26 0f`` (вход в обработчик и изменение
+  стека). Дальнейшая часть пролога зависит от числа локальных переменных и
+  аргументов: например, наряду с обычным ``0f f8 ff ...`` у ``buttonClick``
+  кнопки ``Yes`` встречается ``0f f4 ff 07 ...``. Поэтому граница
+  подтверждается полем ``strOff``, а не одним шаблоном пролога.
 
 * **Таблица строк** — строки с нулём подряд. Перед именами-идентификаторами
   (именами сообщений и свойств) стоят два байта хеша, перед строковыми
@@ -32,11 +32,12 @@
 * Исходник скрипта в книге игры **не хранится** (в системной части ToolBook —
   хранится, сжатый обратными ссылками). Значит нужен разбор байт-кода.
 
-**Чего пока нет:** значения опкодов. Длины операндов в `OPERAND_LEN` выведены
-по согласованности разбора (блок обязан разбираться ровно до маркера) и
-проверены вручную на `ResetPage`; таблица неполна, на длинных обработчиках
-разбор упирается в неизвестный опкод. Пока это дизассемблер структуры, а не
-смысла.
+Диспетчер байт-кода найден в `MTB40RUN.EXE`: сегмент NE 34, чтение опкода по
+смещению `0x3448`, таблица переходов `SS:0x0b88`. Поэтому длины ниже взяты из
+настоящих обработчиков опкодов, а не подобраны по книге. Все 1805 обработчиков
+с целой таблицей строк разбираются ровно до маркера. Смысл сложных операций
+вызова объектов ещё восстанавливается; это по-прежнему дизассемблер, а не
+готовый интерпретатор.
 
 Использование::
 
@@ -54,34 +55,55 @@ import re
 import struct
 import sys
 
-# Пролог обработчика — общий для всех 988 блоков книги.
-PROLOGUE = bytes.fromhex('260ff8ff3b030dfcff3b040df8ff')
+# Общий двухбайтовый префикс. Размер кадра и раскладка аргументов после него
+# различаются, поэтому полный пролог нельзя использовать как сигнатуру.
+HANDLER_PREFIX = bytes.fromhex('260f')
 # Маркер конца кода и начала таблицы строк.
 END_MARK = bytes.fromhex('271d66')
 
-# Длины операндов. Выведены по согласованности разбора и проверены вручную на
-# обработчике ResetPage; часть значений ещё под вопросом (см. модуль docstring).
+# Длины операндов из диспетчера MTB40RUN.EXE. В книге «Башни знаний» реально
+# эта таблица разбирает 1805/1805 целых обработчиков.
 OPERAND_LEN = {
-    0x00: 0, 0x01: 0, 0x02: 2, 0x03: 0, 0x04: 0, 0x05: 1, 0x06: 4, 0x07: 2,
-    0x08: 2, 0x09: 0, 0x0a: 0, 0x0b: 0, 0x0c: 0, 0x0d: 2, 0x0f: 2, 0x10: 0,
-    0x12: 1, 0x14: 1, 0x15: 0, 0x19: 0, 0x1a: 0, 0x1b: 0, 0x20: 1, 0x21: 1,
-    0x22: 2, 0x23: 2, 0x24: 0, 0x25: 0, 0x26: 0, 0x27: 0, 0x29: 0, 0x2a: 0,
-    0x2b: 0, 0x2c: 1, 0x2d: 1, 0x2e: 0, 0x2f: 3, 0x31: 0, 0x33: 0, 0x35: 0,
-    0x36: 0, 0x37: 0, 0x3a: 2, 0x3b: 1, 0x3c: 0, 0x3f: 0, 0x40: 0, 0x41: 0,
-    0x42: 0, 0x44: 0, 0x46: 4, 0x4a: 0, 0x56: 2, 0x64: 0, 0x68: 1, 0x6c: 2,
-    0x6d: 2, 0x72: 1, 0x73: 0, 0x77: 0
+    0x00: 2, 0x01: 2, 0x02: 2, 0x03: 2, 0x04: 1, 0x05: 2, 0x06: 4,
+    0x07: 2, 0x08: 2, 0x09: 2, 0x0a: 2, 0x0b: 2, 0x0c: 2, 0x0d: 2,
+    0x0f: 2, 0x10: 1, 0x12: 2, 0x13: 2, 0x14: 2, 0x15: 2,
+    0x19: 0, 0x1a: 0, 0x1b: 0, 0x1e: 3, 0x1f: 3,
+    0x20: 3, 0x21: 2, 0x22: 2, 0x23: 2, 0x24: 0, 0x25: 1,
+    0x26: 0, 0x27: 0, 0x29: 1, 0x2a: 0, 0x2b: 1, 0x2c: 1,
+    0x2d: 1, 0x2e: 1, 0x2f: 0, 0x30: 0, 0x31: 0, 0x32: 0,
+    0x33: 1, 0x34: 1, 0x35: 1, 0x36: 1, 0x37: 1, 0x38: 1,
+    0x39: 1, 0x3a: 3, 0x3b: 1,
+    0x3c: 0, 0x3e: 4, 0x3f: 4, 0x40: 2, 0x41: 0, 0x42: 0,
+    0x44: 2, 0x45: 2, 0x46: 2, 0x48: 0, 0x49: 0, 0x4a: 1,
+    0x4b: 2, 0x53: 2, 0x56: 0, 0x59: 2, 0x64: 2, 0x68: 2,
+    0x6c: 3, 0x6d: 5, 0x71: 2, 0x72: 1, 0x73: 0, 0x76: 3,
+    0x77: 0,
 }
 
 # Как читается операнд: ссылка на таблицу строк или число.
 REF_OPS = {0x07, 0x08, 0x6c}
-LOCAL_OPS = {0x02, 0x0d, 0x0f}
+LOCAL_OPS = {0x00, 0x01, 0x02, 0x03, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+             0x0f, 0x45, 0x46, 0x59, 0x68}
+
+OP_NAME = {
+    0x00: 'loadLocalU8', 0x01: 'loadLocalW', 0x02: 'loadLocalD',
+    0x03: 'loadLocalQ', 0x04: 'pushU8', 0x05: 'pushU16',
+    0x06: 'pushU32', 0x07: 'pushNearRef', 0x08: 'pushFarRef',
+    0x09: 'pushLocalPtr', 0x0a: 'pushLocalFarPtr',
+    0x0b: 'storeLocalU8', 0x0c: 'storeLocalW', 0x0d: 'storeLocalD',
+    0x0f: 'adjustStack', 0x10: 'dupBytes', 0x12: 'jump',
+    0x13: 'jumpIfTrueW', 0x14: 'jumpIfFalseW',
+    0x15: 'jumpIfFalseD', 0x19: 'restoreCodePtr',
+    0x21: 'callBuiltinVoid', 0x22: 'callBuiltinW',
+    0x23: 'callBuiltinD', 0x26: 'enterHandler',
+}
 
 # Опкод 0x23 берёт номер класса/встроенного имени. Номера свои, с таблицей
 # имён компилятора не совпадают (ledger/0024); значения ниже выведены по тому,
 # какая строка лежит на стеке перед инструкцией, на сотнях обработчиков.
 CLASS_ID = {
-    177: 'background',   # popka, Stories, map, Question — имена фонов
-    180: 'page',         # zast2, zast3, mainMenu, game_21_2 — имена страниц
+    177: 'background',   # consumes a background name from bytecode
+    180: 'page',         # consumes a page name from bytecode
     482: 'callMCI',      # play mySound, close mySound wait, stop myMIDI wait
 }
 
@@ -104,7 +126,7 @@ def read_book(path: str) -> bytes:
 
 def find_handlers(data: bytes) -> list[dict]:
     """Все обработчики книги: код и таблица строк."""
-    starts = [m.start() for m in re.finditer(re.escape(PROLOGUE), data, re.S)]
+    starts = [m.start() for m in re.finditer(re.escape(HANDLER_PREFIX), data, re.S)]
     marks = [m.start() for m in re.finditer(re.escape(END_MARK), data, re.S)]
     out = []
     for s in starts:
@@ -113,9 +135,7 @@ def find_handlers(data: bytes) -> list[dict]:
             continue
         m = marks[k]
         # проверка целостности: поле указывает ровно за маркер
-        if struct.unpack_from('<H', data, m + 3)[0] != (m - s) + 7:
-            out.append({'code_at': s, 'broken': True, 'code': data[s:m],
-                        'strings': [], 'name': None})
+        if m + 5 > len(data) or struct.unpack_from('<H', data, m + 3)[0] != (m - s) + 7:
             continue
         p = m + 5
         strings = []
@@ -160,7 +180,7 @@ def disasm(h: dict) -> list[str]:
             lines.append(f'{i:5}: {op:02x} ??? (дальше не разобрано)')
             lines.append(f'       хвост: {code[i:].hex()}')
             break
-        text = f'{op:02x}'
+        text = f'{op:02x} {OP_NAME.get(op, "")}'.rstrip()
         if ln == 1:
             text += f' {code[i + 1]}'
         elif ln == 2:
@@ -175,6 +195,25 @@ def disasm(h: dict) -> list[str]:
                 text += f' {v}'
         elif ln == 4:
             text += f' {struct.unpack_from("<i", code, i + 1)[0]}'
+        elif ln == 3:
+            a = code[i + 1]
+            v = struct.unpack_from('<H', code, i + 2)[0]
+            if op == 0x3a:
+                s = string_at(h, i + 4 + v)
+                text += f' {a} -> {s!r}' if s is not None else f' {a} -> @{i + 4 + v}'
+            elif op == 0x6c:
+                # У 6c сначала относительная ссылка, затем однобайтовый флаг.
+                v = struct.unpack_from('<H', code, i + 1)[0]
+                s = string_at(h, i + 3 + v)
+                text += f' -> {s!r} {code[i + 3]}' if s is not None else \
+                        f' -> @{i + 3 + v} {code[i + 3]}'
+            else:
+                text += f' {a} {v}'
+        elif ln == 5:
+            rel = struct.unpack_from('<H', code, i + 1)[0]
+            s = string_at(h, i + 3 + rel)
+            text += f' -> {s!r}' if s is not None else f' -> @{i + 3 + rel}'
+            text += f' {code[i + 3]} {struct.unpack_from("<H", code, i + 4)[0]}'
         lines.append(f'{i:5}: {text}')
         i += 1 + ln
     return lines

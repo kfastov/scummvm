@@ -78,6 +78,9 @@ esac
 # -cpu pentium3 — Windows 98 спотыкается на слишком «новых» CPUID.
 # -vga cirrus   — под Cirrus GD5446 у Windows 98 есть родные драйверы, DirectDraw заводится.
 # -device sb16  — то, что игры 90-х ожидают увидеть как звуковую карту.
+# -audiodev none — звук в госте работает логически, но тесты ничего не выводят
+#                  на стандартное устройство macOS. AUDIO_DRIVER=coreaudio
+#                  можно указать вручную только для отдельной проверки звука.
 # -device pcnet — AMD PCnet, драйвер тоже есть в коробке (нужен, чтобы таскать файлы по сети).
 #
 # usb-tablet намеренно НЕ подключаем: Windows 98 отдаёт ему указатель, драйвера USB HID
@@ -86,13 +89,14 @@ esac
 # Тип машины: снимок состояния можно поднять только на том же типе, на котором
 # он снят. QEMU обновился — старые снимки требуют MACHINE=pc-i440fx-10.1.
 MACHINE="${MACHINE:-pc}"
+AUDIO_DRIVER="${AUDIO_DRIVER:-none}"
 
 ARGS=(
 	-machine "$MACHINE,accel=tcg"
 	-cpu pentium3
 	-m "$RAM"
 	-vga cirrus
-	-audiodev coreaudio,id=snd0
+	-audiodev "$AUDIO_DRIVER,id=snd0"
 	-device sb16,audiodev=snd0
 	-netdev user,id=net0
 	-device pcnet,netdev=net0
@@ -108,6 +112,13 @@ ARGS=(
 	-usb
 	-device usb-tablet
 )
+
+# GDB=1 — заглушка удалённого протокола на localhost:1234. Она нужна для
+# воспроизводимой отладки 16-битной среды ToolBook через tools/gdbcli.py;
+# обычный запуск стенда не останавливается и порт не открывает.
+if [ "${GDB:-0}" = "1" ]; then
+	ARGS+=(-s)
+fi
 
 # HEADLESS=1 — без окна, только через монитор (удобно для скриптованной установки)
 if [ "${HEADLESS:-0}" = "1" ]; then

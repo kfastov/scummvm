@@ -35,6 +35,7 @@ find "$RUNDIR/frames" -name '*.png' -delete
 cd "$RUNDIR"
 
 ARGS=(-c scummvm.ini -g surfacesdl -d "${DEBUG:-1}")
+[ "$TARGET" = "bashnya-toolbook" ] && ARGS+=(--extrapath="$ROOT/scummvm-src/dists/engine-data")
 [ "${DUMP:-0}" = "1" ] && ARGS+=(-u)
 
 echo "==> $TARGET, вслепую, ${RUNTIME}s"
