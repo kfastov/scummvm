@@ -470,7 +470,7 @@ void Book::scanScriptObjects() {
 		ScriptObject object;
 		object.record = record.offset;
 		object.script = script;
-		appendScriptHandlers(script, end, object.handlers);
+		appendScriptHandlers(script, end, object.handlers, record.offset);
 		handlerCount += object.handlers.size();
 		_scriptObjects.push_back(object);
 	}
@@ -482,6 +482,23 @@ const ScriptObject *Book::findScriptObject(uint16 handle, uint16 selector) const
 	for (uint i = 0; i < _scriptObjects.size(); i++)
 		if (_scriptObjects[i].handle == handle && _scriptObjects[i].selector == selector)
 			return &_scriptObjects[i];
+	return nullptr;
+}
+
+const ScriptObject *Book::findScriptObjectByRecord(uint32 record) const {
+	for (uint i = 0; i < _scriptObjects.size(); i++)
+		if (_scriptObjects[i].record == record)
+			return &_scriptObjects[i];
+	return nullptr;
+}
+
+const Handler *Book::findScriptHandler(uint32 ownerRecord, uint16 selector) const {
+	const ScriptObject *owner = findScriptObjectByRecord(ownerRecord);
+	if (!owner)
+		return nullptr;
+	for (uint i = 0; i < owner->handlers.size(); i++)
+		if (owner->handlers[i].eventHash == selector)
+			return &owner->handlers[i];
 	return nullptr;
 }
 
@@ -584,7 +601,7 @@ void Book::scanScriptObjectIndex() {
 }
 
 void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
-		Common::Array<Handler> &out) const {
+		Common::Array<Handler> &out, uint32 ownerScriptRecord) const {
 	if (script + 0x18 > scriptEnd)
 		return;
 	uint16 count = readU16(&_data[script + 0x16]);
@@ -620,6 +637,7 @@ void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
 			if (_handlers[h].code != code)
 				continue;
 			Handler handler = _handlers[h];
+			handler.ownerScriptRecord = ownerScriptRecord;
 			handler.eventHash = eventHash;
 			out.push_back(handler);
 			found = true;
@@ -640,6 +658,7 @@ void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
 				Handler handler;
 				handler.code = code;
 				handler.codeSize = marker - code;
+				handler.ownerScriptRecord = ownerScriptRecord;
 				handler.eventHash = eventHash;
 				readHandlerStrings(code, handler);
 				out.push_back(handler);
@@ -655,6 +674,7 @@ void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
 			Handler handler;
 			handler.code = code;
 			handler.codeSize = 1;
+			handler.ownerScriptRecord = ownerScriptRecord;
 			handler.eventHash = eventHash;
 			out.push_back(handler);
 			found = true;
@@ -670,7 +690,9 @@ void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
 				Handler handler;
 				handler.code = code;
 				handler.codeSize = marker - code;
+				handler.ownerScriptRecord = ownerScriptRecord;
 				handler.eventHash = eventHash;
+				handler.returnsValue = true;
 				out.push_back(handler);
 				break;
 			}

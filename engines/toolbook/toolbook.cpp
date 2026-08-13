@@ -201,16 +201,19 @@ void ToolBookEngine::dispatchObjectEvent(const Object &object, uint16 eventHash)
 // current handler: fabricating a return value could select a game branch that
 // the serialized OpenScript never selected.
 bool ToolBookEngine::runHandler(const Handler &handler) {
-	struct Value {
-		uint32 number = 0;
-		Common::String string;
-		bool isString = false;
-		bool isObject = false;
-		bool hasReference = false;
-		uint32 reference = 0; // serialized near/far reference target in the book
-		uint8 type = 0; // ToolBook runtime type byte (when known)
-		uint8 width = 4; // physical VM stack width: W=2, D=4, extended=10
-	};
+	Common::Array<ScriptValue> arguments;
+	ScriptValue receiver;
+	return runHandler(handler, arguments, receiver, nullptr, 0);
+}
+
+bool ToolBookEngine::runHandler(const Handler &handler,
+		const Common::Array<ScriptValue> &arguments,
+		const ScriptValue &receiver, ScriptValue *result, uint depth) {
+	typedef ScriptValue Value;
+	if (depth >= 64) {
+		warning("ToolBook: слишком глубокая цепочка OpenScript @0x%x", handler.code);
+		return false;
+	}
 	static const uint8 kTypeWidths[0x5f] = {
 		4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 8, 4, 4,
 		4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2,
@@ -221,6 +224,11 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 	};
 	Common::Array<Value> stack;
 	Common::HashMap<int, Value> locals;
+	int argumentOffset = 8;
+	for (uint i = 0; i < arguments.size(); i++) {
+		locals[argumentOffset] = arguments[i];
+		argumentOffset += arguments[i].width;
+	}
 	const byte *code = _book->bytes(handler.code, handler.codeSize);
 	if (!code)
 		return false;
@@ -512,7 +520,13 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 		}
 		case 0x26: break;
 		case 0x27: return true;
-		case 0x28: return true;
+		case 0x28:
+			if (result) {
+				if (stack.empty())
+					return false;
+				*result = pop();
+			}
+			return true;
 		case 0x2b: { // coerce a dynamic value to another dynamic type
 			uint8 type = code[ip++];
 			if (!stack.empty()) {
@@ -551,7 +565,16 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 				stack.back().width = 4;
 			break;
 		case 0x33: ip++; break;
-		case 0x3b: { uint8 slot = code[ip++]; if (slot == 2) pushString(_book->pages()[_currentPage].name); else pushNumber(0); break; }
+		case 0x3b: {
+			uint8 slot = code[ip++];
+			if (slot == 2)
+				pushString(_book->pages()[_currentPage].name);
+			else if (slot == 3 || slot == 4)
+				stack.push_back(receiver);
+			else
+				pushNumber(0);
+			break;
+		}
 		case 0x3c:
 			if (!stack.empty())
 				stack.back().width = 4;
@@ -609,14 +632,16 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 			Common::String name = _book->readString(nameTarget + 2, 255);
 			Common::String key = name;
 			key.toUppercase();
-			if (kind == 1 && _nativeFunctions.contains(key)) {
-				const NativeBinding &binding = _nativeFunctions.getVal(key);
+			uint16 selector = _book->readUint16(nameTarget);
+			const Handler *scriptTarget = kind == 1 && handler.ownerScriptRecord ?
+					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
+			if (kind == 1 && (scriptTarget || _nativeFunctions.contains(key))) {
 				// The linked thunk has its own marshalling signature. It is not
 				// equal to the wire's explicit byte count: a property-style call
 				// may use the implicit receiver as its first native D argument.
 				Common::Array<Value> args;
 				pop(); // duplicated lookup context
-				Value receiver = pop();
+				Value callReceiver = pop();
 				uint consumed = 0;
 				while (!stack.empty() && consumed < argumentBytes) {
 					consumed += stack.back().width;
@@ -626,24 +651,35 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 					debug(1, "ToolBook: native %s argument stack mismatch", name.c_str());
 					return false;
 				}
-				if (key == "DISPLAYFONTS") {
+				if (scriptTarget) {
+					Common::Array<Value> orderedArgs;
+					for (int i = (int)args.size() - 1; i >= 0; i--)
+						orderedArgs.push_back(args[i]);
+					Value callResult;
+					if (!runHandler(*scriptTarget, orderedArgs, callReceiver,
+							scriptTarget->returnsValue ? &callResult : nullptr, depth + 1))
+						return false;
+					if (scriptTarget->returnsValue)
+						stack.push_back(callResult);
+				} else if (key == "DISPLAYFONTS") {
+					const NativeBinding &binding = _nativeFunctions.getVal(key);
 					if (binding.argumentBytes != 4 || argumentBytes != 0) {
 						debug(1, "ToolBook: unexpected displayFonts signature");
 						return false;
 					}
-					Common::String family = receiver.string;
-					Common::String result;
+					Common::String family = callReceiver.string;
+					Common::String fontList;
 					for (Common::HashMap<Common::String, NativeFontFace>::const_iterator it =
 							_nativeFonts.begin(); it != _nativeFonts.end(); ++it) {
 						const NativeFontFace &face = it->_value;
 						if (!family.empty() && !face.name.equalsIgnoreCase(family))
 							continue;
-						result += face.name;
+						fontList += face.name;
 						for (uint s = 0; s < face.points.size(); s++)
-							result += Common::String::format(",%u", face.points[s]);
-						result += "\r\n";
+							fontList += Common::String::format(",%u", face.points[s]);
+						fontList += "\r\n";
 					}
-					pushString(result);
+					pushString(fontList);
 				} else {
 					debug(1, "ToolBook: native function %s пока не реализована @0x%x",
 							name.c_str(), handler.code + ip - 6);
@@ -668,6 +704,11 @@ bool ToolBookEngine::runHandler(const Handler &handler) {
 			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, handler.code + ip - 1);
 			return false;
 		}
+	}
+	if (handler.returnsValue && result) {
+		if (stack.empty())
+			return false;
+		*result = pop();
 	}
 	return true;
 }
