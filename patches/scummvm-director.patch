@@ -1,18 +1,20 @@
 diff --git a/backends/graphics/surfacesdl/surfacesdl-graphics.cpp b/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
-index 02abddf9..30eb45b0 100644
+index 02abddf9..65ba1f5f 100644
 --- a/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
 +++ b/backends/graphics/surfacesdl/surfacesdl-graphics.cpp
-@@ -1381,6 +1381,10 @@ void SurfaceSdlGraphicsManager::internUpdateScreen() {
- 			dst.x += _maxExtraPixels;	// Shift rect since some scalers need to access the data around
- 			dst.y += _maxExtraPixels;	// any pixel to scale it, and we want to avoid mem access crashes.
- 
-+			// ЛОКАЛЬНАЯ ПРАВКА: см. выше — под dummy поверхности могут отсутствовать.
-+			if (!origSurf || !srcSurf)
-+				continue;
-+
- 			if (!blitSurface(origSurf, r, srcSurf, &dst))
- 				error("SDL_BlitSurface failed: %s", SDL_GetError());
- 		}
+@@ -1370,7 +1370,11 @@ void SurfaceSdlGraphicsManager::internUpdateScreen() {
+ #if SDL_VERSION_ATLEAST(2, 0, 0)
+ 	bool doPresent = false;
+ #endif
+-	if (actualDirtyRects > 0 || _cursorNeedsRedraw) {
++	// The SDL dummy video driver can leave the display surfaces unavailable
++	// during the first graphics transaction.  Skip that transaction as a
++	// whole: guarding only the blit below still lets SDL_LockSurface(nullptr)
++	// crash before the engine is created.
++	if ((actualDirtyRects > 0 || _cursorNeedsRedraw) && origSurf && srcSurf && _hwScreen) {
+ 		SDL_Rect *r;
+ 		SDL_Rect dst;
+ 		uint32 bpp, srcPitch, dstPitch;
 @@ -1980,6 +1984,13 @@ void SurfaceSdlGraphicsManager::clearOverlay() {
  	if (!_overlayVisible)
  		return;
@@ -137,807 +139,6 @@ index 7587340a..2a7e4c21 100644
  		} else {
  			previousCastId = _sprite->_castId;
  			replaceSprite(nextSprite);
-diff --git a/engines/director/debug-bridge.cpp b/engines/director/debug-bridge.cpp
-new file mode 100644
-index 00000000..8809ecbb
---- /dev/null
-+++ b/engines/director/debug-bridge.cpp
-@@ -0,0 +1,695 @@
-+/* ScummVM - Graphic Adventure Engine
-+ *
-+ * ScummVM is the legal property of its developers, whose names
-+ * are too numerous to list here. Please refer to the COPYRIGHT
-+ * file distributed with this source distribution.
-+ *
-+ * This program is free software: you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation, either version 3 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-+ *
-+ */
-+
-+// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): см. debug-bridge.h.
-+
-+#define FORBIDDEN_SYMBOL_ALLOW_ALL
-+
-+#include <errno.h>
-+#include <fcntl.h>
-+#include <netinet/in.h>
-+#include <netinet/tcp.h>
-+#include <string.h>
-+#include <sys/socket.h>
-+#include <unistd.h>
-+
-+#include "common/file.h"
-+#include "common/events.h"
-+#include "common/system.h"
-+#include "common/memstream.h"
-+#include "common/tokenizer.h"
-+#include "graphics/paletteman.h"
-+#include "graphics/surface.h"
-+#include "image/png.h"
-+
-+#include "director/director.h"
-+#include "director/debugger.h"
-+#include "director/debug-bridge.h"
-+#include "director/cast.h"
-+#include "director/castmember/castmember.h"
-+#include "director/channel.h"
-+#include "director/frame.h"
-+#include "director/movie.h"
-+#include "director/score.h"
-+#include "director/sound.h"
-+#include "director/sprite.h"
-+#include "director/types.h"
-+#include "director/window.h"
-+#include "director/lingo/lingo.h"
-+#include "director/lingo/lingo-object.h"
-+
-+namespace Director {
-+
-+static Common::String jsonEscape(const Common::String &s) {
-+	Common::String out;
-+	for (uint i = 0; i < s.size(); i++) {
-+		byte c = (byte)s[i];
-+		switch (c) {
-+		case '"':  out += "\\\""; break;
-+		case '\\': out += "\\\\"; break;
-+		case '\n': out += "\\n"; break;
-+		case '\r': out += "\\r"; break;
-+		case '\t': out += "\\t"; break;
-+		default:
-+			// Управляющие байты пропускаем через \u, всё остальное — как есть.
-+			// Строки движка бывают в кодировке игры, а не в UTF-8; клиент
-+			// декодирует их сам, поэтому старшие байты не трогаем.
-+			if (c < 0x20)
-+				out += Common::String::format("\\u%04x", c);
-+			else
-+				out += (char)c;
-+		}
-+	}
-+	return out;
-+}
-+
-+DebugBridge::DebugBridge() {
-+	_listenFd = -1;
-+	_clientFd = -1;
-+}
-+
-+DebugBridge::~DebugBridge() {
-+	closeClient();
-+	if (_listenFd >= 0)
-+		::close(_listenFd);
-+}
-+
-+bool DebugBridge::listen(int port) {
-+	_listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
-+	if (_listenFd < 0) {
-+		warning("DebugBridge: сокет не создан: %s", strerror(errno));
-+		return false;
-+	}
-+
-+	int yes = 1;
-+	::setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-+
-+	struct sockaddr_in addr;
-+	memset(&addr, 0, sizeof(addr));
-+	addr.sin_family = AF_INET;
-+	addr.sin_port = htons((uint16)port);
-+	addr.sin_addr.s_addr = htonl(0x7f000001); // только localhost
-+
-+	if (::bind(_listenFd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-+		warning("DebugBridge: порт %d занят: %s", port, strerror(errno));
-+		::close(_listenFd);
-+		_listenFd = -1;
-+		return false;
-+	}
-+
-+	if (::listen(_listenFd, 1) < 0) {
-+		warning("DebugBridge: listen(%d): %s", port, strerror(errno));
-+		::close(_listenFd);
-+		_listenFd = -1;
-+		return false;
-+	}
-+
-+	::fcntl(_listenFd, F_SETFL, O_NONBLOCK);
-+	warning("DebugBridge: слушаю 127.0.0.1:%d", port);
-+	return true;
-+}
-+
-+void DebugBridge::acceptClient() {
-+	int fd = ::accept(_listenFd, nullptr, nullptr);
-+	if (fd < 0)
-+		return;
-+
-+	// Один клиент за раз: новое подключение вытесняет старое.
-+	closeClient();
-+
-+	int yes = 1;
-+	::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-+	::fcntl(fd, F_SETFL, O_NONBLOCK);
-+	_clientFd = fd;
-+	_inbuf.clear();
-+}
-+
-+void DebugBridge::closeClient() {
-+	if (_clientFd >= 0) {
-+		::close(_clientFd);
-+		_clientFd = -1;
-+	}
-+	_inbuf.clear();
-+}
-+
-+void DebugBridge::send(const Common::String &payload, bool ok) {
-+	if (_clientFd < 0)
-+		return;
-+
-+	Common::String line = Common::String::format("{\"ok\":%s,\"out\":\"%s\"}\n",
-+			ok ? "true" : "false", jsonEscape(payload).c_str());
-+
-+	const char *p = line.c_str();
-+	size_t left = line.size();
-+	// Ответы короткие, но клиент может читать медленно. Крутимся с потолком,
-+	// чтобы залипший клиент не остановил движок навсегда.
-+	for (int spins = 0; left > 0 && spins < 100000; spins++) {
-+		ssize_t n = ::write(_clientFd, p, left);
-+		if (n > 0) {
-+			p += n;
-+			left -= n;
-+			continue;
-+		}
-+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-+			continue;
-+		break;
-+	}
-+}
-+
-+void DebugBridge::poll() {
-+	if (_listenFd < 0)
-+		return;
-+
-+	// Отложенный ввод: всё, чему пришло время.
-+	uint32 now = g_system->getMillis();
-+	while (!_pending.empty() && _pending[0].atMs <= now) {
-+		PendingInput in = _pending.remove_at(0);
-+		if (in.type != Common::EVENT_MOUSEMOVE)
-+			pushMouse(Common::EVENT_MOUSEMOVE, in.x, in.y);
-+		pushMouse(in.type, in.x, in.y);
-+	}
-+
-+	acceptClient();
-+	readCommands();
-+}
-+
-+void DebugBridge::readCommands() {
-+	if (_clientFd < 0)
-+		return;
-+
-+	char buf[4096];
-+	for (;;) {
-+		ssize_t n = ::read(_clientFd, buf, sizeof(buf));
-+		if (n > 0) {
-+			for (ssize_t i = 0; i < n; i++)
-+				_inbuf += buf[i];
-+			continue;
-+		}
-+		if (n == 0) { // клиент отключился
-+			closeClient();
-+			return;
-+		}
-+		break; // EAGAIN
-+	}
-+
-+	for (;;) {
-+		uint nl = 0;
-+		while (nl < _inbuf.size() && _inbuf[nl] != '\n')
-+			nl++;
-+		if (nl >= _inbuf.size())
-+			break;
-+
-+		Common::String line(_inbuf.c_str(), nl);
-+		_inbuf = Common::String(_inbuf.c_str() + nl + 1);
-+		line.trim();
-+		if (line.empty())
-+			continue;
-+
-+		Common::String out = execute(line);
-+		send(out, true);
-+	}
-+}
-+
-+void DebugBridge::pushMouse(int type, int x, int y) {
-+	// Кладём в сам менеджер событий: Lingo читает положение и кнопки мыши
-+	// напрямую (getMousePos/getButtonState), поэтому события в обход менеджера
-+	// для игры не существуют.
-+	Common::Event ev;
-+	ev.type = (Common::EventType)type;
-+	ev.mouse = Common::Point(x, y);
-+	g_system->getEventManager()->pushEvent(ev);
-+}
-+
-+void DebugBridge::schedule(uint32 atMs, int type, int x, int y) {
-+	PendingInput in;
-+	in.atMs = atMs;
-+	in.type = type;
-+	in.x = x;
-+	in.y = y;
-+	_pending.push_back(in);
-+}
-+
-+// ---------------------------------------------------------------- команды
-+
-+Common::String DebugBridge::cmdState() {
-+	Common::String out;
-+	Window *window = g_director->getCurrentWindow();
-+	Movie *movie = window ? window->getCurrentMovie() : nullptr;
-+
-+	out += Common::String::format("millis: %u\n", g_system->getMillis());
-+	out += Common::String::format("mouse: %d,%d buttons: %d\n",
-+			g_system->getEventManager()->getMousePos().x,
-+			g_system->getEventManager()->getMousePos().y,
-+			g_system->getEventManager()->getButtonState());
-+
-+	if (!movie) {
-+		out += "movie: (нет)\n";
-+		return out;
-+	}
-+
-+	Score *score = movie->getScore();
-+	out += Common::String::format("movie: %s\n", movie->getArchive() ?
-+			movie->getArchive()->getPathName().toString('/').c_str() : "(без архива)");
-+	out += Common::String::format("path: %s\n", window->getCurrentPath().c_str());
-+	out += Common::String::format("frame: %d of %d\n", score->getCurrentFrameNum(), score->getFramesNum());
-+	out += Common::String::format("playState: %d\n", (int)score->_playState);
-+	out += Common::String::format("channels: %d\n", (int)score->_channels.size());
-+	out += Common::String::format("version: %d\n", g_director->getVersion());
-+
-+	// Метка кадра, если есть — по ней удобно понимать, где мы в сценарии.
-+	Common::String label = score->getFrameLabel(score->getCurrentFrameNum());
-+	if (!label.empty())
-+		out += Common::String::format("label: %s\n", label.c_str());
-+
-+	return out;
-+}
-+
-+Common::String DebugBridge::cmdSprites(bool all) {
-+	Window *window = g_director->getCurrentWindow();
-+	Movie *movie = window ? window->getCurrentMovie() : nullptr;
-+	if (!movie)
-+		return "нет фильма";
-+
-+	Score *score = movie->getScore();
-+	Common::Point mouse = g_system->getEventManager()->getMousePos();
-+	Common::String out;
-+
-+	out += Common::String::format("кадр %d, каналов %d, мышь %d,%d\n",
-+			score->getCurrentFrameNum(), (int)score->_channels.size(), mouse.x, mouse.y);
-+
-+	for (uint i = 0; i < score->_channels.size(); i++) {
-+		Channel *ch = score->_channels[i];
-+		if (!ch || !ch->_sprite)
-+			continue;
-+		Sprite *sp = ch->_sprite;
-+		if (!all && !sp->_castId.member)
-+			continue;
-+
-+		Common::Rect bbox = ch->getBbox();
-+		CastMember *cast = movie->getCastMember(sp->_castId);
-+		CastMemberInfo *info = movie->getCastMemberInfo(sp->_castId);
-+
-+		out += Common::String::format(
-+				"ch %-3d cast %-10s %-9s %-16s bbox (%d,%d)-(%d,%d) vis %d puppet %d/%04x move %d "
-+				"script %s beh %d inst %d frames [%d..%d] mouse %d\n",
-+				i, sp->_castId.asString().c_str(),
-+				cast ? castType2str(cast->_type) : "—",
-+				info && !info->name.empty() ? info->name.c_str() : "",
-+				bbox.left, bbox.top, bbox.right, bbox.bottom,
-+				ch->_visible, sp->_puppet, sp->_autoPuppet, sp->_moveable,
-+				sp->_scriptId.asString().c_str(),
-+				(int)sp->_behaviors.size(), (int)ch->_scriptInstanceList.size(),
-+				ch->_startFrame, ch->_endFrame,
-+				sp->respondsToMouse());
-+	}
-+
-+	return out;
-+}
-+
-+Common::String DebugBridge::cmdHit(int x, int y) {
-+	Window *window = g_director->getCurrentWindow();
-+	Movie *movie = window ? window->getCurrentMovie() : nullptr;
-+	if (!movie)
-+		return "нет фильма";
-+
-+	Score *score = movie->getScore();
-+	Common::Point pos(x, y);
-+	Common::String out;
-+	int winner = 0;
-+
-+	for (int i = score->_channels.size() - 1; i >= 0; i--) {
-+		Channel *ch = score->_channels[i];
-+		if (!ch || !ch->_sprite)
-+			continue;
-+
-+		CollisionTest test = ch->isMouseIn(pos);
-+		if (test == kCollisionNo && !ch->_sprite->_castId.member)
-+			continue;
-+
-+		bool responds = ch->_sprite->respondsToMouse();
-+		if (test != kCollisionNo) {
-+			Common::Rect bbox = ch->getBbox();
-+			out += Common::String::format("ch %-3d тест %d отвечает %d bbox (%d,%d)-(%d,%d) "
-+					"beh %d inst %d script %s\n",
-+					i, (int)test, responds, bbox.left, bbox.top, bbox.right, bbox.bottom,
-+					(int)ch->_sprite->_behaviors.size(), (int)ch->_scriptInstanceList.size(),
-+					ch->_sprite->_scriptId.asString().c_str());
-+		}
-+
-+		if (test == kCollisionYes && responds && !winner)
-+			winner = i;
-+		else if (test == kCollisionHole && !winner)
-+			break;
-+	}
-+
-+	out += Common::String::format("getMouseSpriteIDFromPos(%d,%d) = %d\n",
-+			x, y, score->getMouseSpriteIDFromPos(pos));
-+	return out;
-+}
-+
-+Common::String DebugBridge::cmdBehaviors(int channel) {
-+	Window *window = g_director->getCurrentWindow();
-+	Movie *movie = window ? window->getCurrentMovie() : nullptr;
-+	if (!movie)
-+		return "нет фильма";
-+
-+	Score *score = movie->getScore();
-+	if (channel < 0 || channel >= (int)score->_channels.size())
-+		return Common::String::format("нет канала %d", channel);
-+
-+	Channel *ch = score->_channels[channel];
-+	Sprite *sp = ch->_sprite;
-+	Common::String out;
-+
-+	out += Common::String::format("канал %d: cast %s, кадры канала [%d..%d], текущий %d\n",
-+			channel, sp->_castId.asString().c_str(), ch->_startFrame, ch->_endFrame,
-+			score->getCurrentFrameNum());
-+	out += Common::String::format("поведений в спрайте: %d, созданных экземпляров: %d\n",
-+			(int)sp->_behaviors.size(), (int)ch->_scriptInstanceList.size());
-+	out += Common::String::format("spriteListIdx %d\n  %s\n", sp->_spriteListIdx,
-+			sp->_spriteInfo.toString().c_str());
-+
-+	// То же самое, но из партитуры текущего кадра, а не из живого канала.
-+	// Расхождение между ними и есть ответ на вопрос «кто отстал».
-+	if (score->_currentFrame && channel < (int)score->_currentFrame->_sprites.size()) {
-+		Sprite *fs = score->_currentFrame->_sprites[channel];
-+		out += Common::String::format("в партитуре кадра %d: cast %s, spriteListIdx %d\n  %s\n",
-+				score->getCurrentFrameNum(), fs->_castId.asString().c_str(),
-+				fs->_spriteListIdx, fs->_spriteInfo.toString().c_str());
-+	}
-+
-+	// Сырые блоки деталей спрайта из файла: описание, поведения, имя. Разбор
-+	// именно этих байтов и решает, чему верить — файлу или движку.
-+	for (int d = 0; d < 3 && sp->_spriteListIdx; d++) {
-+		Common::MemoryReadStreamEndian *st = score->getSpriteDetailsStream(sp->_spriteListIdx + d);
-+		if (!st) {
-+			out += Common::String::format("  блок [%d]: нет\n", sp->_spriteListIdx + d);
-+			continue;
-+		}
-+		out += Common::String::format("  блок [%d], %d байт:", sp->_spriteListIdx + d, (int)st->size());
-+		for (uint b = 0; b < st->size(); b++) {
-+			if (b % 16 == 0)
-+				out += "\n    ";
-+			out += Common::String::format("%02x ", st->readByte());
-+		}
-+		out += "\n";
-+		delete st;
-+	}
-+
-+	for (uint i = 0; i < sp->_behaviors.size(); i++) {
-+		BehaviorElement &b = sp->_behaviors[i];
-+		out += Common::String::format("  [%d] %s\n", i, b.toString().c_str());
-+
-+		ScriptContext *scr = movie->getScriptContext(kScoreScript, b.memberID);
-+		if (!scr) {
-+			out += "       скрипта нет (getScriptContext вернул ноль)\n";
-+			continue;
-+		}
-+
-+		out += "       обработчики:";
-+		for (auto &it : scr->_eventHandlers)
-+			out += Common::String::format(" %s", g_lingo->_eventHandlerTypes[(LEvent)it._key]);
-+		for (auto &it : scr->_functionHandlers)
-+			out += Common::String::format(" %s()", it._key.c_str());
-+		out += "\n";
-+	}
-+
-+	for (uint i = 0; i < ch->_scriptInstanceList.size(); i++) {
-+		out += Common::String::format("  экземпляр [%d]: %s\n", i,
-+				ch->_scriptInstanceList[i].asString(true).c_str());
-+	}
-+
-+	return out;
-+}
-+
-+Common::String DebugBridge::cmdShot(const Common::String &path) {
-+	Graphics::Surface *screen = g_system->lockScreen();
-+	if (!screen) {
-+		return "экрана нет";
-+	}
-+
-+	Common::DumpFile out;
-+	if (!out.open(Common::Path(path), true)) {
-+		g_system->unlockScreen();
-+		return Common::String::format("не открывается %s", path.c_str());
-+	}
-+
-+	bool ok;
-+	if (screen->format.isCLUT8()) {
-+		byte pal[768];
-+		g_system->getPaletteManager()->grabPalette(pal, 0, 256);
-+		ok = Image::writePNG(out, *screen, pal, 256);
-+	} else {
-+		ok = Image::writePNG(out, *screen);
-+	}
-+
-+	out.finalize();
-+	out.close();
-+	g_system->unlockScreen();
-+
-+	return ok ? Common::String::format("%s %dx%d", path.c_str(), screen->w, screen->h)
-+			  : Common::String("writePNG не смог");
-+}
-+
-+Common::String DebugBridge::cmdEvent(int channel, const Common::String &eventName) {
-+	Movie *movie = g_director->getCurrentMovie();
-+	if (!movie)
-+		return "нет фильма";
-+
-+	if (!g_lingo->_eventHandlerTypeIds.contains(eventName))
-+		return Common::String::format("неизвестное событие %s", eventName.c_str());
-+
-+	LEvent ev = (LEvent)g_lingo->_eventHandlerTypeIds[eventName];
-+	movie->processEvent(ev, channel);
-+	return Common::String::format("processEvent(%s, %d) выполнен", eventName.c_str(), channel);
-+}
-+
-+Common::String DebugBridge::cmdCastInfo(const Common::String &spec) {
-+	Movie *movie = g_director->getCurrentMovie();
-+	if (!movie)
-+		return "нет фильма";
-+
-+	int member = atoi(spec.c_str());
-+	int castLib = DEFAULT_CAST_LIB;
-+	const char *colon = strchr(spec.c_str(), ':');
-+	if (colon) {
-+		castLib = member;
-+		member = atoi(colon + 1);
-+	}
-+
-+	CastMemberID id(member, castLib);
-+	CastMember *cast = movie->getCastMember(id);
-+	if (!cast)
-+		return Common::String::format("нет члена каста %s", id.asString().c_str());
-+
-+	CastMemberInfo *info = movie->getCastMemberInfo(id);
-+	Common::String out = Common::String::format("%s: тип %s, имя \"%s\"\n",
-+			id.asString().c_str(), castType2str(cast->_type),
-+			info ? info->name.c_str() : "");
-+
-+	if (info && !info->script.empty())
-+		out += Common::String::format("исходник скрипта:\n%s\n", info->script.c_str());
-+
-+	static const ScriptType kTypes[] = { kScoreScript, kCastScript, kMovieScript, kParentScript };
-+	for (uint t = 0; t < ARRAYSIZE(kTypes); t++) {
-+		ScriptType type = kTypes[t];
-+		ScriptContext *scr = movie->getScriptContext(type, id);
-+		if (!scr)
-+			continue;
-+		out += Common::String::format("контекст %s:", scriptType2str(type));
-+		for (auto &it : scr->_eventHandlers)
-+			out += Common::String::format(" %s", g_lingo->_eventHandlerTypes[(LEvent)it._key]);
-+		for (auto &it : scr->_functionHandlers)
-+			out += Common::String::format(" %s()", it._key.c_str());
-+		out += "\n";
-+	}
-+
-+	return out;
-+}
-+
-+Common::String DebugBridge::cmdSound() {
-+	// Положительный признак вместо отсутствия ошибок: какие каналы реально
-+	// заняты и чем. Прогон под звуковым драйвером dummy этого не покажет —
-+	// в нём каналы тоже «играют», но хотя бы видно, что файл найден и поток создан.
-+	Window *window = g_director->getCurrentWindow();
-+	DirectorSound *sound = window ? window->getSoundManager() : nullptr;
-+	if (!sound)
-+		return "звуковой менеджер недоступен";
-+
-+	Common::String out = Common::String::format("звук включён: %d, последний файл: '%s'\n",
-+			sound->getSoundEnabled(), sound->getCurrentSound().c_str());
-+
-+	for (int ch = 1; ch <= 8; ch++) {
-+		bool active = sound->isChannelActive(ch);
-+		SoundChannel *chan = sound->getChannel(ch);
-+		if (!active && !chan)
-+			continue;
-+		out += Common::String::format("  канал %d: играет %d, громкость %d, puppet %d",
-+				ch, active, sound->getChannelVolume(ch), sound->isChannelPuppet(ch));
-+		if (chan && chan->lastPlayedSound.type == kSoundCast)
-+			out += Common::String::format(", последний член каста %d:%d",
-+					chan->lastPlayedSound.u.cast.castLib, chan->lastPlayedSound.u.cast.member);
-+		out += "\n";
-+	}
-+	return out;
-+}
-+
-+Common::String DebugBridge::execute(const Common::String &line) {
-+	Common::StringTokenizer tok(line);
-+	Common::String cmd = tok.nextToken();
-+
-+	if (cmd.equalsIgnoreCase("ping"))
-+		return "pong";
-+
-+	if (cmd.equalsIgnoreCase("state"))
-+		return cmdState();
-+
-+	if (cmd.equalsIgnoreCase("sprites")) {
-+		Common::String arg = tok.nextToken();
-+		return cmdSprites(arg.equalsIgnoreCase("all"));
-+	}
-+
-+	if (cmd.equalsIgnoreCase("hit")) {
-+		int x = atoi(tok.nextToken().c_str());
-+		int y = atoi(tok.nextToken().c_str());
-+		return cmdHit(x, y);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("behaviors") || cmd.equalsIgnoreCase("beh"))
-+		return cmdBehaviors(atoi(tok.nextToken().c_str()));
-+
-+	if (cmd.equalsIgnoreCase("eval") || cmd.equalsIgnoreCase("lingo")) {
-+		// Остаток строки — код Lingo как есть. `eval` считает его выражением и
-+		// отдаёт значение, `lingo` — оператором.
-+		if (!g_debugger)
-+			return "консоль недоступна";
-+		Common::String code(line.c_str() + cmd.size());
-+		code.trim();
-+		if (code.empty())
-+			return "нечего выполнять";
-+		return g_debugger->evalLingo(code, cmd.equalsIgnoreCase("eval"));
-+	}
-+
-+	if (cmd.equalsIgnoreCase("sound"))
-+		return cmdSound();
-+
-+	if (cmd.equalsIgnoreCase("castinfo"))
-+		return cmdCastInfo(tok.nextToken());
-+
-+	if (cmd.equalsIgnoreCase("shot")) {
-+		// Путь берём остатком строки, а не токеном: в нём бывают пробелы.
-+		Common::String path(line.c_str() + 4);
-+		path.trim();
-+		return cmdShot(path.empty() ? Common::String("bridge-shot.png") : path);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("event")) {
-+		int ch = atoi(tok.nextToken().c_str());
-+		return cmdEvent(ch, tok.nextToken());
-+	}
-+
-+	if (cmd.equalsIgnoreCase("move")) {
-+		int x = atoi(tok.nextToken().c_str());
-+		int y = atoi(tok.nextToken().c_str());
-+		pushMouse(Common::EVENT_MOUSEMOVE, x, y);
-+		return Common::String::format("мышь в %d,%d", x, y);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("down") || cmd.equalsIgnoreCase("up")) {
-+		int x = atoi(tok.nextToken().c_str());
-+		int y = atoi(tok.nextToken().c_str());
-+		pushMouse(Common::EVENT_MOUSEMOVE, x, y);
-+		pushMouse(cmd.equalsIgnoreCase("down") ? Common::EVENT_LBUTTONDOWN : Common::EVENT_LBUTTONUP, x, y);
-+		return Common::String::format("%s в %d,%d", cmd.c_str(), x, y);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("click")) {
-+		int x = atoi(tok.nextToken().c_str());
-+		int y = atoi(tok.nextToken().c_str());
-+		Common::String holdStr = tok.nextToken();
-+		int hold = holdStr.empty() ? 250 : atoi(holdStr.c_str());
-+
-+		pushMouse(Common::EVENT_MOUSEMOVE, x, y);
-+		pushMouse(Common::EVENT_LBUTTONDOWN, x, y);
-+		schedule(g_system->getMillis() + hold, Common::EVENT_LBUTTONUP, x, y);
-+		return Common::String::format("клик в %d,%d, отпускание через %d мс", x, y, hold);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("drag")) {
-+		// Перетаскивание: нажать, провести мышь по прямой, отпустить. Игра ловит
-+		// перетаскивание циклом `repeat while the stilldown`, который читает
-+		// положение мыши, — одним нажатием и отпусканием его не пройти.
-+		int x1 = atoi(tok.nextToken().c_str());
-+		int y1 = atoi(tok.nextToken().c_str());
-+		int x2 = atoi(tok.nextToken().c_str());
-+		int y2 = atoi(tok.nextToken().c_str());
-+		Common::String durStr = tok.nextToken();
-+		int dur = durStr.empty() ? 1200 : atoi(durStr.c_str());
-+		const int steps = 12;
-+
-+		pushMouse(Common::EVENT_MOUSEMOVE, x1, y1);
-+		pushMouse(Common::EVENT_LBUTTONDOWN, x1, y1);
-+
-+		uint32 now = g_system->getMillis();
-+		for (int i = 1; i <= steps; i++) {
-+			schedule(now + dur * i / (steps + 1), Common::EVENT_MOUSEMOVE,
-+					x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps);
-+		}
-+		schedule(now + dur, Common::EVENT_MOUSEMOVE, x2, y2);
-+		schedule(now + dur + 150, Common::EVENT_LBUTTONUP, x2, y2);
-+		return Common::String::format("перетаскивание (%d,%d) -> (%d,%d) за %d мс", x1, y1, x2, y2, dur);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("key")) {
-+		int code = atoi(tok.nextToken().c_str());
-+		Common::Event ev;
-+		ev.type = Common::EVENT_KEYDOWN;
-+		ev.kbd = Common::KeyState((Common::KeyCode)code, code);
-+		g_system->getEventManager()->pushEvent(ev);
-+		ev.type = Common::EVENT_KEYUP;
-+		g_system->getEventManager()->pushEvent(ev);
-+		return Common::String::format("клавиша %d", code);
-+	}
-+
-+	if (cmd.equalsIgnoreCase("help")) {
-+		return "Команды моста:\n"
-+			   "  ping | state | sprites [all] | hit X Y | behaviors CH | castinfo [LIB:]MEM | sound\n"
-+			   "  shot ПУТЬ | event CH ИМЯ | move X Y | down X Y | up X Y | click X Y [мс]\n"
-+			   "  drag X1 Y1 X2 Y2 [мс] | key КОД\n"
-+			   "  eval ВЫРАЖЕНИЕ | lingo ОПЕРАТОР — код Lingo как есть, без разбора командной строки\n"
-+			   "Всё прочее уходит в консоль ScummVM: help, channels, cast, print ВЫРАЖЕНИЕ,\n"
-+			   "funcs, var, bt, disasm, bpset, markers, debugflag_enable ...\n";
-+	}
-+
-+	// Всё остальное — команда консоли ScummVM. Там уже есть print (вычисление
-+	// Lingo-выражения), channels, cast, funcs, breakpoints и прочее; выдумывать
-+	// им замену незачем.
-+	if (!g_debugger)
-+		return "консоль недоступна";
-+
-+	Common::String out;
-+	g_debugger->runCapturedCommand(line, out);
-+	if (out.empty())
-+		out = "(пусто)";
-+	return out;
-+}
-+
-+} // End of namespace Director
-diff --git a/engines/director/debug-bridge.h b/engines/director/debug-bridge.h
-new file mode 100644
-index 00000000..05eb254a
---- /dev/null
-+++ b/engines/director/debug-bridge.h
-@@ -0,0 +1,94 @@
-+/* ScummVM - Graphic Adventure Engine
-+ *
-+ * ScummVM is the legal property of its developers, whose names
-+ * are too numerous to list here. Please refer to the COPYRIGHT
-+ * file distributed with this source distribution.
-+ *
-+ * This program is free software: you can redistribute it and/or modify
-+ * it under the terms of the GNU General Public License as published by
-+ * the Free Software Foundation, either version 3 of the License, or
-+ * (at your option) any later version.
-+ *
-+ * This program is distributed in the hope that it will be useful,
-+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
-+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-+ * GNU General Public License for more details.
-+ *
-+ * You should have received a copy of the GNU General Public License
-+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
-+ *
-+ */
-+
-+#ifndef DIRECTOR_DEBUG_BRIDGE_H
-+#define DIRECTOR_DEBUG_BRIDGE_H
-+
-+// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост.
-+//
-+// Живой движок слушает TCP-порт и отвечает на текстовые команды. Нужен потому,
-+// что безоконный прогон нечем расспросить: логи приходится растить до гигабайтов
-+// и вылавливать в них нужный кадр, а консоль ScummVM в режиме `dummy` открыть
-+// негде. Мост даёт прицельные вопросы («что под курсором», «какие поведения у
-+// канала 9», «выполни Lingo-выражение») и прицельный ввод в нужный момент.
-+//
-+// Порт задаётся ключом `debugbridge_port` в конфиге. Протокол: одна команда в
-+// строке, ответ — одна строка JSON {"ok":bool,"out":"..."}.
-+
-+#include "common/array.h"
-+#include "common/str.h"
-+
-+namespace Director {
-+
-+class DebugBridge {
-+public:
-+	DebugBridge();
-+	~DebugBridge();
-+
-+	/// Открывает слушающий сокет на localhost. Ложь — порт занят или сокет не создался.
-+	bool listen(int port);
-+
-+	/// Вызывается из главного цикла: принимает клиента, читает и выполняет команды,
-+	/// доигрывает отложенные действия (отпускание кнопки мыши). Не блокирует.
-+	void poll();
-+
-+	bool isRunning() const { return _listenFd >= 0; }
-+
-+private:
-+	void acceptClient();
-+	void closeClient();
-+	void send(const Common::String &payload, bool ok);
-+	void readCommands();
-+
-+	Common::String execute(const Common::String &line);
-+
-+	// Собственные команды моста (всё остальное уходит в консоль ScummVM).
-+	Common::String cmdState();
-+	Common::String cmdSprites(bool all);
-+	Common::String cmdHit(int x, int y);
-+	Common::String cmdBehaviors(int channel);
-+	Common::String cmdShot(const Common::String &path);
-+	Common::String cmdEvent(int channel, const Common::String &eventName);
-+	Common::String cmdCastInfo(const Common::String &spec);
-+	Common::String cmdSound();
-+
-+	void pushMouse(int type, int x, int y);
-+	void schedule(uint32 atMs, int type, int x, int y);
-+
-+	int _listenFd;
-+	int _clientFd;
-+	Common::String _inbuf;
-+
-+	// Очередь отложенного ввода. Мгновенный клик Director не замечает — он
-+	// опрашивает состояние мыши в своём цикле, — а перетаскивание вообще живёт
-+	// в цикле `repeat while the stilldown`, которому нужны движения мыши между
-+	// нажатием и отпусканием.
-+	struct PendingInput {
-+		uint32 atMs;
-+		int type;
-+		int x, y;
-+	};
-+	Common::Array<PendingInput> _pending;
-+};
-+
-+} // End of namespace Director
-+
-+#endif
 diff --git a/engines/director/debugger.cpp b/engines/director/debugger.cpp
 index 3cda88d8..ce967711 100644
 --- a/engines/director/debugger.cpp
@@ -1657,10 +858,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..3b590ace
+index 00000000..796f08e4
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,796 @@
+@@ -0,0 +1,1669 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1693,11 +894,11 @@ index 00000000..3b590ace
 +namespace ToolBook {
 +
 +static const byte kSignature[4] = { 0x03, 'J', 'B', 'O' };
-+// Пролог кода обработчика OpenScript, общий для всех 988 обработчиков книги.
-+static const byte kHandlerPrologue[] = {
-+	0x26, 0x0f, 0xf8, 0xff, 0x3b, 0x03, 0x0d, 0xfc, 0xff, 0x3b, 0x04, 0x0d, 0xf8, 0xff
-+};
-+static const uint kPrologue = sizeof(kHandlerPrologue);
++// Общий префикс кода обработчика OpenScript. Размер кадра и раскладка
++// аргументов после него различаются; целостность подтверждается полем strOff
++// у маркера таблицы строк, а не длинным шаблоном пролога.
++static const byte kHandlerPrefix[] = { 0x26, 0x0f };
++static const uint kHandlerPrefixSize = sizeof(kHandlerPrefix);
 +static const char kPageAnchor[] = "ASYM_TpID";
 +
 +static inline uint16 readU16(const byte *p) { return p[0] | (p[1] << 8); }
@@ -1749,6 +950,44 @@ index 00000000..3b590ace
 +Book::Book() {}
 +Book::~Book() {}
 +
++uint16 Book::readUint16(uint32 offset) const {
++	return offset + 2 <= _data.size() ? readU16(&_data[offset]) : 0;
++}
++
++uint32 Book::readUint32(uint32 offset) const {
++	return offset + 4 <= _data.size() ? readU32(&_data[offset]) : 0;
++}
++
++const byte *Book::bytes(uint32 offset, uint32 size) const {
++	return offset <= _data.size() && size <= _data.size() - offset ? &_data[offset] : nullptr;
++}
++
++Common::String Book::readString(uint32 offset, uint32 maxLength) const {
++	if (offset >= _data.size())
++		return Common::String();
++	uint32 end = offset;
++	while (end < _data.size() && _data[end] && end - offset <= maxLength)
++		end++;
++	if (end >= _data.size() || end == offset || end - offset > maxLength)
++		return Common::String();
++	return Common::String((const char *)&_data[offset], end - offset);
++}
++
++Common::String Book::handlerString(const Handler &handler, uint32 target) const {
++	if (target < handler.code || target >= _data.size())
++		return Common::String();
++	// Named references point at a two-byte selector/hash followed by the
++	// identifier. A literal points directly at its first character. Prefer the
++	// formal reference spelling when the two bytes at target are not printable
++	// identifier bytes; this keeps dispatch numeric and still exposes the name
++	// for diagnostics/global lookup.
++	if (target + 3 < _data.size() &&
++			(!Common::isAlpha(_data[target]) && _data[target] != '_') &&
++			(Common::isAlpha(_data[target + 2]) || _data[target + 2] == '_'))
++		target += 2;
++	return readString(target);
++}
++
 +bool Book::load(Common::SeekableReadStream *stream, uint32 embeddedOffset) {
 +	if (!stream)
 +		return false;
@@ -1778,13 +1017,19 @@ index 00000000..3b590ace
 +	debug(1, "ToolBook: книга %u байт со смещения 0x%x", size, start);
 +
 +	scanRecords();
++	scanHandlers();
++	scanScriptObjects();
++	scanScriptObjectIndex();
++	scanHeapSegments();
 +	scanImages();
 +	scanObjects();
 +	scanPages();
++	scanPageOrder();
 +	scanClassNames();
 +
-+	debug(1, "ToolBook: записей %u (сегментов %u), картинок %u, страниц %u, классов %u",
-+			_records.size(), _segmentCount, _images.size(), _pages.size(), _classNames.size());
++	debug(1, "ToolBook: записей %u (сегментов %u), картинок %u, страниц %u, обработчиков %u, top-level scripts %u, классов %u",
++			_records.size(), _segmentCount, _images.size(), _pages.size(), _handlers.size(),
++			_scriptObjects.size(), _classNames.size());
 +	return true;
 +}
 +
@@ -1822,86 +1067,183 @@ index 00000000..3b590ace
 +}
 +
 +void Book::scanImages() {
-+	const uint n = _data.size();
-+
-+	for (uint i = 0; i + 40 <= n; ) {
-+		if (!(_data[i] == 0x28 && _data[i + 1] == 0 && _data[i + 2] == 0 && _data[i + 3] == 0)) {
-+			i++;
-+			continue;
-+		}
-+
-+		int32 w = (int32)readU32(&_data[i + 4]);
-+		int32 h = (int32)readU32(&_data[i + 8]);
-+		uint16 planes = readU16(&_data[i + 12]);
-+		uint16 bpp = readU16(&_data[i + 14]);
-+		uint32 comp = readU32(&_data[i + 16]);
-+
-+		bool plausible = planes == 1 && comp <= 2 &&
-+				(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32) &&
-+				w > 0 && w <= 2048 && h != 0 && ABS(h) <= 2048;
-+
-+		if (!plausible) {
-+			i++;
-+			continue;
-+		}
-+
-+		Image img;
-+		img.offset = i;
-+		img.width = w;
-+		img.height = ABS(h);
-+		img.depth = bpp;
-+		img.colors = readU32(&_data[i + 32]);
-+		if (img.colors == 0 && bpp <= 8)
-+			img.colors = 1u << bpp;
-+		img.stride = ((w * bpp + 31) / 32) * 4;
-+		img.rawSize = img.stride * img.height;
-+
-+		// Несжатой считаем только ту картинку, перед которой стоит файловая
-+		// шапка BM с согласованным bfOffBits: у таких пиксели лежат сразу за
-+		// палитрой как есть.
-+		if (i >= 14 && _data[i - 14] == 'B' && _data[i - 13] == 'M') {
-+			uint32 offBits = readU32(&_data[i - 14 + 10]);
-+			img.raw = (offBits == 14 + 40 + img.colors * 4);
-+		}
-+		if (img.raw)
-+			img.pixels = i + 40 + img.colors * 4;
-+
-+		// Перед заголовком лежит пара размеров: распакованный и сжатый. По ней
-+		// и опознаётся сжатый поток — и она же служит проверкой при поиске
-+		// начала данных.
-+		for (uint32 back = 8; back <= 0x140 && back <= i; back++) {
-+			if (readU32(&_data[i - back]) != img.rawSize)
-+				continue;
-+			uint32 comp = readU32(&_data[i - back + 4]);
-+			if (comp > 0 && comp <= img.rawSize * 2) {
-+				img.compSize = comp;
++	// Do not scan the whole file for BITMAPINFOHEADER byte patterns: 91 such
++	// patterns occur in compressed data.  Every real image is referenced by a
++	// Picture block (+0x55 is a local handle to a type-0 DIB block), while the
++	// authoritative raw/compressed sizes live in that Picture at +0x2d/+0x31.
++	// This relation resolves exactly all 2393 images in this book.
++	for (uint s = 0; s < _heapSegments.size(); s++) {
++		const HeapSegment &seg = _heapSegments[s];
++		for (uint32 p = seg.base + 0x11; p < seg.end; ) {
++			uint32 next = seg.base + (readU16(&_data[p]) | 1);
++			if (next <= p || next > seg.end)
 +				break;
++			if (readU16(&_data[p + 2]) != 0x15 || next - p < 0x57) {
++				p = next;
++				continue;
 +			}
++
++			uint16 dibHandle = readU16(&_data[p + 0x55]);
++			uint32 dibBlock = dibHandle >= 3 ? seg.base + dibHandle - 3 : seg.end;
++			uint32 dib = dibBlock + 4;
++			if (dibBlock + 44 > seg.end || readU16(&_data[dibBlock + 2]) != 0 ||
++					readU32(&_data[dib]) != 40) {
++				p = next;
++				continue;
++			}
++
++			int32 w = (int32)readU32(&_data[dib + 4]);
++			int32 h = (int32)readU32(&_data[dib + 8]);
++			uint16 planes = readU16(&_data[dib + 12]);
++			uint16 bpp = readU16(&_data[dib + 14]);
++			uint32 compression = readU32(&_data[dib + 16]);
++			if (planes != 1 || compression > 2 ||
++					!(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32) ||
++					w <= 0 || w > 2048 || h == 0 || ABS(h) > 2048) {
++				p = next;
++				continue;
++			}
++
++			Image img;
++			img.offset = dib;
++			img.width = w;
++			img.height = ABS(h);
++			img.depth = bpp;
++			img.colors = readU32(&_data[dib + 32]);
++			if (img.colors == 0 && bpp <= 8)
++				img.colors = 1u << bpp;
++			img.stride = ((w * bpp + 31) / 32) * 4;
++			img.rawSize = readU32(&_data[p + 0x2d]);
++			img.compSize = readU32(&_data[p + 0x31]);
++			img.segBase = seg.base;
++			if (img.rawSize != img.stride * img.height) {
++				p = next;
++				continue;
++			}
++
++			bool duplicate = false;
++			for (uint i = 0; i < _images.size(); i++)
++				if (_images[i].offset == img.offset) {
++					duplicate = true;
++					break;
++				}
++			if (!duplicate)
++				_images.push_back(img);
++			p = next;
 +		}
-+
-+		// База сегмента: блок с DIB занимает 4 + 40 + палитра байт, поле
-+		// «конец» в его заголовке даёт смещение конца от базы (ledger/0031).
-+		if (i >= 4) {
-+			uint32 blockEnd = i + 40 + img.colors * 4;
-+			uint16 endField = readU16(&_data[i - 4]);
-+			if (blockEnd > endField)
-+				img.segBase = blockEnd - endField;
-+		}
-+
-+		if (img.rawSize > 0 && (img.raw || img.compSize))
-+			_images.push_back(img);
-+
-+		i += 40;
 +	}
 +}
 +
 +// Единица координат книги: 1/1440 дюйма, книга 640×480 при 96 точках на дюйм.
 +static const int kUnit = 15;
 +
++static bool isObjectBlockType(uint16 type) {
++	switch (type) {
++	case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c:
++	case 0x0d: case 0x0e: case 0x0f: case 0x10: case 0x12:
++	case 0x13: case 0x15: case 0x1a:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static int unitsToPixel(int16 units) {
++	return units >= 0 ? units / kUnit : -((-units + kUnit - 1) / kUnit);
++}
++
++void Book::scanHeapSegments() {
++	// У root-блока Page/Background всегда handle 0x14: он начинается по
++	// segmentBase+0x11, а handle любого блока равен relativeOffset+3. Поле
++	// segmentBase+0x0d задаёт конец цепочки. Ссылки нечётные, поэтому и конец,
++	// и next block нормализуются OR 1 (проверено на всех 181 DIB-сегментах).
++	const uint32 n = _data.size();
++	for (uint32 p = 0x11; p + 20 < n; p++) {
++		uint16 type = readU16(&_data[p + 2]);
++		if (type != 4 && type != 5)
++			continue;
++		if (_data[p + 4] != 0 || _data[p + 5] != 2)
++			continue;
++		uint32 base = p - 0x11;
++		uint32 firstEnd = base + (readU16(&_data[p]) | 1);
++		uint32 heapEnd = base + (readU16(&_data[base + 0x0d]) | 1);
++		if (firstEnd <= p || firstEnd > heapEnd || heapEnd > n)
++			continue;
++		// Не принимаем случайный шаблон в потоке: вся heap-цепочка обязана
++		// закончиться ровно на формальном heapEnd.
++		uint32 block = p;
++		uint count = 0;
++		while (block < heapEnd && count++ < 10000) {
++			uint32 next = base + (readU16(&_data[block]) | 1);
++			if (next <= block || next > heapEnd)
++				break;
++			block = next;
++		}
++		if (block != heapEnd)
++			continue;
++
++		HeapSegment seg;
++		seg.base = base;
++		seg.end = heapEnd;
++		seg.type = type;
++		seg.id = readU16(&_data[p + 6]);
++		seg.selector = readU16(&_data[base + 7]);
++		uint32 nameAt = p + 10, nameEnd = nameAt;
++		while (nameEnd < firstEnd && _data[nameEnd] >= 32 && _data[nameEnd] < 127 &&
++				nameEnd - nameAt <= 31)
++			nameEnd++;
++		if (nameEnd < firstEnd && _data[nameEnd] == 0)
++			seg.name = Common::String((const char *)&_data[nameAt], nameEnd - nameAt);
++		_heapSegments.push_back(seg);
++		p = firstEnd - 1;
++	}
++
++	debug(1, "ToolBook: формальных heap-сегментов %u", _heapSegments.size());
++}
++
++void Book::scanHandlers() {
++	// Тот же строгий критерий, что в tools/osc.py: для каждого общего префикса
++	// берём ближайший следующий маркер таблицы строк. Обработчик цел только
++	// тогда, когда поле strOff указывает ровно за этот маркер.
++	Common::Array<uint32> starts;
++	Common::Array<uint32> marks;
++	const uint32 n = _data.size();
++	for (uint32 i = 0; i + 3 <= n; i++) {
++		if (i + kHandlerPrefixSize <= n && memcmp(&_data[i], kHandlerPrefix, kHandlerPrefixSize) == 0)
++			starts.push_back(i);
++		if (_data[i] == 0x27 && _data[i + 1] == 0x1d && _data[i + 2] == 0x66)
++			marks.push_back(i);
++	}
++
++	uint markIndex = 0;
++	for (uint i = 0; i < starts.size(); i++) {
++		const uint32 code = starts[i];
++		while (markIndex < marks.size() && marks[markIndex] < code)
++			markIndex++;
++		if (markIndex >= marks.size())
++			break;
++
++		const uint32 marker = marks[markIndex];
++		const uint32 codeSize = marker - code;
++		if (marker + 5 > n || codeSize > 0xffff ||
++				readU16(&_data[marker + 3]) != codeSize + 7)
++			continue;
++
++		Handler hd;
++		hd.code = code;
++		hd.codeSize = codeSize;
++		readHandlerStrings(code, hd);
++		_handlers.push_back(hd);
++	}
++
++	debug(1, "ToolBook: обработчиков с целой таблицей строк %u/%u",
++			_handlers.size(), starts.size());
++}
++
 +// Таблица строк обработчика: за кодом идёт маркер 27 1d 66, поле смещения и
 +// строки. Имена (сообщения, свойства) идут с двухбайтовым хешем впереди,
 +// строковые литералы — без него; последняя строка таблицы — имя обработчика.
-+void Book::readHandlerStrings(uint32 code, Handler &hd) {
++void Book::readHandlerStrings(uint32 code, Handler &hd) const {
 +	uint32 m = code;
 +	while (m + 3 < _data.size() && m < code + 8000) {
 +		if (_data[m] == 0x27 && _data[m + 1] == 0x1d && _data[m + 2] == 0x66)
@@ -1912,6 +1254,7 @@ index 00000000..3b590ace
 +		return;
 +	if (readU16(&_data[m + 3]) != (m - code) + 7)
 +		return;
++	hd.codeSize = m - code;
 +
 +	uint32 p = m + 5;
 +	Common::Array<Common::String> all;
@@ -1955,176 +1298,653 @@ index 00000000..3b590ace
 +	}
 +}
 +
-+void Book::scanObjects() {
-+	// Книга — куча блоков `[u16 конец][u16 тип][данные]`, где «конец» считается
-+	// от базы сегмента (ledger/0031). Объект лежит тремя блоками подряд:
-+	//
-+	//     [свойства, тип 0x10/0x08/0x15]  рамка и число вершин
-+	//     [имя, тип 0]                    `[u32 самоссылка][имя\0]`
-+	//     [обвод либо DIB, тип 0]         список вершин или картинка
-+	//
-+	// Вход в цепочку — блок с заголовком DIB: его длина известна (4 + 40 +
-+	// палитра), отсюда база сегмента. Объекты, лежащие в сегменте до первой
-+	// картинки, так не находятся — это осознанное ограничение.
-+	Common::Array<uint32> bases;
-+	for (uint k = 0; k < _images.size(); k++) {
-+		if (!_images[k].segBase)
++void Book::scanScriptObjects() {
++	// A top-level script is an outer type-1 record. The first six body bytes
++	// identify the record inside its 16-bit segment, and the script header
++	// follows at record+0x10. Requiring both the exact self handle and the
++	// 0x0225 script signature rejects the other type-1 record variants.
++	uint handlerCount = 0;
++	for (uint i = 0; i < _records.size(); i++) {
++		const Record &record = _records[i];
++		if (record.type != 1 || record.offset + 0x28 > _data.size())
 +			continue;
-+		bool seen = false;
-+		for (uint j = 0; j < bases.size(); j++)
-+			if (bases[j] == _images[k].segBase)
-+				seen = true;
-+		if (!seen)
-+			bases.push_back(_images[k].segBase);
++		uint32 end = record.body + record.size;
++		uint32 script = record.offset + 0x10;
++		if (end > _data.size() || script + 0x18 > end ||
++				_data[record.body] != 0 || _data[record.body + 3] != 0 ||
++				readU16(&_data[record.body + 1]) != (uint16)(record.segmentOffset + 3) ||
++				readU16(&_data[script + 6]) != 0x0225)
++			continue;
++
++		uint16 count = readU16(&_data[script + 0x16]);
++		uint32 recordBase = script + 0x1a + (uint32)count * 4;
++		if (count > 64 || recordBase > end)
++			continue;
++		bool valid = true;
++		for (uint h = 0; h < count; h++) {
++			uint32 handlerRecord = recordBase + readU16(&_data[script + 0x1a + h * 4]);
++			if (handlerRecord + 29 >= end || _data[handlerRecord + 29] != 0x26) {
++				valid = false;
++				break;
++			}
++		}
++		if (!valid)
++			continue;
++
++		ScriptObject object;
++		object.record = record.offset;
++		object.script = script;
++		appendScriptHandlers(script, end, object.handlers, record.offset);
++		handlerCount += object.handlers.size();
++		_scriptObjects.push_back(object);
++	}
++	debug(1, "ToolBook: формальных top-level script records %u, handlers %u",
++			_scriptObjects.size(), handlerCount);
++}
++
++const ScriptObject *Book::findScriptObject(uint16 handle, uint16 selector) const {
++	for (uint i = 0; i < _scriptObjects.size(); i++)
++		if (_scriptObjects[i].handle == handle && _scriptObjects[i].selector == selector)
++			return &_scriptObjects[i];
++	return nullptr;
++}
++
++const ScriptObject *Book::findScriptObjectByRecord(uint32 record) const {
++	for (uint i = 0; i < _scriptObjects.size(); i++)
++		if (_scriptObjects[i].record == record)
++			return &_scriptObjects[i];
++	return nullptr;
++}
++
++const Handler *Book::findScriptHandler(uint32 ownerRecord, uint16 selector) const {
++	const ScriptObject *owner = findScriptObjectByRecord(ownerRecord);
++	if (!owner)
++		return nullptr;
++	for (uint i = 0; i < owner->handlers.size(); i++)
++		if (owner->handlers[i].eventHash == selector)
++			return &owner->handlers[i];
++	return nullptr;
++}
++
++void Book::scanScriptObjectIndex() {
++	if (_scriptObjects.empty())
++		return;
++
++	// Record segments encode their far selector as the high byte at +0x16.
++	// A ScriptObject id-table entry is `{handle, selector, id, flags}` and its
++	// target record is `segmentBase + handle + 0x0d`. This handle convention is
++	// deliberately different from local heap handles. Build the set of exact
++	// formal targets before looking for a table.
++	Common::HashMap<uint32, int> targetByFarRef;
++	for (uint i = 0; i < _scriptObjects.size(); i++) {
++		const ScriptObject &object = _scriptObjects[i];
++		const Record *record = nullptr;
++		for (uint r = 0; r < _records.size(); r++)
++			if (_records[r].offset == object.record) {
++				record = &_records[r];
++				break;
++			}
++		if (!record || record->segmentBase + 0x17 > _data.size() ||
++				record->offset < record->segmentBase + 0x0d)
++			continue;
++		uint32 relative = record->offset - record->segmentBase - 0x0d;
++		if (relative > 0xffff)
++			continue;
++		uint16 selector = (uint16)_data[record->segmentBase + 0x16] << 8;
++		uint32 key = ((uint32)selector << 16) | relative;
++		if (targetByFarRef.contains(key)) {
++			warning("ToolBook: duplicate formal ScriptObject far reference %04x:%04x",
++					selector, (uint16)relative);
++			return;
++		}
++		targetByFarRef[key] = i;
++	}
++	if (targetByFarRef.size() != _scriptObjects.size())
++		return;
++
++	uint32 candidate = 0;
++	uint candidateCount = 0;
++	Common::Array<int> candidateOrder;
++	for (uint32 start = 0; start + 8 <= _data.size(); start++) {
++		// The overwhelming majority of bytes cannot start an id-table. Reject
++		// them before allocating its per-candidate validation state.
++		uint32 firstKey = ((uint32)readU16(&_data[start + 2]) << 16) |
++				readU16(&_data[start]);
++		if (!targetByFarRef.contains(firstKey) || readU16(&_data[start + 6]) > 1)
++			continue;
++		Common::Array<bool> seen;
++		seen.resize(_scriptObjects.size());
++		Common::Array<int> order;
++		uint16 previousId = 0;
++		bool first = true, terminated = false, valid = true;
++		for (uint32 p = start; p + 8 <= _data.size() && order.size() <= _scriptObjects.size(); p += 8) {
++			uint16 handle = readU16(&_data[p]);
++			uint16 selector = readU16(&_data[p + 2]);
++			uint16 id = readU16(&_data[p + 4]);
++			uint16 flags = readU16(&_data[p + 6]);
++			uint32 key = ((uint32)selector << 16) | handle;
++			if (!targetByFarRef.contains(key) || flags > 1 || (!first && id <= previousId)) {
++				valid = false;
++				break;
++			}
++			int object = targetByFarRef[key];
++			if (seen[object]) {
++				valid = false;
++				break;
++			}
++			seen[object] = true;
++			order.push_back(object);
++			previousId = id;
++			first = false;
++			if (flags == 1) {
++				terminated = true;
++				break;
++			}
++		}
++		if (!valid || !terminated || order.size() != _scriptObjects.size())
++			continue;
++		candidate = start;
++		candidateOrder = order;
++		candidateCount++;
++	}
++	if (candidateCount != 1) {
++		warning("ToolBook: expected one formal ScriptObject id table, found %u",
++				candidateCount);
++		return;
 +	}
 +
-+	for (uint b = 0; b < bases.size(); b++) {
-+		uint32 segBase = bases[b];
++	for (uint i = 0; i < candidateOrder.size(); i++) {
++		uint32 entry = candidate + i * 8;
++		ScriptObject &object = _scriptObjects[candidateOrder[i]];
++		object.handle = readU16(&_data[entry]);
++		object.selector = readU16(&_data[entry + 2]);
++		object.id = readU16(&_data[entry + 4]);
++	}
++	debug(1, "ToolBook: formal ScriptObject id table @0x%x, %u entries",
++			candidate, candidateOrder.size());
++}
 +
-+		// самая ранняя картинка сегмента — точка входа
-+		uint32 entry = 0;
-+		for (uint k = 0; k < _images.size(); k++)
-+			if (_images[k].segBase == segBase && (!entry || _images[k].offset - 4 < entry))
-+				entry = _images[k].offset - 4;
-+		if (!entry)
-+			continue;
++void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
++		Common::Array<Handler> &out, uint32 ownerScriptRecord) const {
++	if (script + 0x18 > scriptEnd)
++		return;
++	uint16 count = readU16(&_data[script + 0x16]);
++	uint32 directoryEnd = script + 0x18 + (uint32)count * 4;
++	// The word after the directory is a reserved/flags field, not a required
++	// zero terminator. One real ButtonDown script stores 0x0200 there; handler
++	// record offsets still use the byte immediately after it as their base.
++	uint32 recordBase = directoryEnd + 2;
++	if (!count || count > 64 || recordBase > scriptEnd)
++		return;
 +
-+		Common::Array<uint32> starts, lens, types;
-+		uint32 p = entry;
-+		for (uint step = 0; step < 4000; step++) {
-+			if (p + 4 > _data.size())
-+				break;
-+			uint32 next = segBase + readU16(&_data[p]);
-+			if (next <= p || next - p > 0xffff || next + 4 > _data.size())
-+				break;
-+			starts.push_back(p);
-+			types.push_back(readU16(&_data[p + 2]));
-+			lens.push_back(next - p);
-+			p = next;
++	// Directory entries point to serialized handler records. Every record has a
++	// 29-byte header; bytecode begins at record+29. This is equivalent to
++	// script+0x37+4*count for the first record, while later offsets are relative
++	// to recordBase (not to the first code address).
++	if (readU16(&_data[script + 6]) != 0x0225)
++		return;
++	for (uint i = 0; i < count; i++) {
++		uint16 eventHash = readU16(&_data[script + 0x18 + i * 4]);
++		uint16 relative = readU16(&_data[script + 0x1a + i * 4]);
++		uint32 record = recordBase + relative;
++		uint32 recordEnd = scriptEnd;
++		for (uint j = 0; j < count; j++) {
++			uint16 candidate = readU16(&_data[script + 0x1a + j * 4]);
++			if (candidate > relative)
++				recordEnd = MIN(recordEnd, recordBase + candidate);
 +		}
-+
-+		for (uint i = 1; i + 1 < starts.size(); i++) {
-+			if (types[i] != 0 || lens[i] < 6 || lens[i] > 32)
++		uint32 code = record + 29;
++		if (code >= recordEnd || _data[code] != 0x26)
++			continue;
++		bool found = false;
++		for (uint h = 0; h < _handlers.size(); h++) {
++			if (_handlers[h].code != code)
 +				continue;
-+
-+			// имя: `[u32 самоссылка][имя\0]`
-+			uint32 np = starts[i] + 4;
-+			uint32 e = np;
-+			while (e < starts[i] + lens[i] && _data[e] >= 32 && _data[e] < 127)
-+				e++;
-+			if (e == np || e >= starts[i] + lens[i] || _data[e] != 0)
-+				continue;
-+
-+			Object obj;
-+			obj.offset = np;
-+			obj.name = Common::String((const char *)&_data[np], e - np);
-+
-+			// свойства лежат в предыдущем блоке: ищем в нём рамку —
-+			// четыре u16, кратные 15, дающие осмысленный прямоугольник.
-+			const uint32 pp = starts[i - 1] + 4, plen = lens[i - 1] - 4;
-+			uint32 nverts = 0;
-+			bool haveRect = false;
-+			if (plen >= 12) {
-+				for (int off = (int)plen - 10; off >= 0; off -= 2) {
-+					const byte *q = &_data[pp + off];
-+					int l = readU16(q), t = readU16(q + 2), r = readU16(q + 4), bt = readU16(q + 6);
-+					if (l % 15 || t % 15 || r % 15 || bt % 15)
-+						continue;
-+					if (l >= r || t >= bt || r > 640 * 15 || bt > 480 * 15)
-+						continue;
-+					obj.rect = Common::Rect(l / 15, t / 15, r / 15, bt / 15);
-+					nverts = readU16(q + 8);
-+					haveRect = true;
-+					break;
-+				}
-+			}
-+			if (!haveRect)
-+				continue;
-+
-+			// следом либо картинка, либо список вершин
-+			const uint32 dp = starts[i + 1] + 4, dlen = lens[i + 1] - 4;
-+			if (dlen >= 40 && _data[dp] == 0x28 && _data[dp + 1] == 0) {
-+				obj.picture = true;
-+			} else if (nverts && dlen >= nverts * 4) {
-+				for (uint32 v = 0; v < nverts; v++) {
-+					int x = readU16(&_data[dp + v * 4]);
-+					int y = readU16(&_data[dp + v * 4 + 2]);
-+					if (x % 15 || y % 15)
-+						break;
-+					obj.outline.push_back(Common::Point(x / 15, y / 15));
-+				}
-+			}
-+
-+			// Скрипт объекта лежит следующими блоками той же цепочки: код
-+			// обработчика опознаётся по общему прологу (ledger/0023).
-+			for (uint k = i + 1; k < starts.size() && k <= i + 4; k++) {
-+				if (lens[k] < 40)
++			Handler handler = _handlers[h];
++			handler.ownerScriptRecord = ownerScriptRecord;
++			handler.eventHash = eventHash;
++			out.push_back(handler);
++			found = true;
++			break;
++		}
++		// The global scanner deliberately starts from the common `26 0f`
++		// prologue, but a directory may also own a short handler whose second
++		// opcode is something else. The directory supplies an authoritative
++		// record bound, so accept the standard end marker here when its strOff
++		// field points exactly past the marker. This is the same integrity check
++		// as scanHandlers(), without assuming a particular function prologue.
++		if (!found) {
++			for (uint32 marker = code + 1; marker + 5 <= recordEnd; marker++) {
++				if (_data[marker] != 0x27 || _data[marker + 1] != 0x1d ||
++						_data[marker + 2] != 0x66 ||
++						readU16(&_data[marker + 3]) != marker - code + 7)
 +					continue;
-+				uint32 bp = starts[k] + 4, blen = lens[k] - 4;
-+				for (uint32 q = 0; q + kPrologue < blen; q++) {
-+					if (memcmp(&_data[bp + q], kHandlerPrologue, kPrologue) != 0)
-+						continue;
-+					Handler hd;
-+					hd.code = bp + q;
-+					readHandlerStrings(bp + q, hd);
-+					if (!hd.name.empty())
-+						obj.handlers.push_back(hd);
-+					q += 8;
-+				}
++				Handler handler;
++				handler.code = code;
++				handler.codeSize = marker - code;
++				handler.ownerScriptRecord = ownerScriptRecord;
++				handler.eventHash = eventHash;
++				readHandlerStrings(code, handler);
++				out.push_back(handler);
++				found = true;
++				break;
 +			}
-+
-+			_objects.push_back(obj);
 +		}
-+	}
-+
-+	// Сегменты обходятся в порядке картинок, а не файла, поэтому объекты
-+	// нужно упорядочить: разбиение по страницам идёт по смещению.
-+	for (uint i = 1; i < _objects.size(); i++) {
-+		Object tmp = _objects[i];
-+		uint j = i;
-+		while (j > 0 && _objects[j - 1].offset > tmp.offset) {
-+			_objects[j] = _objects[j - 1];
-+			j--;
++		// Empty handlers compile to a bare `enterHandler` followed immediately
++		// by the standard END/return marker, so they intentionally have no 0x0f
++		// stack-frame prologue or string table.
++		if (!found && code + 4 <= recordEnd && _data[code] == 0x26 &&
++				_data[code + 1] == 0x27 && _data[code + 2] == 0x1d && _data[code + 3] == 0x66) {
++			Handler handler;
++			handler.code = code;
++			handler.codeSize = 1;
++			handler.ownerScriptRecord = ownerScriptRecord;
++			handler.eventHash = eventHash;
++			out.push_back(handler);
++			found = true;
 +		}
-+		_objects[j] = tmp;
++		// A return-value handler may end with the VM's alternate
++		// `returnDynamic/end` marker (28 1c 66) instead of the usual void
++		// marker. Directory record bounds remain authoritative.
++		if (!found) {
++			for (uint32 marker = code; marker + 5 <= recordEnd; marker++) {
++				if (_data[marker] != 0x28 || _data[marker + 1] != 0x1c ||
++						_data[marker + 2] != 0x66 ||
++						readU16(&_data[marker + 3]) != marker - code + 7)
++					continue;
++				Handler handler;
++				handler.code = code;
++				handler.codeSize = marker - code;
++				handler.ownerScriptRecord = ownerScriptRecord;
++				handler.eventHash = eventHash;
++				handler.returnsValue = true;
++				out.push_back(handler);
++				break;
++			}
++		}
 +	}
 +}
 +
++bool Book::resolveLocalScript(uint32 segmentBase, uint32 segmentEnd, uint16 handle,
++		uint32 &script, uint32 &scriptEnd) const {
++	if (handle < 3)
++		return false;
++	script = segmentBase + handle - 3;
++	if (script + 0x1a > segmentEnd || readU16(&_data[script + 2]) != 0 ||
++			readU16(&_data[script + 6]) != 0x0225)
++		return false;
++	scriptEnd = segmentBase + (readU16(&_data[script]) | 1);
++	if (scriptEnd <= script || scriptEnd > segmentEnd)
++		return false;
++
++	uint16 count = readU16(&_data[script + 0x16]);
++	uint32 recordBase = script + 0x1a + (uint32)count * 4;
++	if (count > 64 || recordBase > scriptEnd)
++		return false;
++	for (uint i = 0; i < count; i++) {
++		uint32 record = recordBase + readU16(&_data[script + 0x1a + i * 4]);
++		if (record + 29 >= scriptEnd || _data[record + 29] != 0x26)
++			return false;
++	}
++	return true;
++}
++
++bool Book::appendScriptBinding(uint32 segmentBase, uint32 segmentEnd, uint16 binding,
++		Common::Array<Handler> &out) const {
++	if (!binding)
++		return true;
++
++	uint32 script = 0, scriptEnd = 0;
++	if (resolveLocalScript(segmentBase, segmentEnd, binding, script, scriptEnd)) {
++		// A valid local directory with count zero is still a resolved binding.
++		// It must not fall through to an unrelated ScriptObject whose id happens
++		// to be one less than the local handle.
++		appendScriptHandlers(script, scriptEnd, out);
++		return true;
++	}
++
++	uint16 externalId = binding - 1;
++	for (uint i = 0; i < _scriptObjects.size(); i++) {
++		if (_scriptObjects[i].id != externalId)
++			continue;
++		for (uint h = 0; h < _scriptObjects[i].handlers.size(); h++)
++			out.push_back(_scriptObjects[i].handlers[h]);
++		return true;
++	}
++	return false;
++}
++
++void Book::scanObjects() {
++	// Typed object block: +8 parent handle, +0a name/payload handle, +0f
++	// script handle. Для Picture (0x15) +0x55 указывает на DIB block. Все эти
++	// ссылки разрешаются как segmentBase + handle - 3.
++	for (uint s = 0; s < _heapSegments.size(); s++) {
++		const HeapSegment &seg = _heapSegments[s];
++		Common::Array<uint16> handles, blockTypes;
++		for (uint32 q = seg.base + 0x11; q < seg.end; ) {
++			uint32 next = seg.base + (readU16(&_data[q]) | 1);
++			if (next <= q || next > seg.end)
++				break;
++			handles.push_back((uint16)(q - seg.base + 3));
++			blockTypes.push_back(readU16(&_data[q + 2]));
++			q = next;
++		}
++		uint32 p = seg.base + 0x11;
++		while (p < seg.end) {
++			uint32 next = seg.base + (readU16(&_data[p]) | 1);
++			if (next <= p || next > seg.end)
++				break;
++			uint16 type = readU16(&_data[p + 2]);
++			uint32 len = next - p;
++			uint16 parentHandle = readU16(&_data[p + 8]);
++			bool parentValid = parentHandle == 0x14;
++			for (uint b = 0; !parentValid && b < handles.size(); b++)
++				if (handles[b] == parentHandle && isObjectBlockType(blockTypes[b]))
++					parentValid = true;
++			if (isObjectBlockType(type) && len >= 20 && parentValid) {
++				Object obj;
++				obj.offset = p;
++				obj.block = p;
++				obj.segmentBase = seg.base;
++				obj.handle = (uint16)(p - seg.base + 3);
++				obj.parentHandle = parentHandle;
++				obj.type = type;
++				obj.id = readU32(&_data[p + 4]);
++				obj.ownVisible = len <= 0x23 || (_data[p + 0x23] & 1) != 0;
++				obj.visible = obj.ownVisible;
++
++				// У всех визуальных объектов прямоугольник лежит невыравненно с +0x13.
++				if (len >= 0x1b) {
++					uint32 q = p + 0x13;
++					int16 l = (int16)readU16(&_data[q]), t = (int16)readU16(&_data[q + 2]);
++					int16 r = (int16)readU16(&_data[q + 4]), bt = (int16)readU16(&_data[q + 6]);
++					if (l < r && t < bt)
++						obj.rect = Common::Rect(unitsToPixel(l), unitsToPixel(t),
++								unitsToPixel(r), unitsToPixel(bt));
++				}
++
++				uint16 nameHandle = readU16(&_data[p + 0x0a]);
++				uint32 nameBlock = nameHandle >= 3 ? seg.base + nameHandle - 3 : seg.end;
++				bool validNameBlock = false;
++				for (uint b = 0; b < handles.size(); b++)
++					if (handles[b] == nameHandle && blockTypes[b] == 0)
++						validNameBlock = true;
++				if (validNameBlock && nameBlock + 5 < seg.end) {
++					uint32 e = nameBlock + 4;
++					while (e < seg.end && _data[e] >= 32 && _data[e] < 127)
++						e++;
++					if (e > nameBlock + 4 && e < seg.end && _data[e] == 0) {
++						obj.offset = nameBlock + 4;
++						obj.name = Common::String((const char *)&_data[nameBlock + 4], e - nameBlock - 4);
++					}
++				}
++
++				if (type == 0x15 && len >= 0x57) {
++					uint16 dibHandle = readU16(&_data[p + 0x55]);
++					uint32 dib = seg.base + dibHandle - 3 + 4;
++					for (uint i = 0; i < _images.size(); i++) {
++						if (_images[i].offset == dib) {
++							obj.picture = true;
++							obj.image = i;
++							break;
++						}
++					}
++				}
++
++				// Field text is two formal local references deep:
++				// Field+0x28 -> descriptor type0, descriptor+6 -> text type0.
++				// The text payload is [capacity:u16][logicalLen:u16][bytes].
++				if (type == 0x0a && len >= 0x2a) {
++					obj.field = true;
++					uint16 descriptorHandle = readU16(&_data[p + 0x28]);
++					uint32 descriptor = descriptorHandle >= 3 ?
++							seg.base + descriptorHandle - 3 : seg.end;
++					bool validDescriptor = false;
++					for (uint b = 0; b < handles.size(); b++)
++						if (handles[b] == descriptorHandle && blockTypes[b] == 0)
++							validDescriptor = true;
++					if (validDescriptor && descriptor + 8 <= seg.end) {
++						uint16 textHandle = readU16(&_data[descriptor + 6]);
++						uint32 text = textHandle >= 3 ? seg.base + textHandle - 3 : seg.end;
++						bool validText = false;
++						for (uint b = 0; b < handles.size(); b++)
++							if (handles[b] == textHandle && blockTypes[b] == 0)
++								validText = true;
++						if (validText && text + 8 <= seg.end) {
++							uint32 textEnd = seg.base + (readU16(&_data[text]) | 1);
++							uint16 capacity = readU16(&_data[text + 4]);
++							uint16 logicalLen = readU16(&_data[text + 6]);
++							if (logicalLen <= capacity && text + 8 + capacity <= textEnd) {
++								obj.textBlock = text;
++								obj.textCapacity = capacity;
++								obj.initialText = cp1251ToUtf8(Common::String(
++										(const char *)&_data[text + 8], logicalLen));
++							}
++						}
++					}
++				}
++
++				uint16 scriptBinding = readU16(&_data[p + 0x0f]);
++				if (!appendScriptBinding(seg.base, seg.end, scriptBinding, obj.handlers))
++					warning("ToolBook: unresolved object script binding %u at block 0x%x",
++							scriptBinding, p);
++				_objects.push_back(obj);
++			}
++			p = next;
++		}
++	}
++	debug(1, "ToolBook: формальных дочерних объектов %u", _objects.size());
++}
++
++void Book::appendObjectTree(uint32 segmentBase, uint16 handle, bool parentVisible,
++		Common::Array<Object> &out, uint depth) const {
++	if (depth > 32)
++		return;
++	const Object *source = nullptr;
++	for (uint i = 0; i < _objects.size(); i++) {
++		if (_objects[i].segmentBase == segmentBase && _objects[i].handle == handle) {
++			source = &_objects[i];
++			break;
++		}
++	}
++	if (!source)
++		return;
++
++	Object object = *source;
++	object.visible = parentVisible && object.ownVisible;
++	out.push_back(object);
++	if (object.type != 0x0b || object.block + 0x34 > _data.size())
++		return;
++
++	// A Group owns an ordered type-0 child-list block. Each ten-byte entry is
++	// `[handle, layoutRect]`; coordinates in the child object itself remain the
++	// authoritative absolute page coordinates. The list order is back-to-front.
++	uint16 count = readU16(&_data[object.block + 0x28]);
++	uint16 listHandle = readU16(&_data[object.block + 0x32]);
++	if (!count || listHandle < 3)
++		return;
++	uint32 list = segmentBase + listHandle - 3;
++	if (list + 4 + (uint32)count * 10 > _data.size() || readU16(&_data[list + 2]) != 0)
++		return;
++	for (uint i = 0; i < count; i++)
++		appendObjectTree(segmentBase, readU16(&_data[list + 4 + i * 10]),
++				object.visible, out, depth + 1);
++}
++
++void Book::appendSegmentObjects(uint32 segmentBase, Common::Array<Object> &out) const {
++	const HeapSegment *segment = nullptr;
++	for (uint i = 0; i < _heapSegments.size(); i++) {
++		if (_heapSegments[i].base == segmentBase) {
++			segment = &_heapSegments[i];
++			break;
++		}
++	}
++	if (!segment)
++		return;
++
++	// Root +0x30 points to the type-6 child service. Its +0x06 count and
++	// +0x10 type-0 list handle enumerate every direct child in z-order.
++	uint32 root = segmentBase + 0x11;
++	uint16 serviceHandle = readU16(&_data[root + 0x30]);
++	if (serviceHandle < 3)
++		return;
++	uint32 service = segmentBase + serviceHandle - 3;
++	if (service + 0x12 > segment->end || readU16(&_data[service + 2]) != 6)
++		return;
++	uint16 count = readU16(&_data[service + 0x06]);
++	uint16 listHandle = readU16(&_data[service + 0x10]);
++	if (!count || listHandle < 3)
++		return;
++	uint32 list = segmentBase + listHandle - 3;
++	if (list + 4 + (uint32)count * 2 > segment->end || readU16(&_data[list + 2]) != 0)
++		return;
++	for (uint i = 0; i < count; i++)
++		appendObjectTree(segmentBase, readU16(&_data[list + 4 + i * 2]), true, out, 0);
++}
++
++void Book::appendRootHandlers(uint32 segmentBase, Common::Array<Handler> &out) const {
++	const HeapSegment *segment = nullptr;
++	for (uint i = 0; i < _heapSegments.size(); i++)
++		if (_heapSegments[i].base == segmentBase) {
++			segment = &_heapSegments[i];
++			break;
++		}
++	if (!segment)
++		return;
++
++	// Root +0x2e is a serialized script binding. A strict local type-0 script
++	// handle is stored directly. Otherwise a non-zero value is a one-based
++	// reference to the formal top-level ScriptObject id table. This partition is
++	// exact across all 261 heaps in this book (144 null, 27 local, 90 external).
++	// Validate the local script fully before choosing it: six external ids also
++	// happen to land on an unrelated type-0 block numerically.
++	uint32 root = segmentBase + 0x11;
++	uint16 handle = readU16(&_data[root + 0x2e]);
++	if (!handle)
++		return;
++	if (!appendScriptBinding(segmentBase, segment->end, handle, out))
++		warning("ToolBook: unresolved root script binding %u at heap 0x%x", handle, segmentBase);
++}
++
 +void Book::scanPages() {
-+	// Страницы разделяются полноэкранными фонами: объекты, лежащие между двумя
-+	// соседними фонами, принадлежат одной странице.
-+	Common::Array<uint> fullscreen;
-+	for (uint k = 0; k < _images.size(); k++)
-+		if (_images[k].width == 640 && _images[k].height == 480 && _images[k].depth == 8)
-+			fullscreen.push_back(k);
-+
-+	uint obj = 0;
-+	for (uint f = 0; f < fullscreen.size(); f++) {
++	for (uint s = 0; s < _heapSegments.size(); s++) {
++		if (_heapSegments[s].type != 5)
++			continue;
 +		Page page;
-+		page.background = fullscreen[f];
-+		uint32 from = _images[fullscreen[f]].offset;
-+		uint32 to = (f + 1 < fullscreen.size()) ? _images[fullscreen[f + 1]].offset : _data.size();
++		page.segmentBase = _heapSegments[s].base;
++		page.id = _heapSegments[s].id;
++		page.selector = _heapSegments[s].selector;
++		page.name = _heapSegments[s].name;
 +
-+		while (obj < _objects.size() && _objects[obj].offset < from)
-+			obj++;
-+		for (uint k = obj; k < _objects.size() && _objects[k].offset < to; k++)
-+			page.objects.push_back(_objects[k]);
-+
-+		// Имя страницы: объект во весь экран обычно назван по странице.
-+		for (uint k = 0; k < page.objects.size(); k++) {
-+			const Common::Rect &r = page.objects[k].rect;
-+			if (r.width() >= 620 && r.height() >= 460) {
-+				page.name = page.objects[k].name;
++		// Page root +0x4b хранит far reference на Background root. Handle там
++		// всегда 0x14; selector однозначно разрешается среди Background.
++		uint32 root = page.segmentBase + 0x11;
++		uint16 bgHandle = readU16(&_data[root + 0x4b]);
++		uint16 bgSelector = readU16(&_data[root + 0x4d]);
++		if (bgHandle == 0x14) {
++			for (uint b = 0; b < _heapSegments.size(); b++) {
++				if (_heapSegments[b].type != 4 || _heapSegments[b].selector != bgSelector)
++					continue;
++				page.backgroundSegmentBase = _heapSegments[b].base;
++				page.backgroundId = _heapSegments[b].id;
++				uint32 backgroundRoot = page.backgroundSegmentBase + 0x11;
++				uint16 widthUnits = readU16(&_data[backgroundRoot + 0x63]);
++				uint16 heightUnits = readU16(&_data[backgroundRoot + 0x65]);
++				if (widthUnits && heightUnits) {
++					// Client extents are stored in 1/1440-inch units. Some
++					// full-width backgrounds serialize 9597 rather than 9600;
++					// round to the nearest pixel instead of shrinking them.
++					page.canvasWidth = (widthUnits + kUnit / 2) / kUnit;
++					page.canvasHeight = (heightUnits + kUnit / 2) / kUnit;
++				}
++				appendSegmentObjects(page.backgroundSegmentBase, page.objects);
 +				break;
 +			}
 +		}
-+		if (page.name.empty() && !page.objects.empty())
-+			page.name = page.objects[0].name;
++		appendSegmentObjects(page.segmentBase, page.objects);
++		// A Page is a child of its Background in the ToolBook message
++		// hierarchy. Search its own/shared script first, then the parent
++		// Background script when the Page does not handle the selector.
++		appendRootHandlers(page.segmentBase, page.eventHandlers);
++		appendRootHandlers(page.backgroundSegmentBase, page.eventHandlers);
++		for (uint i = 0; i < page.objects.size(); i++)
++			if (page.objects[i].picture && page.objects[i].rect.width() >= 620 &&
++					page.objects[i].rect.height() >= 460)
++				page.background = page.objects[i].image;
 +
 +		_pages.push_back(page);
 +	}
++}
 +
-+	scanPageText();
++void Book::scanPageOrder() {
++	// Compiled books serialize an ordered far-reference table separately from
++	// the heap. Each 13-byte entry contains the current Page root, followed by
++	// the Background/Page ids of the next entry. Resolve it structurally: every
++	// Page selector must occur exactly once and every next-id pair must agree
++	// with the following formal heap root. Names and file adjacency play no role.
++	const uint count = _pages.size();
++	if (!count || count > 0xffff || _data.size() < count * 13)
++		return;
++
++	Common::HashMap<uint16, int> bySelector;
++	for (uint i = 0; i < count; i++)
++		bySelector[_pages[i].selector] = i;
++
++	for (uint32 start = 0; start + (uint32)count * 13 <= _data.size(); start++) {
++		if (readU16(&_data[start]) != 0x14 || _data[start + 4] != 0)
++			continue;
++		uint16 firstSelector = readU16(&_data[start + 2]);
++		if (!bySelector.contains(firstSelector))
++			continue;
++
++		Common::Array<int> order;
++		Common::Array<bool> seen;
++		seen.resize(count);
++		bool valid = true;
++		for (uint i = 0; i < count; i++) {
++			uint32 entry = start + i * 13;
++			uint16 selector = readU16(&_data[entry + 2]);
++			if (readU16(&_data[entry]) != 0x14 || _data[entry + 4] != 0 ||
++					!bySelector.contains(selector)) {
++				valid = false;
++				break;
++			}
++			int page = bySelector[selector];
++			if (page < 0 || page >= (int)count || seen[page]) {
++				valid = false;
++				break;
++			}
++			seen[page] = true;
++			order.push_back(page);
++
++			// The last entry points to itself; every earlier one points to the
++			// next far reference. This validates all 13 bytes of every entry.
++			uint32 nextEntry = start + (i + 1 < count ? i + 1 : i) * 13;
++			uint16 nextSelector = readU16(&_data[nextEntry + 2]);
++			if (!bySelector.contains(nextSelector)) {
++				valid = false;
++				break;
++			}
++			const Page &next = _pages[bySelector[nextSelector]];
++			if (readU32(&_data[entry + 5]) != next.backgroundId ||
++					readU32(&_data[entry + 9]) != next.id) {
++				valid = false;
++				break;
++			}
++		}
++		if (!valid || order.size() != count)
++			continue;
++
++		_pageOrder = order;
++		_initialPage = order[0];
++		for (uint i = 0; i < count; i++)
++			_pages[order[i]].nextPage = order[i + 1 < count ? i + 1 : i];
++		debug(1, "ToolBook: formal page-order table @0x%x, %u entries, initial selector %04x",
++				start, count, _pages[_initialPage].selector);
++		return;
++	}
++
++	warning("ToolBook: formal page-order table was not found");
 +}
 +
 +void Book::scanPageText() {
@@ -2250,6 +2070,72 @@ index 00000000..3b590ace
 +	return out;
 +}
 +
++// Большие картинки ToolBook передаются распаковщику как huge-указатель. После
++// каждой группы оригинал проверяет SI и, если он стал 0 или больше 0xfffc,
++// переносит источник на следующий 64-КБ сегмент. Поэтому хвост страницы может
++// быть слаком, хотя он входит в объявленный compSize (MTB40BAS, seg 101:0x41).
++//
++// Здесь страница считается от начала src: живой рантайм передаёт первый кусок
++// с нулевым SI. Проверки строгие — должны сойтись и весь compSize, и rawSize.
++static bool unpackHugeChunks(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
++		uint32 *usedOut) {
++	uint32 in = 0, out = 0;
++	while (in < srcLen && out < dstLen) {
++		uint32 pageOffset = in & 0xffff;
++		if (pageOffset > 0xfffc) {
++			uint32 skip = 0x10000 - pageOffset;
++			if (skip > srcLen - in)
++				break;
++			in += skip;
++			continue;
++		}
++
++		if (srcLen - in < 2)
++			break;
++		uint32 records = src[in] | (src[in + 1] << 8);
++		in += 2;
++		if (!records || records > 0xfff0)
++			break;
++
++		const uint32 pageEnd = (in & 0xffff0000) + 0x10000;
++		bool valid = true;
++		for (uint32 k = 0; k < records; k++) {
++			if (in >= srcLen || in >= pageEnd) {
++				valid = false;
++				break;
++			}
++			byte c = src[in++];
++			if (c <= 0xf5) {
++				uint32 count = c + 3;
++				if (in >= srcLen || in >= pageEnd || count > dstLen - out) {
++					valid = false;
++					break;
++				}
++				byte value = src[in++];
++				if (dst)
++					memset(dst + out, value, count);
++				out += count;
++			} else {
++				uint32 count = c - 0xf5;
++				if (count > srcLen - in || in + count > pageEnd || count > dstLen - out) {
++					valid = false;
++					break;
++				}
++				if (dst)
++					memcpy(dst + out, src + in, count);
++				in += count;
++				out += count;
++			}
++		}
++		if (!valid)
++			break;
++	}
++
++	if (usedOut)
++		*usedOut = in;
++	return in == srcLen && out == dstLen;
++}
++
 +static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
 +		uint32 stride, uint32 *usedOut) {
 +	(void)stride;
@@ -2280,30 +2166,6 @@ index 00000000..3b590ace
 +	return out;
 +}
 +
-+// Быстрая проба: считает размеры, ничего не записывая. Поиск начала данных —
-+// это десятки тысяч попыток, и запись в буфер на каждой съедала бы секунды.
-+static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 stride,
-+		uint32 &outLen, uint32 &usedLen) {
-+	(void)stride;
-+	uint32 in = 0, out = 0;
-+	while (out < dstLen && in < srcLen) {
-+		byte c = src[in++];
-+		uint32 n;
-+		if (c <= 0xf5) {
-+			if (in >= srcLen)
-+				break;
-+			in++;
-+			n = c + 3;
-+		} else {
-+			n = c - 0xf5;
-+			in += n;
-+		}
-+		out += n;
-+	}
-+	outLen = out;
-+	usedLen = in;
-+}
-+
 +// Сколько байт выхода даст поток, если считать его кусками с числом записей.
 +static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
 +	uint32 in = 0, out = 0;
@@ -2331,6 +2193,40 @@ index 00000000..3b590ace
 +	return out;
 +}
 +
++// Строгая проверка одного обычного chunk stream: поток обязан израсходовать
++// ровно объявленный compressed size и произвести ровно raw size.
++static bool probeChunkStream(const byte *src, uint32 srcLen, uint32 dstLen) {
++	uint32 in = 0, out = 0;
++	while (in < srcLen && out < dstLen) {
++		if (srcLen - in < 2)
++			return false;
++		uint32 records = src[in] | (src[in + 1] << 8);
++		in += 2;
++		if (!records || records > 0xfff0)
++			return false;
++		for (uint32 k = 0; k < records; k++) {
++			if (in >= srcLen)
++				return false;
++			byte c = src[in++];
++			if (c <= 0xf5) {
++				if (in >= srcLen)
++					return false;
++				in++;
++				out += c + 3;
++			} else {
++				uint32 count = c - 0xf5;
++				if (count > srcLen - in)
++					return false;
++				in += count;
++				out += count;
++			}
++			if (out > dstLen)
++				return false;
++		}
++	}
++	return in == srcLen && out == dstLen;
++}
++
 +bool Book::locatePixels(Image &img) {
 +	if (img.pixels)
 +		return true;
@@ -2340,6 +2236,26 @@ index 00000000..3b590ace
 +	// Основной путь (ledger/0044): поток лежит блоком сразу за блоком DIB и
 +	// начинается с числа записей. Проверяем несколько ближайших положений.
 +	const uint32 afterPal = img.offset + 40 + img.colors * 4;
++
++	// Большой поток начинается после десятибайтового заголовка
++	// `01 00 00 00 01 00 00 00 00 00`. Его группы живут в huge-span и на
++	// границе source page могут оставлять 1..3 байта слака. Совпадение обоих
++	// размеров обязательно: у фона @0x1757a9 это 232673 -> 307200 байт.
++	static const byte kHugePrefix[10] = { 1, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
++	if (img.compSize && afterPal + sizeof(kHugePrefix) <= _data.size() &&
++			memcmp(&_data[afterPal], kHugePrefix, sizeof(kHugePrefix)) == 0) {
++		uint32 s = afterPal + sizeof(kHugePrefix);
++		if (img.compSize <= _data.size() - s &&
++				unpackHugeChunks(&_data[s], img.compSize, nullptr, img.rawSize, nullptr)) {
++			img.pixels = s;
++			img.chunked = true;
++			img.hugeSpan = true;
++			debug(1, "ToolBook: huge-span картинки @0x%x: поток @0x%x, %u -> %u байт",
++					img.offset, s, img.compSize, img.rawSize);
++			return true;
++		}
++	}
++
 +	for (uint32 shift = 4; shift <= 64; shift += 2) {
 +		uint32 s = afterPal + shift;
 +		if (s + 8 >= _data.size())
@@ -2350,6 +2266,158 @@ index 00000000..3b590ace
 +			img.pixels = s;
 +			img.chunked = true;
 +			return true;
++		}
++	}
++
++	// В сегменте с несколькими Picture потоки лежат после всей heap-цепочки,
++	// в порядке object ID (а не DIB/file order), вплотную по compSize. Поля
++	// raw/comp находятся в Picture block +0x2d/+0x31. Normal/hover variants
++	// and other sibling pictures therefore share one ordered stream tail.
++	int imageIndex = -1;
++	for (uint i = 0; i < _images.size(); i++)
++		if (_images[i].offset == img.offset) {
++			imageIndex = i;
++			break;
++		}
++	uint32 segmentBase = 0, segmentEnd = 0;
++	if (imageIndex >= 0) {
++		for (uint i = 0; i < _objects.size(); i++)
++			if (_objects[i].image == imageIndex) {
++				segmentBase = _objects[i].segmentBase;
++				break;
++			}
++	}
++	for (uint i = 0; i < _heapSegments.size(); i++)
++		if (_heapSegments[i].base == segmentBase) {
++			segmentEnd = _heapSegments[i].end;
++			break;
++		}
++	if (segmentEnd) {
++		Common::Array<uint> pictures;
++		for (uint i = 0; i < _objects.size(); i++) {
++				// The tail contains storage for every Picture block. Keep unresolved
++				// pictures in the cursor walk too: they still consume compSize, or
++				// rawSize when the formal compressed-size field is zero.
++			if (_objects[i].segmentBase != segmentBase || _objects[i].type != 0x15)
++				continue;
++
++			// A segment tail contains only pictures which do not already have a
++			// stream beside their DIB. Mixed segments may keep one Picture at
++			// afterPalette+4 while sibling streams live in the ordered tail.
++			// Counting its compSize in both places shifts every subsequent tail
++			// stream. Use the declared sizes as a strict test;
++			// the old size-only probe is deliberately not sufficient here.
++			const Object &object = _objects[i];
++			bool hasLocalStream = false;
++			if (object.image >= 0) {
++				const Image &localImage = _images[object.image];
++				const uint32 localAfterPal = localImage.offset + 40 + localImage.colors * 4;
++				const uint32 raw = readU32(&_data[object.block + 0x2d]);
++				const uint32 comp = readU32(&_data[object.block + 0x31]);
++				for (uint32 shift = 4; shift <= 64 && !hasLocalStream; shift += 2) {
++					const uint32 candidate = localAfterPal + shift;
++					if (candidate <= _data.size() && comp <= _data.size() - candidate)
++						hasLocalStream = probeChunkStream(&_data[candidate], comp, raw);
++				}
++			}
++			if (hasLocalStream)
++				continue;
++
++			uint at = pictures.size();
++			while (at > 0 && _objects[pictures[at - 1]].id > _objects[i].id)
++				at--;
++			pictures.insert_at(at, i);
++		}
++
++		if (!pictures.empty()) {
++			// A zero compressed size is the formal marker for an uncompressed
++			// tail image; it still occupies rawSize bytes. Raw spans may precede
++			// the first compressed stream, so anchor validation starts after all
++			// leading raw images while preserving their total byte count.
++			uint anchor = 0;
++			uint32 rawPrefix = 0;
++			while (anchor < pictures.size()) {
++				const Object &obj = _objects[pictures[anchor]];
++				uint32 comp = readU32(&_data[obj.block + 0x31]);
++				if (comp)
++					break;
++				uint32 raw = readU32(&_data[obj.block + 0x2d]);
++				if (!raw || raw > 0xffffffffU - rawPrefix) {
++					rawPrefix = 0;
++					anchor = pictures.size();
++					break;
++				}
++				rawPrefix += raw;
++				anchor++;
++			}
++
++			if (anchor < pictures.size()) {
++				const Object &first = _objects[pictures[anchor]];
++				uint32 firstRaw = readU32(&_data[first.block + 0x2d]);
++				uint32 firstComp = readU32(&_data[first.block + 0x31]);
++				debug(2, "ToolBook: segment stream probe @0x%x end=0x%x: %u pictures, anchor id=%u raw=%u comp=%u, raw prefix=%u",
++						segmentBase, segmentEnd, pictures.size(), first.id, firstRaw, firstComp, rawPrefix);
++				uint32 stream = 0;
++				for (uint32 shift = 0; shift <= 64; shift++) {
++					uint32 candidate = segmentEnd + shift;
++					if (candidate > _data.size() || rawPrefix > _data.size() - candidate)
++						continue;
++					uint32 packed = candidate + rawPrefix;
++					if (firstComp <= _data.size() - packed &&
++							(probeChunkStream(&_data[packed], firstComp, firstRaw) ||
++							 unpackHugeChunks(&_data[packed], firstComp, nullptr, firstRaw, nullptr))) {
++						stream = candidate;
++						break;
++					}
++				}
++
++				uint32 cursor = stream;
++				bool valid = stream != 0;
++				Common::Array<byte> storage;
++				for (uint i = 0; valid && i < pictures.size(); i++) {
++					const Object &obj = _objects[pictures[i]];
++					uint32 raw = readU32(&_data[obj.block + 0x2d]);
++					uint32 comp = readU32(&_data[obj.block + 0x31]);
++					byte kind = 0; // raw tail bytes
++					if (!comp) {
++						valid = raw && cursor <= _data.size() && raw <= _data.size() - cursor;
++					} else if (cursor <= _data.size() && comp <= _data.size() - cursor &&
++							probeChunkStream(&_data[cursor], comp, raw)) {
++						kind = 1; // ordinary chunk stream
++					} else if (cursor <= _data.size() && comp <= _data.size() - cursor &&
++							unpackHugeChunks(&_data[cursor], comp, nullptr, raw, nullptr)) {
++						kind = 2; // source-page-spanning chunk stream
++					} else {
++						valid = false;
++					}
++					if (valid && obj.image >= 0)
++						valid = raw == _images[obj.image].rawSize;
++					if (valid) {
++						storage.push_back(kind);
++						cursor += comp ? comp : raw;
++					}
++				}
++				if (valid) {
++					cursor = stream;
++					for (uint i = 0; i < pictures.size(); i++) {
++						const Object &obj = _objects[pictures[i]];
++						uint32 raw = readU32(&_data[obj.block + 0x2d]);
++						uint32 comp = readU32(&_data[obj.block + 0x31]);
++						if (obj.image >= 0) {
++							Image &candidate = _images[obj.image];
++							candidate.compSize = comp ? comp : raw;
++							candidate.pixels = cursor;
++							candidate.raw = storage[i] == 0;
++							candidate.chunked = storage[i] != 0;
++							candidate.hugeSpan = storage[i] == 2;
++						}
++						cursor += comp ? comp : raw;
++					}
++					debug(1, "ToolBook: %u потоков сегмента @0x%x начинаются @0x%x",
++							pictures.size(), segmentBase, stream);
++					return img.pixels != 0;
++				}
++			}
 +		}
 +	}
 +
@@ -2376,8 +2444,14 @@ index 00000000..3b590ace
 +			return nullptr;
 +		memcpy(pixels.begin(), &_data[img.pixels], img.rawSize);
 +	} else if (img.chunked) {
-+		unpackChunks(&_data[img.pixels], _data.size() - img.pixels,
-+				pixels.begin(), img.rawSize, nullptr);
++		if (img.hugeSpan) {
++			if (!unpackHugeChunks(&_data[img.pixels], img.compSize,
++					pixels.begin(), img.rawSize, nullptr))
++				return nullptr;
++		} else {
++			unpackChunks(&_data[img.pixels], _data.size() - img.pixels,
++					pixels.begin(), img.rawSize, nullptr);
++		}
 +	} else {
 +		unpackRLE(&_data[img.pixels], MIN<uint32>(img.compSize + 512, _data.size() - img.pixels),
 +				pixels.begin(), img.rawSize, img.stride, nullptr);
@@ -2459,10 +2533,10 @@ index 00000000..3b590ace
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..555ab519
+index 00000000..22915251
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,289 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2516,7 +2590,6 @@ index 00000000..555ab519
 +//   * скрипты хранятся скомпилированными, опкоды не разобраны.
 +
 +#include "common/array.h"
-+#include "common/array.h"
 +#include "common/rect.h"
 +#include "common/str.h"
 +
@@ -2553,6 +2626,10 @@ index 00000000..555ab519
 +	/// Поток найден в виде кусков `[u16 записей][записи]` — так его пишет сама
 +	/// среда ToolBook (ledger/0039).
 +	bool chunked = false;
++	/// Большой поток хранится как huge-массив 16-битной среды: группы записей
++	/// идут подряд, но после смещения > 0xfffc источник переносится на начало
++	/// следующей 64-КБ страницы. Пропущенный хвост входит в compSize.
++	bool hugeSpan = false;
 +
 +	/// База сегмента кучи, в котором лежит блок с этим DIB. Выводится из
 +	/// заголовка блока: длина блока известна (4 + 40 + палитра), значит
@@ -2560,37 +2637,92 @@ index 00000000..555ab519
 +	uint32 segBase = 0;
 +};
 +
++/// Формальная куча одной страницы/фона ToolBook. Ссылки внутри неё —
++/// 16-битные handles; адрес блока равен ``segmentBase + handle - 3``.
++struct HeapSegment {
++	uint32 base = 0;
++	uint32 end = 0;       ///< первый байт после цепочки блоков
++	uint16 type = 0;      ///< 4 = Background, 5 = Page
++	uint32 id = 0;
++	uint16 selector = 0;  ///< дальний selector, уникален среди root одного типа
++	Common::String name;
++};
++
 +/// Обработчик события объекта: имя события и строки из его таблицы.
 +struct Handler {
 +	uint32 code = 0;                 ///< смещение кода в книге
++	uint32 codeSize = 0;             ///< длина кода до маркера таблицы строк
++	uint32 ownerScriptRecord = 0;    ///< formal top-level ScriptObject record, if any
++	uint16 eventHash = 0;            ///< hash from the owning script directory
++	bool returnsValue = false;       ///< record ends in the alternate return-D marker
 +	Common::String name;             ///< buttonClick, mouseEnter, enterPage…
 +	Common::Array<Common::String> literals;  ///< строковые литералы
 +	Common::Array<Common::String> messages;  ///< имена (с хешем) — сообщения и свойства
 +};
 +
++/// A top-level ToolBook script record. These records use the same event
++/// directory as local page/object scripts, but are addressed through a far
++/// handle/selector pair by the compiled OpenScript dispatcher.
++struct ScriptObject {
++	uint32 record = 0;       ///< outer type-1 record header
++	uint32 script = 0;       ///< serialized script header at record + 0x10
++	uint16 handle = 0;       ///< far handle from the formal ScriptObject id table
++	uint16 selector = 0;     ///< filled from a formal far-reference table
++	uint32 id = 0;           ///< serialized object id, if indexed
++	Common::Array<Handler> handlers;
++};
++
 +/// Объект на странице: кнопка, многоугольник, картинка.
 +///
-+/// Координаты в книге — в 1/1440 дюйма; книга 640×480 точек при 96 точках на
-+/// дюйм, поэтому единица = 15 и **все координаты кратны 15**. Кратность и
-+/// служит проверкой при поиске прямоугольника (ledger/0028).
++/// Координаты в книге — знаковые величины в 1/1440 дюйма; книга 640×480
++/// точек при 96 точках на дюйм, поэтому 15 единиц дают один пиксель. Реальные
++/// объекты могут иметь субпиксельные и отрицательные координаты.
 +struct Object {
 +	uint32 offset = 0;      ///< смещение имени в книге
++	uint32 block = 0;       ///< начало typed object block
++	uint32 segmentBase = 0;
++	uint16 handle = 0;
++	uint16 parentHandle = 0;
++	uint16 type = 0;
++	uint32 id = 0;
 +	Common::String name;
 +	Common::Rect rect;      ///< в точках экрана
 +	/// Обвод для многоугольных областей (ledger/0037). Пусто у прямоугольных.
 +	Common::Array<Common::Point> outline;
 +	bool picture = false;   ///< за именем идёт блок DIB, а не список вершин
-+	/// Обработчики объекта: имя события и строковые литералы из таблицы
-+	/// (ledger/0038). Код не исполняется — опкоды ещё не разобраны.
++	int image = -1;         ///< индекс DIB для Picture
++	bool field = false;
++	uint32 textBlock = 0;
++	uint16 textCapacity = 0;
++	Common::String initialText;
++	bool ownVisible = true; ///< serialized flags+0x23 bit 0, without ancestors
++	bool visible = true;    ///< initial effective visibility, including ancestors
++	/// Обработчики объекта: bytecode, event selector and string table,
++	/// resolved through the object's formal local script handle.
 +	Common::Array<Handler> handlers;
 +};
 +
 +/// Страница книги.
 +struct Page {
++	uint32 segmentBase = 0;
++	uint32 backgroundSegmentBase = 0;
++	uint32 id = 0;
++	uint16 selector = 0;       ///< far selector of the serialized Page root
++	uint32 backgroundId = 0;
++	int nextPage = -1;         ///< index resolved from the formal page-order table
++	uint16 canvasWidth = 640;   ///< referenced Background client size, pixels
++	uint16 canvasHeight = 480;
++	/// Viewer placement is runtime state, not implied by a small Background's
++	/// client size. It remains unset until a formal viewer/transition property
++	/// supplies an origin.
++	bool hasCanvasOrigin = false;
++	int16 canvasX = 0;
++	int16 canvasY = 0;
 +	uint32 anchor = 0;         ///< смещение свойства ASYM_TpID
 +	int background = -1;       ///< индекс в списке картинок, -1 если не найден
 +	Common::String name;       ///< имя страницы, если распознано
 +	Common::Array<Common::String> handlers; ///< имена обработчиков рядом с якорем
++	Common::Array<Handler> eventHandlers;   ///< формально привязанные root handlers
 +	Common::Array<Common::String> text;     ///< текст страницы (CP1251 → UTF-8)
 +	Common::Array<Object> objects;          ///< объекты, лежащие до следующего фона
 +};
@@ -2619,10 +2751,25 @@ index 00000000..555ab519
 +
 +	const Common::Array<Image> &images() const { return _images; }
 +	const Common::Array<Page> &pages() const { return _pages; }
++	int initialPage() const { return _initialPage; }
++	const Common::Array<int> &pageOrder() const { return _pageOrder; }
 +	const Common::Array<Record> &records() const { return _records; }
 +	const Common::Array<Object> &objects() const { return _objects; }
++	const Common::Array<HeapSegment> &heapSegments() const { return _heapSegments; }
++	/// Все обработчики с целой таблицей строк. Пока не привязаны к страницам:
++	/// одного соседства в файле для доказуемой привязки недостаточно.
++	const Common::Array<Handler> &handlers() const { return _handlers; }
++	const Common::Array<ScriptObject> &scriptObjects() const { return _scriptObjects; }
++	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
++	const ScriptObject *findScriptObjectByRecord(uint32 record) const;
++	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
 +	const Common::Array<Common::String> &classNames() const { return _classNames; }
 +	uint segmentCount() const { return _segmentCount; }
++	uint16 readUint16(uint32 offset) const;
++	uint32 readUint32(uint32 offset) const;
++	const byte *bytes(uint32 offset, uint32 size = 1) const;
++	Common::String readString(uint32 offset, uint32 maxLength = 4096) const;
++	Common::String handlerString(const Handler &handler, uint32 target) const;
 +
 +	/// Разворачивает картинку в поверхность. Владение переходит вызывающему.
 +	/// Ноль — данные не нашлись или глубина не поддержана.
@@ -2638,16 +2785,36 @@ index 00000000..555ab519
 +	void scanRecords();
 +	void scanImages();
 +	void scanPages();
++	void scanPageOrder();
 +	void scanPageText();
 +	void scanObjects();
-+	void readHandlerStrings(uint32 code, Handler &hd);
++	void scanHeapSegments();
++	void scanHandlers();
++	void scanScriptObjects();
++	void scanScriptObjectIndex();
++	void readHandlerStrings(uint32 code, Handler &hd) const;
++	void appendScriptHandlers(uint32 script, uint32 scriptEnd,
++			Common::Array<Handler> &out, uint32 ownerScriptRecord = 0) const;
++	bool resolveLocalScript(uint32 segmentBase, uint32 segmentEnd, uint16 handle,
++			uint32 &script, uint32 &scriptEnd) const;
++	bool appendScriptBinding(uint32 segmentBase, uint32 segmentEnd, uint16 binding,
++			Common::Array<Handler> &out) const;
 +	void scanClassNames();
++	void appendSegmentObjects(uint32 segmentBase, Common::Array<Object> &out) const;
++	void appendObjectTree(uint32 segmentBase, uint16 handle, bool parentVisible,
++			Common::Array<Object> &out, uint depth) const;
++	void appendRootHandlers(uint32 segmentBase, Common::Array<Handler> &out) const;
 +
 +	Common::Array<Object> _objects;
++	Common::Array<HeapSegment> _heapSegments;
++	Common::Array<Handler> _handlers;
++	Common::Array<ScriptObject> _scriptObjects;
 +
 +	Common::Array<byte> _data;
 +	Common::Array<Image> _images;
 +	Common::Array<Page> _pages;
++	Common::Array<int> _pageOrder;
++	int _initialPage = -1;
 +	Common::Array<Record> _records;
 +	Common::Array<Common::String> _classNames;
 +	uint _segmentCount = 0;
@@ -2838,10 +3005,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..1e3c4e71
+index 00000000..69e90e23
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,454 @@
+@@ -0,0 +1,1543 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2864,14 +3031,19 @@ index 00000000..1e3c4e71
 + */
 +
 +#include "common/config-manager.h"
++#include "common/archive.h"
 +#include "common/debug.h"
 +#include "common/events.h"
 +#include "common/file.h"
++#include "common/hashmap.h"
++#include "common/formats/winexe.h"
++#include "common/ptr.h"
 +#include "common/system.h"
 +#include "engines/advancedDetector.h"
 +#include "engines/util.h"
 +#include "graphics/font.h"
 +#include "graphics/fontman.h"
++#include "graphics/fonts/ttf.h"
 +#include "graphics/palette.h"
 +#include "graphics/paletteman.h"
 +#include "graphics/surface.h"
@@ -2884,17 +3056,46 @@ index 00000000..1e3c4e71
 +// Книга «Башни знаний» лежит внутри KNTOWER.EXE с этого смещения — там просто
 +// начинается файл книги, без обёртки.
 +static const uint32 kEmbeddedBookOffset = 0x29e0;
++static const uint16 kEventEnterPage = 0x8d55;
++static const uint16 kEventFirstIdle = 0x963c;
++static const uint16 kEventMouseEnter = 0xd5cf;
++static const uint16 kEventMouseLeave = 0xc7ec;
++static const uint16 kEventButtonDown = 0xe148;
++static const uint16 kEventButtonClick = 0xf56e;
++
++static void blitTransparent(Graphics::Surface *dst, const Graphics::Surface &src,
++		int x, int y, int transparent = -1) {
++	for (int sy = 0; sy < src.h; sy++) {
++		int dy = y + sy;
++		if (dy < 0 || dy >= dst->h)
++			continue;
++		const byte *s = (const byte *)src.getBasePtr(0, sy);
++		byte *d = (byte *)dst->getBasePtr(MAX(0, x), dy);
++		int from = MAX(0, -x), to = MIN((int)src.w, (int)dst->w - x);
++		for (int sx = from; sx < to; sx++) {
++			if (transparent < 0 || s[sx] != transparent)
++				d[sx - from] = s[sx];
++		}
++	}
++}
 +
 +ToolBookEngine::ToolBookEngine(OSystem *syst, const ADGameDescription *desc)
 +		: Engine(syst), _desc(desc) {
 +}
 +
 +ToolBookEngine::~ToolBookEngine() {
++	FontMan.mayDeleteFont(_fieldFont);
 +	delete _book;
 +}
 +
 +Common::Error ToolBookEngine::run() {
 +	initGraphics(640, 480);
++	#ifdef USE_FREETYPE2
++	_fieldFont = Graphics::loadTTFFontFromArchive("LiberationSans-Regular.ttf", 16,
++			Graphics::kTTFSizeModeCharacter, 96, 96, Graphics::kTTFRenderModeMonochrome);
++	#endif
++	if (!_fieldFont)
++		_fieldFont = FontMan.getFontByUsage(Graphics::FontManager::kGUIFont);
 +	_startMs = _system->getMillis();
 +
 +	Common::File file;
@@ -2911,6 +3112,8 @@ index 00000000..1e3c4e71
 +	_book = new Book();
 +	if (!_book->load(&file, kEmbeddedBookOffset))
 +		return Common::Error(Common::kUnknownError, "книга не разобралась");
++	if (_book->initialPage() >= 0)
++		_currentPage = _book->initialPage();
 +
 +	debug(0, "ToolBook: страниц %u, картинок %u, записей %u, сегментов %u",
 +			_book->pages().size(), _book->images().size(),
@@ -2935,10 +3138,18 @@ index 00000000..1e3c4e71
 +				i, p.name.c_str(), p.objects.size(), names.c_str());
 +	}
 +
-+	showPage(0);
++	showPage(_currentPage);
++	dispatchPageEvent(kEventEnterPage);
++	_pendingFirstIdle = true;
 +
 +	while (!shouldQuit() && !_quit) {
 +		handleEvents();
++		// firstIdle is a Reader lifecycle event, not part of page navigation.
++		// Deliver it once the page has returned to the event loop.
++		if (_pendingFirstIdle) {
++			_pendingFirstIdle = false;
++			dispatchPageEvent(kEventFirstIdle);
++		}
 +		if (_needsRedraw) {
 +			if (_imageMode)
 +				showImage(_currentImage);
@@ -2953,12 +3164,924 @@ index 00000000..1e3c4e71
 +	return Common::kNoError;
 +}
 +
++int ToolBookEngine::findPageIndex(const Common::String &name) const {
++	for (uint i = 0; i < _book->pages().size(); i++)
++		if (_book->pages()[i].name.equalsIgnoreCase(name))
++			return i;
++	return -1;
++}
++
++void ToolBookEngine::navigateTo(const Common::String &name) {
++	int index = findPageIndex(name);
++	if (index < 0) {
++		warning("ToolBook: страница «%s» не найдена", name.c_str());
++		return;
++	}
++	_currentPage = index;
++	_hoveredObject = 0;
++	_focusedField = 0;
++	_fieldSelectAll = false;
++	_imageMode = false;
++	_needsRedraw = true;
++	debug(0, "ToolBook: OpenScript navigation -> «%s»", name.c_str());
++	dispatchPageEvent(kEventEnterPage);
++	_pendingFirstIdle = true;
++}
++
++void ToolBookEngine::dispatchPageEvent(uint16 eventHash) {
++	if (_currentPage < 0 || _currentPage >= (int)_book->pages().size())
++		return;
++	const Common::Array<Handler> &handlers = _book->pages()[_currentPage].eventHandlers;
++	for (uint i = 0; i < handlers.size(); i++)
++		if (handlers[i].eventHash == eventHash) {
++			runHandler(handlers[i]);
++			return;
++		}
++}
++
++void ToolBookEngine::dispatchObjectEvent(const Object &object, uint16 eventHash) {
++	for (uint i = 0; i < object.handlers.size(); i++)
++		if (object.handlers[i].eventHash == eventHash) {
++			runHandler(object.handlers[i]);
++			return;
++		}
++}
++
++// Initial executable subset of OpenScript. It contains only machine-confirmed
++// VM operations and generic ToolBook services. An unknown operation stops the
++// current handler: fabricating a return value could select a game branch that
++// the serialized OpenScript never selected.
++bool ToolBookEngine::runHandler(const Handler &handler) {
++	Common::Array<ScriptValue> arguments;
++	ScriptValue receiver;
++	return runHandler(handler, arguments, receiver, nullptr, 0);
++}
++
++bool ToolBookEngine::runHandler(const Handler &handler,
++		const Common::Array<ScriptValue> &arguments,
++		const ScriptValue &receiver, ScriptValue *result, uint depth) {
++	typedef ScriptValue Value;
++	if (depth >= 64) {
++		warning("ToolBook: слишком глубокая цепочка OpenScript @0x%x", handler.code);
++		return false;
++	}
++	static const uint8 kTypeWidths[0x5f] = {
++		4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 8, 4, 4,
++		4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2,
++		4, 4, 10, 2, 2, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
++		4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 2, 4,
++		2, 2, 2, 4, 4, 4, 2, 4, 4, 2, 4, 4, 2, 4, 4, 4,
++		4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4
++	};
++	Common::Array<Value> stack;
++	Common::HashMap<int, Value> locals;
++	int argumentOffset = 8;
++	for (uint i = 0; i < arguments.size(); i++) {
++		locals[argumentOffset] = arguments[i];
++		argumentOffset += arguments[i].width;
++	}
++	const byte *code = _book->bytes(handler.code, handler.codeSize);
++	if (!code)
++		return false;
++	uint32 ip = 0;
++	auto pushNumber = [&](uint32 n, uint8 width = 4) { Value v; v.number = n; v.width = width; stack.push_back(v); };
++	auto pushString = [&](const Common::String &s, uint8 width = 4) { Value v; v.string = s; v.isString = true; v.width = width; stack.push_back(v); };
++	auto pushReference = [&](uint32 reference, const Common::String &s, uint8 width) {
++		Value v;
++		v.reference = reference;
++		v.hasReference = true;
++		v.string = s;
++		v.isString = !s.empty();
++		v.width = width;
++		stack.push_back(v);
++	};
++	auto pushObject = [&](const Common::String &s) { Value v; v.string = s; v.isObject = true; v.width = 4; stack.push_back(v); };
++	auto pop = [&]() { Value v; if (!stack.empty()) { v = stack.back(); stack.pop_back(); } return v; };
++	auto popBytes = [&](uint bytes) {
++		uint consumed = 0;
++		while (!stack.empty() && consumed < bytes) {
++			consumed += stack.back().width;
++			stack.pop_back();
++		}
++		if (consumed != bytes)
++			debug(1, "ToolBook: stack cleanup %u bytes consumed %u @0x%x",
++					bytes, consumed, handler.code + ip);
++		return consumed == bytes;
++	};
++	auto isNullValue = [&](const Value &v) {
++		return !v.isString && !v.isObject && !v.hasReference &&
++				!v.isBookReference && !v.buffer && v.array.empty() &&
++				(v.number == 0 || v.number == 0x04000001);
++	};
++	auto truth = [&](const Value &v) {
++		return v.isString || v.isObject ? !v.string.empty() : !isNullValue(v);
++	};
++	auto valueString = [&](const Value &v) {
++		if (v.buffer && _nativeBuffers.contains(v.buffer)) {
++			const NativeBuffer &buffer = _nativeBuffers.getVal(v.buffer);
++			Common::String string;
++			for (uint i = 0; i < buffer.data.size() && buffer.data[i]; i++)
++				string += (char)buffer.data[i];
++			return string;
++		}
++		return v.string;
++	};
++	auto local = [&](int off) { return locals.contains(off) ? locals[off] : Value(); };
++	auto read16 = [&](uint32 at) { return (uint16)(code[at] | (code[at + 1] << 8)); };
++	auto branch = [&](uint32 end, uint16 rel) { ip = (uint16)(end + rel); };
++	auto parseNativeDescriptor = [&](uint32 base, Common::Array<NativeBinding> *out) {
++		uint16 count = _book->readUint16(base);
++		if (!count || count > 64 || !_book->bytes(base + 2, (uint32)count * 10))
++			return false;
++		Common::Array<NativeBinding> parsed;
++		uint32 nextName = 2 + (uint32)count * 10;
++		for (uint i = 0; i < count; i++) {
++			uint32 entry = base + 2 + i * 10;
++			uint16 modeNameOffset = _book->readUint16(entry);
++			uint16 registryNameOffset = _book->readUint16(entry + 2);
++			uint16 ordinal = _book->readUint16(entry + 4);
++			uint16 thunkOffset = _book->readUint16(entry + 6);
++			const byte *lengths = _book->bytes(entry + 8, 2);
++			if (!lengths)
++				return false;
++			uint8 thunkLength = lengths[0], signatureLength = lengths[1];
++			Common::String name = _book->readString(base + registryNameOffset, 255);
++			bool identifier = !name.empty() &&
++					(Common::isAlpha(name[0]) || name[0] == '_');
++			for (uint k = 1; identifier && k < name.size(); k++)
++				identifier = Common::isAlnum(name[k]) || name[k] == '_';
++			const byte *thunk = _book->bytes(base + thunkOffset, thunkLength);
++			bool byName = (modeNameOffset & 0x8000) != 0;
++			if (!identifier || registryNameOffset != nextName ||
++					thunkOffset != registryNameOffset + name.size() + 1 ||
++					thunkLength < 10 || thunkLength != signatureLength + 10 || !thunk ||
++					thunk[0] != 0x29 || (thunk[1] & 3) != 0 ||
++					thunk[thunkLength - 4] != 0x1c || thunk[thunkLength - 3] != 0x66 ||
++					thunk[thunkLength - 2] != thunkLength || thunk[thunkLength - 1] != 0 ||
++					(byName && ((modeNameOffset & 0x7fff) != registryNameOffset || ordinal != 0)))
++				return false;
++			NativeBinding binding;
++			binding.name = name;
++			binding.descriptor = base;
++			binding.thunk = base + thunkOffset;
++			binding.ordinal = ordinal;
++			binding.argumentBytes = thunk[1];
++			binding.thunkLength = thunkLength;
++			binding.signatureLength = signatureLength;
++			binding.byName = byName;
++			parsed.push_back(binding);
++			nextName = thunkOffset + thunkLength;
++		}
++		if (out)
++			*out = parsed;
++		return true;
++	};
++	auto globalName = [&](uint32 operand) {
++		uint16 rel = read16(operand + 2);
++		return _book->handlerString(handler, handler.code + (uint16)(operand + 4 + rel) + 5);
++	};
++	for (uint steps = 0; ip < handler.codeSize && steps < 10000; steps++) {
++		uint8 op = code[ip++];
++		switch (op) {
++		case 0x02: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 4; stack.push_back(value); break; }
++		case 0x01: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 2; stack.push_back(value); break; }
++		case 0x04: pushNumber(code[ip++], 2); break;
++		case 0x05: pushNumber(read16(ip), 2); ip += 2; break;
++		case 0x06: pushNumber((uint32)read16(ip) | ((uint32)read16(ip + 2) << 16)); ip += 4; break;
++		case 0x07: case 0x08: {
++			uint16 rel = read16(ip);
++			ip += 2;
++			uint32 reference = handler.code + (uint16)(ip + rel);
++			Common::String literal;
++			if (op != 0x08 || !parseNativeDescriptor(reference, nullptr))
++				literal = _book->handlerString(handler, reference);
++			pushReference(reference, literal,
++					op == 0x07 ? 2 : 4);
++			break;
++		}
++		case 0x0d: { int16 off = (int16)read16(ip); ip += 2; locals[off] = pop(); locals[off].width = 4; break; }
++		case 0x0c: { int16 off = (int16)read16(ip); ip += 2; locals[off] = pop(); locals[off].width = 2; break; }
++		case 0x0f: {
++			int16 adjustment = (int16)read16(ip);
++			ip += 2;
++			// A negative adjustment reserves frame scratch space, represented by
++			// locals in this abstract VM. A positive one discards real values.
++			if (adjustment > 0)
++				popBytes(adjustment);
++			break;
++		}
++		case 0x10: {
++			uint8 bytes = code[ip++];
++			const uint end = stack.size();
++			uint consumed = 0, first = end;
++			while (first && consumed < bytes) {
++				first--;
++				consumed += stack[first].width;
++			}
++			if (consumed == bytes)
++				for (uint i = first; i < end; i++)
++					stack.push_back(stack[i]);
++			break;
++		}
++		case 0x12: { uint16 rel = read16(ip); ip += 2; branch(ip, rel); break; }
++		case 0x13: case 0x14: { uint16 rel = read16(ip); ip += 2; bool condition = truth(pop()); if ((op == 0x13 && condition) || (op == 0x14 && !condition)) branch(ip, rel); break; }
++		case 0x15: { uint16 rel = read16(ip); ip += 2; if (!truth(pop())) branch(ip, rel); break; }
++		case 0x20: {
++			uint16 id = read16(ip); ip += 2;
++			uint8 cleanup = code[ip++];
++			if (id != 192) {
++				debug(1, "ToolBook: variadic builtin %u @0x%x пока не реализован",
++						id, handler.code + ip - 4);
++				return false;
++			}
++			// Aggregate constructor: cleanup includes flag/count words and N
++			// dynamic values, but not the receiver beneath them.
++			popBytes(cleanup);
++			pushNumber(0, 4);
++			break;
++		}
++		case 0x21: case 0x22: case 0x23: {
++			uint16 id = read16(ip); ip += 2;
++			if (id == 8) {
++				// RUN seg29:013c consumes a module path and a serialized native
++				// procedure descriptor. The descriptor begins with a count and
++				// fixed ten-byte entries; it is a static far value, not a string.
++				Value descriptor = pop();
++				Value module = pop();
++				if ((!module.isString && !module.isObject) || !descriptor.hasReference) {
++					debug(1, "ToolBook: builtin 8 binding operands пока не реализованы @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				uint32 base = descriptor.reference;
++				Common::Array<NativeBinding> bindings;
++				if (!parseNativeDescriptor(base, &bindings)) {
++					debug(1, "ToolBook: поврежден native descriptor @0x%x", base);
++					return false;
++				}
++				Common::String key = module.string;
++				key.toUppercase();
++				_nativeBindings[key] = bindings;
++				for (uint i = 0; i < bindings.size(); i++) {
++					Common::String functionKey = bindings[i].name;
++					functionKey.toUppercase();
++					_nativeFunctions[functionKey] = bindings[i];
++				}
++				debug(2, "ToolBook: native module %s: %u bindings", key.c_str(), bindings.size());
++			} else if (id == 180) { // page(name)
++				Value name = pop();
++				pop(); // book/context
++				if (op != 0x21) pushString(name.string);
++			} else if (id == 177) { // background(name)
++				Value name = pop();
++				pop(); // book/context
++				if (op != 0x21) pushObject(name.string);
++			} else if (id == 182) { // object(owner, name, class)
++				pop(); // class selector
++				Value name = pop();
++				pop(); // page/background owner
++				if (op != 0x21) pushObject(name.string);
++			} else if (id == 329) { // resource(owner, name, class)
++				pop();
++				Value name = pop();
++				pop();
++				if (op != 0x21) pushObject(name.string);
++			} else if (id == 194 || id == 198) { // typed `is` / ordinary equality
++				Value b = pop(), a = pop();
++				bool eq = a.isString || a.isObject || b.isString || b.isObject ?
++						a.string.equalsIgnoreCase(b.string) : a.number == b.number;
++				pushNumber(eq ? 1 : 0, 2);
++			} else if (id == 63) { // ToolBook `&&`: concatenate with one space
++				Value right = pop();
++				Value left = pop();
++				if ((!left.isString && !isNullValue(left)) ||
++						(!right.isString && !isNullValue(right))) {
++					debug(1, "ToolBook: builtin 63 non-string operands пока не реализованы @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				pushString((isNullValue(left) ? Common::String() : left.string) + " " +
++						(isNullValue(right) ? Common::String() : right.string));
++			} else if (id == 70) {
++				// Логическое «не». RUN91:09bc берёт слово и возвращает слово:
++				//     cmp word [bp+6],1  ; CF=1 ⟺ аргумент == 0
++				//     sbb ax,ax          ; ax = -CF
++				//     neg ax             ; ax = CF
++				//     retf 2
++				// То есть 1 возвращается ровно при нулевом аргументе. Раньше здесь
++				// стояло обратное условие, и ветвление после myMCITest уходило не
++				// туда (ledger/0052).
++				Value value = pop();
++				pushNumber((uint16)value.number == 0 ? 1 : 0, 2);
++			} else if (id == 190) { // case-insensitive `does not contain`
++				Value haystack = pop();
++				Value needle = pop();
++				if ((!haystack.isString && !haystack.isObject) ||
++						(!needle.isString && !needle.isObject)) {
++					debug(1, "ToolBook: builtin 190 non-string operands @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				Common::String foldedHaystack = haystack.string;
++				Common::String foldedNeedle = needle.string;
++				foldedHaystack.toUppercase();
++				foldedNeedle.toUppercase();
++				pushNumber(foldedHaystack.find(foldedNeedle) == Common::String::npos, 2);
++			} else if (id == 210) { // ToolBook `is null`
++				Value value = pop();
++				pushNumber(isNullValue(value) ? 1 : 0, 2);
++			} else if (id == 23) { // page navigation
++				Value target = pop();
++				if (target.isString || target.isObject)
++					navigateTo(target.string);
++			} else if (id == 122) { // system word property getter
++				pop();
++				// sysLevel is a ToolBook enum word. Keep the symbolic value until
++				// enum coercion (2d) tags it as a dynamic value.
++				pushString("Reader", 2);
++			} else if (id == 144) {
++				// RUN seg66:02fc consumes a selector W and an input D, and
++				// returns a D. The exact serialized selector 0x401b is its
++				// identity branch, used to obtain the current object/context.
++				Value selector = pop();
++				Value value = pop();
++				if (selector.number != 0x401b) {
++					debug(1, "ToolBook: builtin 144 selector %04x пока не реализован @0x%x",
++							selector.number, handler.code + ip - 3);
++					return false;
++				}
++				stack.push_back(value);
++			} else if (id == 98) { // Win16 AnsiUpper(string copy)
++				Value value = pop();
++				if (!value.isString && !value.isObject) {
++					debug(1, "ToolBook: builtin 98 non-string conversion пока не реализован @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				value.string.toUppercase();
++				value.isString = true;
++				value.isObject = false;
++				value.width = 4;
++				stack.push_back(value);
++			} else if (id == 62) { // dynamic string concatenation
++				Value right = pop();
++				Value left = pop();
++				if ((!left.isString && !left.isObject && !isNullValue(left)) ||
++						(!right.isString && !right.isObject && !isNullValue(right))) {
++					debug(1, "ToolBook: builtin 62 non-string operands пока не реализованы @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				pushString((isNullValue(left) ? Common::String() : left.string) +
++						(isNullValue(right) ? Common::String() : right.string));
++			} else if (id == 163) {
++				// The reached form writes an incremented ten-byte numeric value to
++				// an output pointer. Scratch storage is represented as a Value cell,
++				// so return that cell on the abstract stack for the following dup10.
++				Value outputPointer = pop();
++				Value value = pop();
++				if (value.width != 10) {
++					debug(1, "ToolBook: builtin 163 non-extended operand @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				(void)outputPointer;
++				value.number++;
++				value.width = 10;
++				stack.push_back(value);
++			} else if (id == 206) {
++				// RUN91:0c9c compares two ten-byte numeric values. The bytecode
++				// pushes the iterator first and the upper bound second, so the
++				// returned word is true while upperBound >= iterator.
++				Value upperBound = pop();
++				Value iterator = pop();
++				if (upperBound.width != 10 || iterator.width != 10) {
++					debug(1, "ToolBook: builtin 206 non-extended operands @0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
++			} else if (id == 116) {
++				// Copy a materialized ToolBook string into a Win16 far buffer.
++				// The reached form pushes copyFlag, offset, source, destination;
++				// RUN87:125c returns the source D after lstrcpy.
++				Value source = pop();
++				Value destination = pop();
++				Value offset = pop();
++				Value copyFlag = pop();
++				if (!source.isString || !destination.buffer ||
++						!_nativeBuffers.contains(destination.buffer) || !truth(copyFlag)) {
++					debug(1, "ToolBook: builtin 116 operands src=%d dstbuf=%u off=%u copy=%u @0x%x",
++							source.isString, destination.buffer, offset.number,
++							copyFlag.number, handler.code + ip - 3);
++					return false;
++				}
++				NativeBuffer &buffer = _nativeBuffers[destination.buffer];
++				uint32 from = MIN<uint32>(offset.number, source.string.size());
++				uint32 count = buffer.data.empty() ? 0 :
++						MIN<uint32>(source.string.size() - from, buffer.data.size() - 1);
++				for (uint32 i = 0; i < count; i++)
++					buffer.data[i] = (byte)source.string[from + i];
++				if (!buffer.data.empty())
++					buffer.data[count] = 0;
++				stack.push_back(source);
++			} else if (id == 33 || id == 56) { // hide/show object
++				Value object = pop();
++				if (object.isObject || object.isString)
++					setObjectVisible(object.string, id == 56);
++			} else if (id == 129) { // sysCursor setter
++				pop();
++				pop();
++			} else if (id == 127) {
++				// RUN seg95:02b0 is a void dispatcher over a W action and a D
++				// value (retf 6). The serialized startup uses action 12 with a
++				// null value; that exact branch performs no import/callback and
++				// sets the runtime's internal dynamic slot to canonical true.
++				Value action = pop();
++				Value value = pop();
++				if (action.number != 12 || truth(value)) {
++					debug(1, "ToolBook: builtin 127 action %u/value пока не реализован @0x%x",
++							action.number, handler.code + ip - 3);
++					return false;
++				}
++				_runtimeAction12 = true;
++			} else if (id == 247) { // select a complete Field text range
++				Value object = pop();
++				const Object *field = findCurrentObject(object.string);
++				if (field && field->field) {
++					_focusedField = field->block;
++					_fieldSelectAll = true;
++					_needsRedraw = true;
++				}
++			} else if (id == 364) { // flushMessageQueue: none pending in this VM loop
++				if (op != 0x21)
++					pushNumber(0, op == 0x22 ? 2 : 4);
++			} else if (id == 482) { // callMCI(command, optional notify receiver)
++				Value notifyReceiver = pop();
++				Value commandValue = pop();
++				if (!commandValue.isString) {
++					debug(1, "ToolBook: callMCI non-string command @0x%x", handler.code + ip - 3);
++					return false;
++				}
++				Common::String command = commandValue.string;
++				Common::String folded = command;
++				folded.toLowercase();
++				while (folded.hasSuffix(" wait"))
++					folded.erase(folded.size() - 5);
++				if (folded == "close all") {
++					_mciAliases.clear();
++					pushString(Common::String());
++				} else if (folded == "sysinfo all quantity") {
++					// Win98 exposes the installed MCI driver classes. These are
++					// platform capabilities, not media or page-specific state.
++					pushString("4");
++				} else if (folded.hasPrefix("sysinfo all name ")) {
++					const char *drivers[] = { "CDAudio", "Sequencer", "WaveAudio", "AVIVideo" };
++					uint index = atoi(folded.c_str() + 17);
++					pushString(index >= 1 && index <= ARRAYSIZE(drivers) ?
++							drivers[index - 1] : Common::String());
++				} else {
++					debug(1, "ToolBook: MCI command пока не реализована: %s", command.c_str());
++					return false;
++				}
++				(void)notifyReceiver;
++			} else {
++				debug(1, "ToolBook: builtin %u @0x%x пока не реализован",
++						id, handler.code + ip - 3);
++				return false;
++			}
++			break;
++		}
++		case 0x26: break;
++		case 0x27: return true;
++		case 0x28:
++			if (result) {
++				if (stack.empty())
++					return false;
++				*result = pop();
++			}
++			return true;
++		case 0x2b: { // coerce a dynamic value to another dynamic type
++			uint8 type = code[ip++];
++			if (!stack.empty()) {
++				if (type == 9 && stack.back().isBookReference) {
++					// CDBQUERYFILEPATH on the current BookRef yields the directory
++					// containing the opened book. ScummVM exposes that directory as
++					// the root of SearchMan, so its DOS-visible relative spelling is
++					// sufficient and keeps host paths out of OpenScript values.
++					stack.back().string = ".\\";
++					stack.back().isString = true;
++					stack.back().isBookReference = false;
++				}
++				stack.back().type = type;
++				stack.back().width = 4;
++			}
++			break;
++		}
++		case 0x2c: { // materialize a dynamic value in the requested raw type
++			uint8 type = code[ip++];
++			if (!stack.empty()) {
++				uint8 sourceType = stack.back().type;
++				if (type == 0x22 && stack.back().isString) {
++					// MCI numeric responses are strings until the compiler asks for
++					// ToolBook's ten-byte extended numeric representation.
++					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
++					stack.back().string.clear();
++					stack.back().isString = false;
++				} else if (type == 9 && !stack.back().isString && sourceType == 0x23) {
++					// Reached loop-index conversion used to compose an MCI command.
++					stack.back().string = Common::String::format("%d", (int32)stack.back().number);
++					stack.back().isString = true;
++				}
++				stack.back().type = type;
++				stack.back().width = type < ARRAYSIZE(kTypeWidths) ? kTypeWidths[type] : 4;
++			}
++			break;
++		}
++		case 0x2d: { // tag the raw value already on the stack as a dynamic D
++			uint8 type = code[ip++];
++			if (!stack.empty()) {
++				stack.back().type = type;
++				stack.back().width = 4;
++			}
++			break;
++		}
++		case 0x2e: { // convert one dynamic D type to another
++			uint8 type = code[ip++];
++			if (!stack.empty()) {
++				stack.back().type = type;
++				stack.back().width = 4;
++			}
++			break;
++		}
++		case 0x2f: case 0x30: case 0x31: case 0x77: break;
++		case 0x56: // 10-byte extended value -> dynamic D
++			if (!stack.empty())
++				stack.back().width = 4;
++			break;
++		case 0x33: {
++			uint8 mode = code[ip++];
++			Value index = pop();
++			Value aggregate = pop();
++			if (mode == 2 && !aggregate.array.empty() && index.number < aggregate.array.size())
++				pushString(aggregate.array[index.number]);
++			else if (mode == 0 && aggregate.isString && !aggregate.string.empty()) {
++				int32 at = index.number == 0xffff ? -1 : (int32)index.number;
++				if (at < 0)
++					at += aggregate.string.size();
++				pushString(at >= 0 && at < (int32)aggregate.string.size() ?
++						Common::String(aggregate.string[at]) : Common::String());
++			}
++			else {
++				debug(1, "ToolBook: aggregate index mode %u/%u пока не реализован @0x%x",
++						mode, index.number, handler.code + ip - 2);
++				return false;
++			}
++			break;
++		}
++		case 0x3b: {
++			uint8 slot = code[ip++];
++			if (slot == 0) {
++				// CDB slot 0 is a BookRef (runtime tag class 0x68), not a Page
++				// object and not yet a pathname. Type-9 coercion materializes its
++				// containing directory through CDBQUERYFILEPATH.
++				Value bookReference;
++				bookReference.isBookReference = true;
++				bookReference.type = 0x68;
++				stack.push_back(bookReference);
++			} else if (slot == 2)
++				pushString(_book->pages()[_currentPage].name);
++			else if (slot == 3 || slot == 4)
++				stack.push_back(receiver);
++			else
++				pushNumber(0);
++			break;
++		}
++		case 0x3c:
++			if (!stack.empty())
++				stack.back().width = 4;
++			break;
++		case 0x3e: { // cached global-symbol load
++			Common::String name = globalName(ip);
++			ip += 4;
++			if (_scriptGlobals.contains(name))
++				stack.push_back(_scriptGlobals.getVal(name));
++			else
++				pushNumber(0);
++			break;
++		}
++		case 0x3f: { // cached global-symbol store
++			Common::String name = globalName(ip);
++			ip += 4;
++			Value value = pop();
++			_scriptGlobals[name] = value;
++			break;
++		}
++		case 0x45: case 0x46: {
++			// These opcodes move a five-word (10-byte) extended value. The
++			// abstract VM keeps that aggregate in one Value cell. Do not confuse
++			// this with the one-word 01/0c or two-word 02/0d families.
++			int16 off = (int16)read16(ip);
++			ip += 2;
++			if (op == 0x45) {
++				Value value = local(off);
++				value.width = 10;
++				stack.push_back(value);
++			} else {
++				locals[off] = pop();
++				locals[off].width = 10;
++			}
++			break;
++		}
++		case 0x68: { // tagged dynamic value -> 4-byte local
++			int16 off = (int16)read16(ip);
++			ip += 2;
++			locals[off] = pop();
++			locals[off].width = 4;
++			break;
++		}
++		case 0x71: {
++			// 0x71 is a packed conversion family. Implement only the two
++			// machine-verified forms reached by this book's MCI capability loop.
++			uint16 form = read16(ip);
++			ip += 2;
++			if (stack.empty())
++				return false;
++			if (form == 0x8315) {          // signed W -> extended 10-byte number
++				stack.back().number = (uint32)(int32)(int16)stack.back().number;
++				stack.back().type = 0x22;
++				stack.back().width = 10;
++			} else if (form == 0x8351) {   // extended 10-byte number -> W
++				if (stack.back().width != 10) {
++					debug(1, "ToolBook: opcode 71 form %04x non-extended input @0x%x",
++							form, handler.code + ip - 3);
++					return false;
++				}
++				stack.back().width = 2;
++			} else {
++				debug(1, "ToolBook: opcode 71 form %04x @0x%x пока не реализована",
++						form, handler.code + ip - 3);
++				return false;
++			}
++			break;
++		}
++		case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
++		case 0x59: ip += 2; pushNumber(0, 2); break;
++		case 0x6d: {
++			uint16 rel = read16(ip);
++			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
++			uint8 kind = code[ip + 2];
++			uint16 argumentBytes = read16(ip + 3);
++			ip += 5;
++			// The target is formally a two-byte selector followed by the
++			// identifier. It is never subject to the literal-string heuristic.
++			Common::String name = _book->readString(nameTarget + 2, 255);
++			Common::String key = name;
++			key.toUppercase();
++			uint16 selector = _book->readUint16(nameTarget);
++			const Handler *scriptTarget = kind == 1 && handler.ownerScriptRecord ?
++					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
++			if (kind == 1 && (scriptTarget || _nativeFunctions.contains(key))) {
++				// The linked thunk has its own marshalling signature. It is not
++				// equal to the wire's explicit byte count: a property-style call
++				// may use the implicit receiver as its first native D argument.
++				Common::Array<Value> args;
++				pop(); // duplicated lookup context
++				Value callReceiver = pop();
++				uint consumed = 0;
++				while (!stack.empty() && consumed < argumentBytes) {
++					consumed += stack.back().width;
++					args.push_back(pop());
++				}
++				if (consumed != argumentBytes) {
++					debug(1, "ToolBook: native %s argument stack mismatch", name.c_str());
++					return false;
++				}
++				if (scriptTarget) {
++					Common::Array<Value> orderedArgs;
++					for (int i = (int)args.size() - 1; i >= 0; i--)
++						orderedArgs.push_back(args[i]);
++					Value callResult;
++					if (!runHandler(*scriptTarget, orderedArgs, callReceiver,
++							scriptTarget->returnsValue ? &callResult : nullptr, depth + 1))
++						return false;
++					if (scriptTarget->returnsValue)
++						stack.push_back(callResult);
++				} else if (key == "GLOBALALLOC") {
++					// Win16 GlobalAlloc(flags, bytes). The compiled thunk exposes
++					// the OpenScript source order as size followed by flags.
++					if (argumentBytes != 8 || args.size() != 2)
++						return false;
++					Common::Array<Value> orderedArgs;
++					for (int i = (int)args.size() - 1; i >= 0; i--)
++						orderedArgs.push_back(args[i]);
++					uint32 size = orderedArgs[0].number;
++					uint32 handle = _nextNativeBuffer++;
++					NativeBuffer buffer;
++					buffer.data.resize(size);
++					for (uint32 i = 0; i < size; i++)
++						buffer.data[i] = 0;
++					_nativeBuffers[handle] = buffer;
++					Value allocated;
++					allocated.number = handle;
++					allocated.width = 4;
++					stack.push_back(allocated);
++					debug(2, "ToolBook: GlobalAlloc %u bytes -> %u", size, handle);
++				} else if (key == "GLOBALLOCK") {
++					if (argumentBytes != 4 || args.size() != 1)
++						return false;
++					Value locked;
++					locked.number = args[0].number;
++					locked.buffer = args[0].number;
++					locked.width = 4;
++					if (!_nativeBuffers.contains(locked.buffer))
++						return false;
++					stack.push_back(locked);
++				} else if (key == "ADDFONTRESOURCE") {
++					if (argumentBytes != 4 || args.size() != 1)
++						return false;
++					Common::String fileName = valueString(args[0]);
++					for (uint i = 0; i < fileName.size(); i++)
++						if (fileName[i] == '\\')
++							fileName.setChar('/', i);
++					while (fileName.hasPrefix("./"))
++						fileName.erase(0, 2);
++					Common::ScopedPtr<Common::SeekableReadStream> fontFile(
++							SearchMan.createReadStreamForMember(Common::Path(fileName)));
++					uint32 loaded = 0;
++					if (fontFile) {
++						Common::ScopedPtr<Common::WinResources> resources(
++								Common::WinResources::createFromEXE(fontFile.get()));
++						Common::ScopedPtr<Common::SeekableReadStream> directory(resources ?
++								resources->getResource(Common::kWinFontDir,
++										Common::WinResourceID("FONTDIR")) : nullptr);
++						if (directory && directory->size() >= 2) {
++							uint16 count = directory->readUint16LE();
++							for (uint i = 0; i < count && !directory->eos(); i++) {
++								uint16 id = directory->readUint16LE();
++								if (directory->pos() + 113 > directory->size())
++									break;
++								directory->skip(68);
++								uint16 points = directory->readUint16LE();
++								directory->skip(43);
++								directory->readString(); // device
++								Common::String face = directory->readString();
++								Common::ScopedPtr<Common::SeekableReadStream> font(
++										resources->getResource(Common::kWinFont, id));
++								if (!font || face.empty())
++									continue;
++								Common::String faceKey = face;
++								faceKey.toUppercase();
++								NativeFontFace &registered = _nativeFonts[faceKey];
++								registered.name = face;
++								bool duplicate = false;
++								for (uint p = 0; p < registered.points.size(); p++)
++									duplicate |= registered.points[p] == points;
++								if (!duplicate)
++									registered.points.push_back(points);
++								loaded++;
++							}
++						}
++					}
++					pushNumber(loaded);
++					debug(1, "ToolBook: AddFontResource %s -> %u",
++							fileName.c_str(), loaded);
++				} else if (key == "SENDMESSAGE") {
++					// The reached call is HWND_BROADCAST / WM_FONTCHANGE. ScummVM
++					// owns its font registry directly, so the Windows broadcast has
++					// no additional consumers. Preserve SendMessage's numeric result.
++					if (argumentBytes != 16 || args.size() != 4)
++						return false;
++					pushNumber(0);
++				} else if (key == "GETMODULEPATH") {
++					if (argumentBytes != 4 || args.size() != 1)
++						return false;
++					Common::String moduleName = valueString(args[0]);
++					if (moduleName.empty())
++						return false;
++					// Win16 returns the loaded module's path. It is only fed to the
++					// generic version-resource query next; retain a DOS-visible name.
++					pushString(moduleName + ".DLL");
++				} else if (key == "GETFILEVERSION") {
++					if (argumentBytes != 4 || args.size() != 1)
++						return false;
++					Common::String fileName = valueString(args[0]);
++					for (uint i = 0; i < fileName.size(); i++)
++						if (fileName[i] == '\\')
++							fileName.setChar('/', i);
++					while (fileName.hasPrefix("./"))
++						fileName.erase(0, 2);
++					Common::ScopedPtr<Common::SeekableReadStream> executable(
++							SearchMan.createReadStreamForMember(Common::Path(fileName)));
++					Common::ScopedPtr<Common::WinResources> resources(executable ?
++							Common::WinResources::createFromEXE(executable.get()) : nullptr);
++					Common::ScopedPtr<Common::WinResources::VersionInfo> version(resources ?
++							resources->getVersionResource(1) : nullptr);
++					Value fields;
++					if (version) {
++						const char *keys[] = { "Path", "FileVersion", "Language", "InternalName",
++							"ProductName", "ProductVersion", "OriginalFilename",
++							"LegalCopyright", "LegalTrademarks" };
++						for (uint i = 0; i < ARRAYSIZE(keys); i++)
++							fields.array.push_back(i == 0 ? fileName :
++									version->hash[keys[i]].encode());
++					} else if (fileName.equalsIgnoreCase("USER.DLL") ||
++							fileName.equalsIgnoreCase("USER.EXE")) {
++						// The original bridge queries the version resource of Win98's
++						// loaded USER.EXE. ScummVM has no host USER.EXE, so expose a
++						// compact compatible Win16 platform record. These are platform
++						// properties; no game branch or page name is encoded here.
++						fields.array.push_back("USER.EXE");       // Path
++						fields.array.push_back("4.10.2222");     // FileVersion
++						fields.array.push_back("Russian");       // Language
++						fields.array.push_back("USER");          // InternalName
++						fields.array.push_back("Microsoft Windows");
++						fields.array.push_back("4.10.2222");     // ProductVersion
++						fields.array.push_back("USER.EXE");
++						fields.array.push_back("Microsoft Corporation");
++						fields.array.push_back(Common::String());
++					}
++					fields.width = 4;
++					stack.push_back(fields);
++				} else if (key == "GETWININIVAR") {
++					if (argumentBytes != 8 || args.size() != 2)
++						return false;
++					// Explicit arguments were popped from the VM stack in reverse
++					// source order: key, then section.
++					Common::String section = valueString(args[1]);
++					Common::String setting = valueString(args[0]);
++					Common::String iniKey = section + "\n" + setting;
++					iniKey.toUppercase();
++					pushString(_winIniValues.contains(iniKey) ?
++							_winIniValues.getVal(iniKey) : Common::String());
++				} else if (key == "SETWININIVAR") {
++					if (argumentBytes != 12 || args.size() != 3)
++						return false;
++					// Reverse pop order: value, key, section.
++					Common::String section = valueString(args[2]);
++					Common::String setting = valueString(args[1]);
++					Common::String iniKey = section + "\n" + setting;
++					iniKey.toUppercase();
++					_winIniValues[iniKey] = valueString(args[0]);
++					pushNumber(1);
++				} else if (key == "DISPLAYFONTS") {
++					const NativeBinding &binding = _nativeFunctions.getVal(key);
++					if (binding.argumentBytes != 4 || argumentBytes != 0) {
++						debug(1, "ToolBook: unexpected displayFonts signature");
++						return false;
++					}
++					Common::String family = valueString(callReceiver);
++					Common::String fontList;
++					for (Common::HashMap<Common::String, NativeFontFace>::const_iterator it =
++							_nativeFonts.begin(); it != _nativeFonts.end(); ++it) {
++						const NativeFontFace &face = it->_value;
++						if (!family.empty() && !face.name.equalsIgnoreCase(family))
++							continue;
++						fontList += face.name;
++						for (uint s = 0; s < face.points.size(); s++)
++							fontList += Common::String::format(",%u", face.points[s]);
++						fontList += "\r\n";
++					}
++					pushString(fontList);
++				} else {
++					debug(1, "ToolBook: native function %s пока не реализована @0x%x",
++							name.c_str(), handler.code + ip - 6);
++					return false;
++				}
++			} else {
++				debug(1, "ToolBook: named dispatch %s kind %u/%u пока не реализован @0x%x",
++						name.c_str(), kind, argumentBytes, handler.code + ip - 6);
++				return false;
++			}
++			break;
++		}
++		case 0x72: ip++; pop(); break;
++		case 0x73:
++			// Materialize/copy the top dynamic value in the current context.
++			// The abstract VM already owns its Value, so stack and value stay put.
++			if (stack.empty())
++				return false;
++			stack.back().width = 4;
++			break;
++		default:
++			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, handler.code + ip - 1);
++			return false;
++		}
++	}
++	if (handler.returnsValue && result) {
++		if (stack.empty())
++			return false;
++		*result = pop();
++	}
++	return true;
++}
++
 +// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных прогонов,
 +// такой же по смыслу, как в движке director. Строки вида
 +//     1500 click 232 215
 +//     4000 key 111
-+// где первое число — миллисекунды от старта. Нужен, чтобы обход игры был
-+// воспроизводимым и снимал одни и те же кадры для сверки с эталоном.
++// где первое число — миллисекунды от старта. Это только воспроизводимый
++// пользовательский ввод для кадров сверки; переходы выбирает сама книга.
 +void ToolBookEngine::loadInputScript() {
 +	_inputScriptLoaded = true;
 +	if (!ConfMan.hasKey("inputscript"))
@@ -3004,11 +4127,21 @@ index 00000000..1e3c4e71
 +		const ScriptedInput &in = _inputScript[_inputScriptPos++];
 +		Common::Event ev;
 +		if (in.action == kInputClick) {
++			ev.type = Common::EVENT_MOUSEMOVE;
++			ev.mouse = Common::Point(in.x, in.y);
++			_injected.push_back(ev);
++			ev.type = Common::EVENT_LBUTTONDOWN;
++			ev.mouse = Common::Point(in.x, in.y);
++			_injected.push_back(ev);
 +			ev.type = Common::EVENT_LBUTTONUP;
 +			ev.mouse = Common::Point(in.x, in.y);
 +		} else {
 +			ev.type = Common::EVENT_KEYDOWN;
-+			ev.kbd = Common::KeyState((Common::KeyCode)in.x, in.x);
++			int ascii = in.x;
++			Common::KeyCode keycode = (Common::KeyCode)in.x;
++			if (in.x >= 'A' && in.x <= 'Z')
++				keycode = (Common::KeyCode)(Common::KEYCODE_a + in.x - 'A');
++			ev.kbd = Common::KeyState(keycode, ascii);
 +		}
 +		_injected.push_back(ev);
 +	}
@@ -3024,72 +4157,115 @@ index 00000000..1e3c4e71
 +			_injected.remove_at(0);
 +		}
 +		switch (event.type) {
++		case Common::EVENT_MOUSEMOVE: {
++			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
++			uint32 next = hit ? hit->block : 0;
++			if (next == _hoveredObject)
++				break;
++			const Object *previous = findCurrentObject(_hoveredObject);
++			_hoveredObject = next;
++			if (previous)
++				dispatchObjectEvent(*previous, kEventMouseLeave);
++			// A leave handler may navigate and clear the hover state.
++			if (_hoveredObject == next && next) {
++				hit = findCurrentObject(next);
++				if (hit)
++					dispatchObjectEvent(*hit, kEventMouseEnter);
++			}
++			break;
++		}
 +		case Common::EVENT_KEYDOWN:
++			if (_focusedField) {
++				const Object *field = findCurrentObject(_focusedField);
++				if (field && field->field) {
++					Common::String value = fieldText(*field);
++					if (event.kbd.keycode == Common::KEYCODE_BACKSPACE) {
++						if (_fieldSelectAll) {
++							value.clear();
++							_fieldSelectAll = false;
++						} else
++						if (!value.empty())
++							value.deleteLastChar();
++						_fieldValues[field->block] = value;
++						_needsRedraw = true;
++						break;
++					}
++					if (event.kbd.ascii >= 32 && event.kbd.ascii < 127 &&
++							value.size() < field->textCapacity) {
++						if (_fieldSelectAll) {
++							value.clear();
++							_fieldSelectAll = false;
++						}
++						value += (char)event.kbd.ascii;
++						_fieldValues[field->block] = value;
++						_needsRedraw = true;
++						break;
++					}
++				}
++			}
 +			switch (event.kbd.keycode) {
 +			case Common::KEYCODE_ESCAPE:
 +				_quit = true;
 +				break;
 +			case Common::KEYCODE_RIGHT:
-+			case Common::KEYCODE_SPACE:
 +			case Common::KEYCODE_PAGEDOWN:
-+				if (_imageMode) {
-+					if (_currentImage + 1 < (int)_rawImages.size())
-+						_currentImage++;
-+				} else if (_currentPage + 1 < (int)_book->pages().size()) {
-+					_currentPage++;
++				// Resource browsing is an explicitly enabled diagnostic mode;
++				// it never changes the current game page.
++				if (_imageMode && _currentImage + 1 < (int)_rawImages.size()) {
++					_currentImage++;
++					_needsRedraw = true;
 +				}
-+				_needsRedraw = true;
 +				break;
 +			case Common::KEYCODE_LEFT:
 +			case Common::KEYCODE_PAGEUP:
 +				if (_imageMode) {
 +					if (_currentImage > 0)
 +						_currentImage--;
-+				} else if (_currentPage > 0) {
-+					_currentPage--;
 +				}
 +				_needsRedraw = true;
 +				break;
 +			case Common::KEYCODE_HOME:
-+				_currentPage = 0;
-+				_currentImage = 0;
-+				_needsRedraw = true;
++				if (_imageMode) {
++					_currentImage = 0;
++					_needsRedraw = true;
++				}
 +				break;
 +			case Common::KEYCODE_i:
 +				// Просмотр ресурсов книги: показывает те картинки, которые
-+				// движок действительно разворачивает.
-+				_imageMode = !_imageMode;
-+				_needsRedraw = true;
++				// движок действительно разворачивает. It is disabled unless
++				// explicitly requested and cannot drive page transitions.
++				if (ConfMan.getBool("toolbook_resource_viewer")) {
++					_imageMode = !_imageMode;
++					_needsRedraw = true;
++				}
 +				break;
 +			case Common::KEYCODE_o:
 +				// Рамки объектов страницы — проверка разбора прямоугольников.
-+				_showHotspots = !_showHotspots;
-+				_needsRedraw = true;
++				if (ConfMan.getBool("toolbook_resource_viewer")) {
++					_showHotspots = !_showHotspots;
++					_needsRedraw = true;
++				}
 +				break;
 +			default:
 +				break;
 +			}
 +			break;
++		case Common::EVENT_LBUTTONDOWN: {
++			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
++			if (hit) {
++				_focusedField = hit->field ? hit->block : 0;
++				_fieldSelectAll = false;
++				dispatchObjectEvent(*hit, kEventButtonDown);
++			}
++			break;
++		}
 +		case Common::EVENT_LBUTTONUP: {
-+			// Сначала спрашиваем объекты страницы: у них теперь есть настоящие
-+			// прямоугольники. Пока это только сообщение в лог — исполнять
-+			// обработчик нечем, интерпретатора нет.
 +			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
 +			if (hit) {
 +				debug(0, "ToolBook: щелчок по объекту «%s» (%d,%d)-(%d,%d)",
 +						hit->name.c_str(), hit->rect.left, hit->rect.top,
 +						hit->rect.right, hit->rect.bottom);
-+				break;
-+			}
-+			// Промах — листаем: правая половина вперёд, левая назад.
-+			if (event.mouse.x > 320) {
-+				if (_currentPage + 1 < (int)_book->pages().size()) {
-+					_currentPage++;
-+					_needsRedraw = true;
-+				}
-+			} else if (_currentPage > 0) {
-+				_currentPage--;
-+				_needsRedraw = true;
++				dispatchObjectEvent(*hit, kEventButtonClick);
 +			}
 +			break;
 +		}
@@ -3099,30 +4275,81 @@ index 00000000..1e3c4e71
 +	}
 +}
 +
++const Object *ToolBookEngine::findCurrentObject(const Common::String &name) const {
++	if (_currentPage < 0 || _currentPage >= (int)_book->pages().size())
++		return nullptr;
++	const Common::Array<Object> &objects = _book->pages()[_currentPage].objects;
++	for (uint i = 0; i < objects.size(); i++)
++		if (objects[i].name.equalsIgnoreCase(name))
++			return &objects[i];
++	return nullptr;
++}
++
++const Object *ToolBookEngine::findCurrentObject(uint32 block) const {
++	if (!block || _currentPage < 0 || _currentPage >= (int)_book->pages().size())
++		return nullptr;
++	const Common::Array<Object> &objects = _book->pages()[_currentPage].objects;
++	for (uint i = 0; i < objects.size(); i++)
++		if (objects[i].block == block)
++			return &objects[i];
++	return nullptr;
++}
++
++bool ToolBookEngine::objectVisible(const Page &page, const Object &object, uint depth) const {
++	if (depth > 32)
++		return false;
++	bool own = _visibilityOverrides.contains(object.block) ?
++			_visibilityOverrides.getVal(object.block) : object.ownVisible;
++	if (!own)
++		return false;
++	if (object.parentHandle == 0x14)
++		return true;
++	for (uint i = 0; i < page.objects.size(); i++) {
++		const Object &parent = page.objects[i];
++		if (parent.segmentBase == object.segmentBase && parent.handle == object.parentHandle)
++			return objectVisible(page, parent, depth + 1);
++	}
++	return false;
++}
++
++void ToolBookEngine::setObjectVisible(const Common::String &name, bool visible) {
++	const Object *object = findCurrentObject(name);
++	if (!object)
++		return;
++	_visibilityOverrides[object->block] = visible;
++	_needsRedraw = true;
++}
++
++Common::String ToolBookEngine::fieldText(const Object &object) const {
++	return _fieldValues.contains(object.block) ?
++			_fieldValues.getVal(object.block) : object.initialText;
++}
++
++Common::Point ToolBookEngine::pageOrigin(const Page &page) const {
++	return page.hasCanvasOrigin ? Common::Point(page.canvasX, page.canvasY) : Common::Point();
++}
++
 +const Object *ToolBookEngine::objectAt(int x, int y) const {
 +	const Common::Array<Page> &pages = _book->pages();
 +	if (_imageMode || _currentPage < 0 || _currentPage >= (int)pages.size())
 +		return nullptr;
 +
-+	// Меньший объект выигрывает: полноэкранные прямоугольники вроде popkaRec
-+	// лежат под всеми и не должны перехватывать щелчок.
-+	const Object *best = nullptr;
-+	int bestArea = 0;
++	// Objects are stored in formal back-to-front child-list order. Walk that
++	// order backwards so the topmost visible object receives the event.
 +	const Common::Array<Object> &objs = pages[_currentPage].objects;
-+	for (uint i = 0; i < objs.size(); i++) {
-+		if (!objs[i].rect.contains(x, y))
++	Common::Point origin = pageOrigin(pages[_currentPage]);
++	for (int i = (int)objs.size() - 1; i >= 0; i--) {
++		Common::Rect rect = objs[i].rect;
++		rect.translate(origin.x, origin.y);
++		if (!objectVisible(pages[_currentPage], objs[i]) || !rect.contains(x, y))
 +			continue;
 +		// У многоугольных областей рамка — только грубая отсечка: попадание
 +		// считается по обводу, иначе кнопки на карте перекрывают друг друга.
-+		if (!objs[i].outline.empty() && !pointInOutline(objs[i], x, y))
++		if (!objs[i].outline.empty() && !pointInOutline(objs[i], x - origin.x, y - origin.y))
 +			continue;
-+		int area = objs[i].rect.width() * objs[i].rect.height();
-+		if (!best || area < bestArea) {
-+			best = &objs[i];
-+			bestArea = area;
-+		}
++		return &objs[i];
 +	}
-+	return best;
++	return nullptr;
 +}
 +
 +// Классический тест «луч вправо»: точка внутри, если пересечений нечётное число.
@@ -3143,11 +4370,12 @@ index 00000000..1e3c4e71
 +	// Рамки объектов: пока интерпретатора нет, это единственный способ увидеть,
 +	// правильно ли разобраны прямоугольники (клавиша o).
 +	const uint32 color = screen->format.isCLUT8() ? 255 : screen->format.RGBToColor(0xff, 0, 0xff);
++	Common::Point origin = pageOrigin(page);
 +	for (uint i = 0; i < page.objects.size(); i++) {
 +		const Common::Array<Common::Point> &o = page.objects[i].outline;
 +		if (!o.empty()) {
 +			for (uint k = 0; k < o.size(); k++) {
-+				const Common::Point &a = o[k], &b = o[(k + 1) % o.size()];
++				Common::Point a = o[k] + origin, b = o[(k + 1) % o.size()] + origin;
 +				if (a.x >= 0 && a.x < screen->w && b.x >= 0 && b.x < screen->w &&
 +						a.y >= 0 && a.y < screen->h && b.y >= 0 && b.y < screen->h)
 +					screen->drawLine(a.x, a.y, b.x, b.y, color);
@@ -3155,6 +4383,7 @@ index 00000000..1e3c4e71
 +			continue;
 +		}
 +		Common::Rect r = page.objects[i].rect;
++		r.translate(origin.x, origin.y);
 +		r.clip(Common::Rect(0, 0, screen->w, screen->h));
 +		if (r.isEmpty())
 +			continue;
@@ -3173,27 +4402,54 @@ index 00000000..1e3c4e71
 +	const Page &page = pages[index];
 +
 +	Graphics::Surface *screen = _system->lockScreen();
-+	screen->fillRect(Common::Rect(0, 0, screen->w, screen->h), 0);
++	// A Background whose client canvas is smaller than the book window is a
++	// modal overlay. ToolBook retains the existing framebuffer around it; only
++	// full-window backgrounds replace the page beneath them.
++	if (page.canvasWidth >= screen->w && page.canvasHeight >= screen->h)
++		screen->fillRect(Common::Rect(0, 0, screen->w, screen->h), 0);
 +
 +	bool drawn = false;
-+	if (page.background >= 0) {
++	Common::Point origin = pageOrigin(page);
++	for (uint o = 0; o < page.objects.size(); o++) {
++		const Object &obj = page.objects[o];
++		if (!objectVisible(page, obj) || !obj.picture || obj.image < 0)
++			continue;
 +		Graphics::Palette palette(256);
-+		Graphics::Surface *img = _book->decodeImage(const_cast<Image &>(_book->images()[page.background]), palette);
-+		if (img) {
-+			if (img->format.isCLUT8())
-+				_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
++		Graphics::Surface *img = _book->decodeImage(
++				const_cast<Image &>(_book->images()[obj.image]), palette);
++		if (!img || !img->format.isCLUT8()) {
++			if (img) { img->free(); delete img; }
++			continue;
++		}
++		_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
++		// ToolBook picture DIBs use palette index 253 (magenta) as the
++		// transparent matte. A full-screen background is copied opaquely.
++		int transparent = (obj.rect.width() >= 620 && obj.rect.height() >= 460) ? -1 : 253;
++		blitTransparent(screen, *img, obj.rect.left + origin.x, obj.rect.top + origin.y, transparent);
++		img->free();
++		delete img;
++		drawn = true;
++	}
 +
-+			int x = MAX(0, (screen->w - (int16)img->w) / 2);
-+			int y = MAX(0, (screen->h - (int16)img->h) / 2);
-+			int rows = MIN((int)img->h, (int)screen->h - y);
-+			int cols = MIN((int)img->w, (int)screen->w - x);
-+			for (int row = 0; row < rows; row++) {
-+				memcpy(screen->getBasePtr(x, y + row), img->getBasePtr(0, row),
-+						cols * img->format.bytesPerPixel);
++	// ToolBook Fields are native text overlays; their frame and labels are
++	// already part of the surrounding Picture DIB. Draw only the mutable text.
++	const Graphics::Font *fieldFont = _fieldFont;
++	if (fieldFont) {
++		for (uint o = 0; o < page.objects.size(); o++) {
++			const Object &obj = page.objects[o];
++			if (!obj.field || !objectVisible(page, obj))
++				continue;
++			Common::String value = (_fieldSelectAll && _focusedField == obj.block) ?
++					Common::String() : fieldText(obj);
++			Common::U32String text = value.decode(Common::kUtf8);
++			int x = obj.rect.left + origin.x + 2;
++			int y = obj.rect.top + origin.y + MAX(0, (obj.rect.height() - fieldFont->getFontHeight()) / 2);
++			fieldFont->drawString(screen, text, x, y, MAX(0, obj.rect.width() - 4), 0);
++			if (_focusedField == obj.block) {
++				int caret = MIN(obj.rect.right + origin.x - 2, x + fieldFont->getStringWidth(text));
++				screen->drawLine(caret, obj.rect.top + origin.y + 3,
++						caret, obj.rect.bottom + origin.y - 4, 0);
 +			}
-+			img->free();
-+			delete img;
-+			drawn = true;
 +		}
 +	}
 +
@@ -3210,7 +4466,7 @@ index 00000000..1e3c4e71
 +
 +	debug(1, "ToolBook: страница %d/%d «%s», фон %d, объектов %u, обработчиков %u, строк текста %u",
 +			index + 1, (int)pages.size(), page.name.c_str(), page.background,
-+			page.objects.size(), page.handlers.size(), page.text.size());
++			page.objects.size(), page.eventHandlers.size(), page.text.size());
 +	for (uint i = 0; i < page.objects.size() && i < 8; i++)
 +		debug(2, "  объект %s (%d,%d)-(%d,%d)", page.objects[i].name.c_str(),
 +				page.objects[i].rect.left, page.objects[i].rect.top,
@@ -3298,10 +4554,10 @@ index 00000000..1e3c4e71
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..d7b16753
+index 00000000..8cfbe409
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,166 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3328,15 +4584,14 @@ index 00000000..d7b16753
 +
 +// Движок для книг Asymetrix Multimedia ToolBook 4.0.
 +//
-+// Пока умеет ровно то, что разобрано в формате: открыть книгу, собрать список
-+// страниц с фонами и текстом и показывать их. Байт-код OpenScript не разобран,
-+// поэтому собственной логики игры (кнопки, мини-игры, MCI-команды) здесь нет —
-+// см. book.h и ledger/0015, там записано, что именно установлено и что нет.
++// The engine reads the formal ToolBook heap, decodes the book's image streams
++// and executes the machine-confirmed subset of OpenScript needed by the game.
 +
 +#include "engines/engine.h"
 +#include "common/array.h"
 +#include "common/error.h"
 +#include "common/events.h"
++#include "common/hashmap.h"
 +#include "common/rect.h"
 +
 +struct ADGameDescription;
@@ -3344,6 +4599,7 @@ index 00000000..d7b16753
 +namespace Graphics {
 +struct Surface;
 +class Palette;
++class Font;
 +}
 +
 +namespace ToolBook {
@@ -3365,15 +4621,62 @@ index 00000000..d7b16753
 +	const char *getGameId() const;
 +
 +private:
++	struct ScriptValue {
++		uint32 number = 0;
++		Common::String string;
++		bool isString = false;
++		bool isObject = false;
++		bool hasReference = false;
++		bool isBookReference = false;
++		uint32 reference = 0;
++		uint32 buffer = 0;
++		Common::Array<Common::String> array;
++		uint8 type = 0;
++		uint8 width = 4;
++	};
++	struct NativeBinding {
++		Common::String name;
++		uint32 descriptor = 0;
++		uint32 thunk = 0;
++		uint16 ordinal = 0;
++		uint8 argumentBytes = 0;
++		uint8 thunkLength = 0;
++		uint8 signatureLength = 0;
++		bool byName = false;
++	};
++	struct NativeFontFace {
++		Common::String name;
++		Common::Array<uint16> points;
++	};
++	struct NativeBuffer {
++		Common::Array<byte> data;
++	};
++
 +	void showPage(int index);
 +	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
 +	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
 +	const struct Object *objectAt(int x, int y) const;
++	const struct Object *findCurrentObject(const Common::String &name) const;
++	const struct Object *findCurrentObject(uint32 block) const;
++	bool objectVisible(const struct Page &page, const struct Object &object,
++			uint depth = 0) const;
++	void setObjectVisible(const Common::String &name, bool visible);
++	Common::String fieldText(const struct Object &object) const;
++	Common::Point pageOrigin(const struct Page &page) const;
 +	static bool pointInOutline(const struct Object &obj, int x, int y);
 +	void handleEvents();
++	int findPageIndex(const Common::String &name) const;
++	void navigateTo(const Common::String &name);
++	bool runHandler(const struct Handler &handler);
++	bool runHandler(const struct Handler &handler,
++			const Common::Array<ScriptValue> &arguments,
++			const ScriptValue &receiver, ScriptValue *result, uint depth);
++	void dispatchPageEvent(uint16 eventHash);
++	void dispatchObjectEvent(const struct Object &object, uint16 eventHash);
 +
 +	const ADGameDescription *_desc;
 +	Book *_book = nullptr;
++	const Graphics::Font *_fieldFont = nullptr;
 +
 +	void showImage(int index);
 +	Common::Array<int> _rawImages; ///< индексы картинок, которые умеем разворачивать
@@ -3384,6 +4687,21 @@ index 00000000..d7b16753
 +	bool _quit = false;
 +	bool _needsRedraw = true;
 +	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
++	Common::HashMap<uint32, bool> _visibilityOverrides;
++	Common::HashMap<uint32, Common::String> _fieldValues;
++	Common::HashMap<Common::String, ScriptValue> _scriptGlobals;
++	Common::HashMap<uint32, NativeBuffer> _nativeBuffers;
++	uint32 _nextNativeBuffer = 1;
++	Common::HashMap<Common::String, Common::Array<NativeBinding> > _nativeBindings;
++	Common::HashMap<Common::String, NativeBinding> _nativeFunctions;
++	Common::HashMap<Common::String, NativeFontFace> _nativeFonts;
++	Common::HashMap<Common::String, Common::String> _mciAliases;
++	Common::HashMap<Common::String, Common::String> _winIniValues;
++	bool _runtimeAction12 = false;
++	uint32 _hoveredObject = 0;
++	uint32 _focusedField = 0;
++	bool _fieldSelectAll = false;
++	bool _pendingFirstIdle = false;
 +
 +	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных
 +	// прогонов; ключ конфига inputscript, см. toolbook.cpp.
