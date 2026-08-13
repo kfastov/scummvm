@@ -683,9 +683,10 @@ void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
 		// `returnDynamic/end` marker (28 1c 66) instead of the usual void
 		// marker. Directory record bounds remain authoritative.
 		if (!found) {
-			for (uint32 marker = code; marker + 3 <= recordEnd; marker++) {
+			for (uint32 marker = code; marker + 5 <= recordEnd; marker++) {
 				if (_data[marker] != 0x28 || _data[marker + 1] != 0x1c ||
-						_data[marker + 2] != 0x66)
+						_data[marker + 2] != 0x66 ||
+						readU16(&_data[marker + 3]) != marker - code + 7)
 					continue;
 				Handler handler;
 				handler.code = code;

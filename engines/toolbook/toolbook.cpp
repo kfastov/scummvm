@@ -258,6 +258,16 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		return consumed == bytes;
 	};
 	auto truth = [&](const Value &v) { return v.isString || v.isObject ? !v.string.empty() : v.number != 0; };
+	auto valueString = [&](const Value &v) {
+		if (v.buffer && _nativeBuffers.contains(v.buffer)) {
+			const NativeBuffer &buffer = _nativeBuffers.getVal(v.buffer);
+			Common::String string;
+			for (uint i = 0; i < buffer.data.size() && buffer.data[i]; i++)
+				string += (char)buffer.data[i];
+			return string;
+		}
+		return v.string;
+	};
 	auto local = [&](int off) { return locals.contains(off) ? locals[off] : Value(); };
 	auto read16 = [&](uint32 at) { return (uint16)(code[at] | (code[at + 1] << 8)); };
 	auto branch = [&](uint32 end, uint16 rel) { ip = (uint16)(end + rel); };
@@ -480,6 +490,30 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					return false;
 				}
 				pushString(left.string + right.string);
+			} else if (id == 116) {
+				// Copy a materialized ToolBook string into a Win16 far buffer.
+				// The reached form pushes copyFlag, offset, source, destination;
+				// RUN87:125c returns the source D after lstrcpy.
+				Value source = pop();
+				Value destination = pop();
+				Value offset = pop();
+				Value copyFlag = pop();
+				if (!source.isString || !destination.buffer ||
+						!_nativeBuffers.contains(destination.buffer) || !truth(copyFlag)) {
+					debug(1, "ToolBook: builtin 116 operands src=%d dstbuf=%u off=%u copy=%u @0x%x",
+							source.isString, destination.buffer, offset.number,
+							copyFlag.number, handler.code + ip - 3);
+					return false;
+				}
+				NativeBuffer &buffer = _nativeBuffers[destination.buffer];
+				uint32 from = MIN<uint32>(offset.number, source.string.size());
+				uint32 count = buffer.data.empty() ? 0 :
+						MIN<uint32>(source.string.size() - from, buffer.data.size() - 1);
+				for (uint32 i = 0; i < count; i++)
+					buffer.data[i] = (byte)source.string[from + i];
+				if (!buffer.data.empty())
+					buffer.data[count] = 0;
+				stack.push_back(source);
 			} else if (id == 33 || id == 56) { // hide/show object
 				Value object = pop();
 				if (object.isObject || object.isString)
@@ -530,6 +564,15 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		case 0x2b: { // coerce a dynamic value to another dynamic type
 			uint8 type = code[ip++];
 			if (!stack.empty()) {
+				if (type == 9 && stack.back().isBookReference) {
+					// CDBQUERYFILEPATH on the current BookRef yields the directory
+					// containing the opened book. ScummVM exposes that directory as
+					// the root of SearchMan, so its DOS-visible relative spelling is
+					// sufficient and keeps host paths out of OpenScript values.
+					stack.back().string = ".\\";
+					stack.back().isString = true;
+					stack.back().isBookReference = false;
+				}
 				stack.back().type = type;
 				stack.back().width = 4;
 			}
@@ -567,7 +610,15 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		case 0x33: ip++; break;
 		case 0x3b: {
 			uint8 slot = code[ip++];
-			if (slot == 2)
+			if (slot == 0) {
+				// CDB slot 0 is a BookRef (runtime tag class 0x68), not a Page
+				// object and not yet a pathname. Type-9 coercion materializes its
+				// containing directory through CDBQUERYFILEPATH.
+				Value bookReference;
+				bookReference.isBookReference = true;
+				bookReference.type = 0x68;
+				stack.push_back(bookReference);
+			} else if (slot == 2)
 				pushString(_book->pages()[_currentPage].name);
 			else if (slot == 3 || slot == 4)
 				stack.push_back(receiver);
@@ -583,7 +634,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			Common::String name = globalName(ip);
 			ip += 4;
 			if (_scriptGlobals.contains(name))
-				pushString(_scriptGlobals.getVal(name));
+				stack.push_back(_scriptGlobals.getVal(name));
 			else
 				pushNumber(0);
 			break;
@@ -592,8 +643,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			Common::String name = globalName(ip);
 			ip += 4;
 			Value value = pop();
-			_scriptGlobals[name] = value.isString || value.isObject ?
-					value.string : Common::String::format("%u", value.number);
+			_scriptGlobals[name] = value;
 			break;
 		}
 		case 0x45: case 0x46: {
@@ -661,13 +711,92 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 						return false;
 					if (scriptTarget->returnsValue)
 						stack.push_back(callResult);
+				} else if (key == "GLOBALALLOC") {
+					// Win16 GlobalAlloc(flags, bytes). The compiled thunk exposes
+					// the OpenScript source order as size followed by flags.
+					if (argumentBytes != 8 || args.size() != 2)
+						return false;
+					Common::Array<Value> orderedArgs;
+					for (int i = (int)args.size() - 1; i >= 0; i--)
+						orderedArgs.push_back(args[i]);
+					uint32 size = orderedArgs[0].number;
+					uint32 handle = _nextNativeBuffer++;
+					NativeBuffer buffer;
+					buffer.data.resize(size);
+					for (uint32 i = 0; i < size; i++)
+						buffer.data[i] = 0;
+					_nativeBuffers[handle] = buffer;
+					Value allocated;
+					allocated.number = handle;
+					allocated.width = 4;
+					stack.push_back(allocated);
+					debug(2, "ToolBook: GlobalAlloc %u bytes -> %u", size, handle);
+				} else if (key == "GLOBALLOCK") {
+					if (argumentBytes != 4 || args.size() != 1)
+						return false;
+					Value locked;
+					locked.number = args[0].number;
+					locked.buffer = args[0].number;
+					locked.width = 4;
+					if (!_nativeBuffers.contains(locked.buffer))
+						return false;
+					stack.push_back(locked);
+				} else if (key == "ADDFONTRESOURCE") {
+					if (argumentBytes != 4 || args.size() != 1)
+						return false;
+					Common::String fileName = valueString(args[0]);
+					for (uint i = 0; i < fileName.size(); i++)
+						if (fileName[i] == '\\')
+							fileName.setChar('/', i);
+					while (fileName.hasPrefix("./"))
+						fileName.erase(0, 2);
+					Common::ScopedPtr<Common::SeekableReadStream> fontFile(
+							SearchMan.createReadStreamForMember(Common::Path(fileName)));
+					uint32 loaded = 0;
+					if (fontFile) {
+						Common::ScopedPtr<Common::WinResources> resources(
+								Common::WinResources::createFromEXE(fontFile.get()));
+						Common::ScopedPtr<Common::SeekableReadStream> directory(resources ?
+								resources->getResource(Common::kWinFontDir,
+										Common::WinResourceID("FONTDIR")) : nullptr);
+						if (directory && directory->size() >= 2) {
+							uint16 count = directory->readUint16LE();
+							for (uint i = 0; i < count && !directory->eos(); i++) {
+								uint16 id = directory->readUint16LE();
+								if (directory->pos() + 113 > directory->size())
+									break;
+								directory->skip(68);
+								uint16 points = directory->readUint16LE();
+								directory->skip(43);
+								directory->readString(); // device
+								Common::String face = directory->readString();
+								Common::ScopedPtr<Common::SeekableReadStream> font(
+										resources->getResource(Common::kWinFont, id));
+								if (!font || face.empty())
+									continue;
+								Common::String faceKey = face;
+								faceKey.toUppercase();
+								NativeFontFace &registered = _nativeFonts[faceKey];
+								registered.name = face;
+								bool duplicate = false;
+								for (uint p = 0; p < registered.points.size(); p++)
+									duplicate |= registered.points[p] == points;
+								if (!duplicate)
+									registered.points.push_back(points);
+								loaded++;
+							}
+						}
+					}
+					pushNumber(loaded);
+					debug(1, "ToolBook: AddFontResource %s -> %u",
+							fileName.c_str(), loaded);
 				} else if (key == "DISPLAYFONTS") {
 					const NativeBinding &binding = _nativeFunctions.getVal(key);
 					if (binding.argumentBytes != 4 || argumentBytes != 0) {
 						debug(1, "ToolBook: unexpected displayFonts signature");
 						return false;
 					}
-					Common::String family = callReceiver.string;
+					Common::String family = valueString(callReceiver);
 					Common::String fontList;
 					for (Common::HashMap<Common::String, NativeFontFace>::const_iterator it =
 							_nativeFonts.begin(); it != _nativeFonts.end(); ++it) {

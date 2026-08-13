@@ -67,6 +67,7 @@ private:
 		bool isString = false;
 		bool isObject = false;
 		bool hasReference = false;
+		bool isBookReference = false;
 		uint32 reference = 0;
 		uint32 buffer = 0;
 		uint8 type = 0;
@@ -85,6 +86,9 @@ private:
 	struct NativeFontFace {
 		Common::String name;
 		Common::Array<uint16> points;
+	};
+	struct NativeBuffer {
+		Common::Array<byte> data;
 	};
 
 	void showPage(int index);
@@ -124,7 +128,9 @@ private:
 	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
 	Common::HashMap<uint32, bool> _visibilityOverrides;
 	Common::HashMap<uint32, Common::String> _fieldValues;
-	Common::HashMap<Common::String, Common::String> _scriptGlobals;
+	Common::HashMap<Common::String, ScriptValue> _scriptGlobals;
+	Common::HashMap<uint32, NativeBuffer> _nativeBuffers;
+	uint32 _nextNativeBuffer = 1;
 	Common::HashMap<Common::String, Common::Array<NativeBinding> > _nativeBindings;
 	Common::HashMap<Common::String, NativeBinding> _nativeFunctions;
 	Common::HashMap<Common::String, NativeFontFace> _nativeFonts;
