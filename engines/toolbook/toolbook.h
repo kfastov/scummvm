@@ -61,6 +61,17 @@ public:
 	const char *getGameId() const;
 
 private:
+	struct ScriptValue {
+		uint32 number = 0;
+		Common::String string;
+		bool isString = false;
+		bool isObject = false;
+		bool hasReference = false;
+		uint32 reference = 0;
+		uint32 buffer = 0;
+		uint8 type = 0;
+		uint8 width = 4;
+	};
 	struct NativeBinding {
 		Common::String name;
 		uint32 descriptor = 0;
@@ -92,6 +103,9 @@ private:
 	int findPageIndex(const Common::String &name) const;
 	void navigateTo(const Common::String &name);
 	bool runHandler(const struct Handler &handler);
+	bool runHandler(const struct Handler &handler,
+			const Common::Array<ScriptValue> &arguments,
+			const ScriptValue &receiver, ScriptValue *result, uint depth);
 	void dispatchPageEvent(uint16 eventHash);
 	void dispatchObjectEvent(const struct Object &object, uint16 eventHash);
 
