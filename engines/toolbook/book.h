@@ -92,6 +92,14 @@ struct Image {
 	uint32 segBase = 0;
 };
 
+/// Обработчик события объекта: имя события и строки из его таблицы.
+struct Handler {
+	uint32 code = 0;                 ///< смещение кода в книге
+	Common::String name;             ///< buttonClick, mouseEnter, enterPage…
+	Common::Array<Common::String> literals;  ///< строковые литералы
+	Common::Array<Common::String> messages;  ///< имена (с хешем) — сообщения и свойства
+};
+
 /// Объект на странице: кнопка, многоугольник, картинка.
 ///
 /// Координаты в книге — в 1/1440 дюйма; книга 640×480 точек при 96 точках на
@@ -104,6 +112,9 @@ struct Object {
 	/// Обвод для многоугольных областей (ledger/0037). Пусто у прямоугольных.
 	Common::Array<Common::Point> outline;
 	bool picture = false;   ///< за именем идёт блок DIB, а не список вершин
+	/// Обработчики объекта: имя события и строковые литералы из таблицы
+	/// (ledger/0038). Код не исполняется — опкоды ещё не разобраны.
+	Common::Array<Handler> handlers;
 };
 
 /// Страница книги.
@@ -161,6 +172,7 @@ private:
 	void scanPages();
 	void scanPageText();
 	void scanObjects();
+	void readHandlerStrings(uint32 code, Handler &hd);
 	void scanClassNames();
 
 	/// Раскладывает пиксельные потоки по картинкам одного сегмента.
