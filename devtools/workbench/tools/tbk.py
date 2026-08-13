@@ -48,6 +48,7 @@
     tbk.py images <книга> <каталог> [--min-w 64]  — выгрузка DIB в .bmp
     tbk.py text <книга> [--min 20]          — текст CP1251
     tbk.py scripts <книга> [--limit 20]     — группы строковых операндов скриптов
+    tbk.py objects <книга>                  — объекты страниц с прямоугольниками
 """
 
 from __future__ import annotations
@@ -352,6 +353,81 @@ def cmd_scripts(args):
         print(f"@0x{g['offset']:07x} {'[27 1d 66] ' if g['marker'] else ''}{', '.join(g['items'])}")
 
 
+
+
+# ------------------------------------------------------- объекты страниц
+
+# Координаты в книге — в 1/1440 дюйма. Книга 640×480 точек при 96 точках на
+# дюйм, значит 9600×7200 единиц, и **все координаты кратны 15**. Это и есть
+# точный фильтр, отличающий настоящий прямоугольник от случайных байт.
+UNIT = 15
+PAGE_W, PAGE_H = 640, 480
+
+OBJ_NAME = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{1,24}\x00")
+FULLSCREEN_DIB = bytes.fromhex('280000008002000' + '0e0010000' + '01000800')
+
+
+def find_objects(data: bytes) -> list[dict]:
+    """Объекты книги: имя и прямоугольник в точках экрана.
+
+    Запись объекта заканчивается на ``<u16 next><u32 self><имя\0>``; прямоугольник
+    из четырёх ``u16`` лежит недалеко перед ней, но на разном расстоянии — оно
+    зависит от класса объекта (у многоугольника между ними ещё число вершин).
+    Поэтому прямоугольник ищется перебором назад с проверкой кратности 15.
+    """
+    out = []
+    for m in OBJ_NAME.finditer(data):
+        p = m.start()
+        if p < 64:
+            continue
+        self_off = struct.unpack_from('<I', data, p - 4)[0]
+        if not 0 < self_off < 0x10000:
+            continue
+        for back in range(6, 48):
+            q = p - 4 - back
+            l, t, r, b = struct.unpack_from('<4H', data, q)
+            if l % UNIT or t % UNIT or r % UNIT or b % UNIT:
+                continue
+            if not (0 <= l < r <= PAGE_W * UNIT and 0 <= t < b <= PAGE_H * UNIT):
+                continue
+            if r - l < 2 * UNIT or b - t < 2 * UNIT:
+                continue
+            out.append({'offset': p, 'name': m.group()[:-1].decode('cp1251', 'replace'),
+                        'rect': (l // UNIT, t // UNIT, r // UNIT, b // UNIT),
+                        'rect_at': q})
+            break
+    return out
+
+
+def find_backgrounds(data: bytes) -> list[int]:
+    """Смещения полноэкранных фонов 640×480×8."""
+    pat = struct.pack('<IiiHH', 40, PAGE_W, PAGE_H, 1, 8)
+    return [m.start() for m in re.finditer(re.escape(pat), data)]
+
+
+def cmd_objects(args):
+    data = read_book(args.book)
+    objs = find_objects(data)
+    bgs = find_backgrounds(data)
+    print(f'объектов с прямоугольником: {len(objs)}, полноэкранных фонов: {len(bgs)}')
+    import bisect
+    starts = [o['offset'] for o in objs]
+    shown = 0
+    for k, f in enumerate(bgs):
+        nxt = bgs[k + 1] if k + 1 < len(bgs) else len(data)
+        i, j = bisect.bisect_left(starts, f), bisect.bisect_left(starts, nxt)
+        grp = objs[i:j]
+        if args.min_objects and len(grp) < args.min_objects:
+            continue
+        print(f"\nфон @0x{f:07x}: объектов {len(grp)}")
+        for o in grp[:args.limit]:
+            l, t, r, b = o['rect']
+            print(f"   {o['name']:<20} ({l:3},{t:3})-({r:3},{b:3})")
+        shown += 1
+        if args.pages and shown >= args.pages:
+            break
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -368,6 +444,9 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0); p.set_defaults(fn=cmd_images)
     p = sub.add_parser("text"); p.add_argument("book"); p.add_argument("--min", type=int, default=20); p.set_defaults(fn=cmd_text)
     p = sub.add_parser("scripts"); p.add_argument("book"); p.add_argument("--limit", type=int, default=40); p.set_defaults(fn=cmd_scripts)
+    p = sub.add_parser("objects"); p.add_argument("book")
+    p.add_argument("--limit", type=int, default=20); p.add_argument("--pages", type=int, default=6)
+    p.add_argument("--min-objects", type=int, default=3); p.set_defaults(fn=cmd_objects)
 
     args = ap.parse_args()
     args.fn(args)
