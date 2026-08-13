@@ -423,6 +423,33 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 	return out;
 }
 
+// Быстрая проба: считает размеры, ничего не записывая. Поиск начала данных —
+// это десятки тысяч попыток, и запись в буфер на каждой съедала бы секунды.
+static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 stride,
+		uint32 &outLen, uint32 &usedLen) {
+	uint32 in = 0, out = 0, col = 0;
+	while (out < dstLen && in < srcLen) {
+		byte c = src[in++];
+		uint32 n;
+		if (c <= 0xf5) {
+			if (in >= srcLen)
+				break;
+			in++;
+			n = MIN<uint32>(c + 3, stride - col);
+		} else {
+			uint32 k = c - 0xf5;
+			in += k;
+			n = MIN<uint32>(k, stride - col);
+		}
+		out += n;
+		col += n;
+		if (col >= stride)
+			col = 0;
+	}
+	outLen = out;
+	usedLen = in;
+}
+
 bool Book::locatePixels(Image &img) {
 	if (img.pixels)
 		return true;
@@ -438,18 +465,16 @@ bool Book::locatePixels(Image &img) {
 	// Окно намеренно узкое: на корпусе из 400 картинок данные лежали сразу за
 	// палитрой у 396, а каждая проверка стоит полной распаковки. С окном в
 	// 64 КБ перелистывание страницы подвисало на секунды (ledger/0029).
-	const uint32 kSearch = 0x600;
-	Common::Array<byte> tmp;
-	tmp.resize(img.rawSize);
+	const uint32 kSearch = 0x8000;
 
 	for (uint32 off = 0; off < kSearch; off++) {
 		uint32 start = afterPalette + off;
 		if (start + img.compSize > _data.size())
 			break;
 
-		uint32 used = 0;
-		uint32 got = unpackRLE(&_data[start], MIN<uint32>(img.compSize + 512, _data.size() - start),
-				tmp.begin(), img.rawSize, img.stride, &used);
+		uint32 got = 0, used = 0;
+		probeRLE(&_data[start], MIN<uint32>(img.compSize + 512, _data.size() - start),
+				img.rawSize, img.stride, got, used);
 
 		if (got == img.rawSize && used + img.height / 2 + 16 >= img.compSize &&
 				used <= img.compSize + img.height / 2 + 16) {
@@ -457,6 +482,8 @@ bool Book::locatePixels(Image &img) {
 			return true;
 		}
 	}
+	debug(1, "ToolBook: не нашли пиксели картинки @0x%x %dx%d, raw=%u comp=%u",
+			img.offset, img.width, img.height, img.rawSize, img.compSize);
 	return false;
 }
 
