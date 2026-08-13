@@ -3005,10 +3005,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..d3f19f8f
+index 00000000..8660b259
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,1580 @@
+@@ -0,0 +1,1754 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3274,6 +3274,13 @@ index 00000000..d3f19f8f
 +				(v.number == 0 || v.number == 0x04000001);
 +	};
 +	auto truth = [&](const Value &v) {
++		// Логические значения ToolBook — канонические строки `true`/`false`.
++		// Без этой проверки строка «false» считалась истиной, потому что она
++		// не пуста (ledger/0054).
++		if (v.isString && v.string.equalsIgnoreCase("false"))
++			return false;
++		if (v.isString && v.string.equalsIgnoreCase("true"))
++			return true;
 +		return v.isString || v.isObject ? !v.string.empty() : !isNullValue(v);
 +	};
 +	auto valueString = [&](const Value &v) {
@@ -3561,30 +3568,78 @@ index 00000000..d3f19f8f
 +					return false;
 +				}
 +				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
-+			} else if (id == 116) {
-+				// Copy a materialized ToolBook string into a Win16 far buffer.
-+				// The reached form pushes copyFlag, offset, source, destination;
-+				// RUN87:125c returns the source D after lstrcpy.
++			} else if (id == 69) {
++				// RUN91:00b2: вычитание чисел ToolBook. Значение грузится как целое
++				// (`fild dword`) или как двойное (`fld qword`) в зависимости от
++				// слова-признака, дальше `fsubr` — то есть результат это
++				// «первое минус второе», и он кладётся десятью байтами
++				// `[u16 признак][8 байт числа]` (ledger/0054).
++				Value secondTag = pop();
++				Value second = pop();
++				Value first = pop();
++				if (secondTag.width != 2 || second.width != 10 || first.width != 10) {
++					debug(1, "ToolBook: builtin 69 неожиданная форма операндов 	0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				Value difference = first;
++				difference.number = first.number - second.number;
++				difference.type = 0x22;
++				difference.width = 10;
++				stack.push_back(difference);
++						} else if (id == 106) {
++				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
++				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
++				// `результат - начало строки + 1`. То есть это `offset()` —
++				// позиция подстроки, считая с единицы, или 0 (ledger/0054).
++				// Искомое лежит в аргументе, уложенном первым, строка — во втором.
++				Value haystack = pop();
++				Value needle = pop();
++				if (!haystack.isString || !needle.isString) {
++					debug(1, "ToolBook: builtin 106 нестроковые операнды 	0x%x",
++							handler.code + ip - 3);
++					return false;
++				}
++				const char *at = needle.string.empty() ? nullptr :
++						strstr(haystack.string.c_str(), needle.string.c_str());
++				pushNumber(at ? (uint32)(at - haystack.string.c_str()) + 1 : 0,
++						op == 0x22 ? 2 : 4);
++						} else if (id == 116) {
++				// RUN87:125c, retf 0xc. Аргументы (в порядке укладки): флаг копии,
++				// смещение, приёмник, источник. Функция строит значение-строку по
++				// дальнему указателю `приёмник + смещение` (MTB40BAS.109) и, если
++				// флаг не ноль и источник не пуст, сперва копирует источник туда
++				// (KERNEL.88 = lstrcpy). Возвращается всегда значение, построенное по
++				// приёмнику, — поэтому чтение заполненного буфера идёт этой же
++				// функцией с нулевым флагом (ledger/0054).
 +				Value source = pop();
 +				Value destination = pop();
 +				Value offset = pop();
 +				Value copyFlag = pop();
-+				if (!source.isString || !destination.buffer ||
-+						!_nativeBuffers.contains(destination.buffer) || !truth(copyFlag)) {
-+					debug(1, "ToolBook: builtin 116 operands src=%d dstbuf=%u off=%u copy=%u @0x%x",
-+							source.isString, destination.buffer, offset.number,
-+							copyFlag.number, handler.code + ip - 3);
++				if (!destination.buffer || !_nativeBuffers.contains(destination.buffer)) {
++					debug(1, "ToolBook: builtin 116 приёмник не буфер (%u) 	0x%x",
++							destination.buffer, handler.code + ip - 3);
 +					return false;
 +				}
 +				NativeBuffer &buffer = _nativeBuffers[destination.buffer];
-+				uint32 from = MIN<uint32>(offset.number, source.string.size());
-+				uint32 count = buffer.data.empty() ? 0 :
-+						MIN<uint32>(source.string.size() - from, buffer.data.size() - 1);
-+				for (uint32 i = 0; i < count; i++)
-+					buffer.data[i] = (byte)source.string[from + i];
-+				if (!buffer.data.empty())
-+					buffer.data[count] = 0;
-+				stack.push_back(source);
++				uint32 from = MIN<uint32>(offset.number, buffer.data.size());
++				if (truth(copyFlag)) {
++					if (!source.isString) {
++						debug(1, "ToolBook: builtin 116 источник не строка 	0x%x",
++								handler.code + ip - 3);
++						return false;
++					}
++					uint32 count = from >= buffer.data.size() ? 0 :
++							MIN<uint32>(source.string.size(), buffer.data.size() - from - 1);
++					for (uint32 i = 0; i < count; i++)
++						buffer.data[from + i] = (byte)source.string[i];
++					if (from + count < buffer.data.size())
++						buffer.data[from + count] = 0;
++				}
++				Common::String text;
++				for (uint32 i = from; i < buffer.data.size() && buffer.data[i]; i++)
++					text += (char)buffer.data[i];
++				pushString(text);
 +			} else if (id == 33 || id == 56) { // hide/show object
 +				Value object = pop();
 +				if (object.isObject || object.isString)
@@ -3648,6 +3703,12 @@ index 00000000..d3f19f8f
 +			} else {
 +				debug(1, "ToolBook: builtin %u @0x%x пока не реализован",
 +						id, handler.code + ip - 3);
++				// Верхушка стека — операнды нереализованного builtin: печатаем их,
++				// чтобы барьер сразу показывал, с чем его зовут.
++				for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 8; v--, n++)
++					debug(1, "    операнд [-%d]: ширина %u тип %02x число %u стр «%s»",
++							n, stack[v].width, stack[v].type, stack[v].number,
++							valueString(stack[v]).c_str());
 +				return false;
 +			}
 +			break;
@@ -3688,6 +3749,16 @@ index 00000000..d3f19f8f
 +					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
 +					stack.back().string.clear();
 +					stack.back().isString = false;
++				} else if (stack.back().isString && type != 9 &&
++						(stack.back().string.equalsIgnoreCase("true") ||
++						 stack.back().string.equalsIgnoreCase("false"))) {
++					// Логическое значение ToolBook хранится канонической строкой
++					// `true`/`false`. При материализации в числовой тип оно должно
++					// стать 1/0: стартовый скрипт отдаёт результат myMCITest именно
++					// так, а builtin 70 (логическое «не», RUN91:09bc) читает слово.
++					// Без этого «true» приходило нулём и книга уходила в ветку
++					// «звуковое устройство не обнаружено» (ledger/0054).
++					stack.back().number = stack.back().string.equalsIgnoreCase("true") ? 1 : 0;
 +				} else if (type == 9 && !stack.back().isString && sourceType == 0x23) {
 +					// Reached loop-index conversion used to compose an MCI command.
 +					stack.back().string = Common::String::format("%d", (int32)stack.back().number);
@@ -3807,11 +3878,24 @@ index 00000000..d3f19f8f
 +			ip += 2;
 +			if (stack.empty())
 +				return false;
-+			if (form == 0x8315) {          // signed W -> extended 10-byte number
-+				stack.back().number = (uint32)(int32)(int16)stack.back().number;
++			if ((form & 0xff) == 0x15) {
++				// RUN34:0x30dd (по таблице seg34:0x2e2e, индекс
++				// `(низкий & 0x0f) << 1 | (низкий & 0xf0)`): снимает слово и
++				// выкладывает десятибайтовое число. Расширение зависит от
++				// знакового бита старшего байта формы: `or ah,ah / jns` —
++				// при взведённом бите идёт `cdq`, иначе dx обнуляется.
++				// Поэтому 0x8315 — со знаком, 0x0315 — без (ledger/0054).
++				stack.back().number = (form & 0x8000) ?
++						(uint32)(int32)(int16)stack.back().number :
++						(stack.back().number & 0xffff);
 +				stack.back().type = 0x22;
 +				stack.back().width = 10;
-+			} else if (form == 0x8351) {   // extended 10-byte number -> W
++			} else if ((form & 0xff) == 0x51) {
++				// Обратное преобразование: подобработчик RUN34:0x3207 передаёт
++				// форму целиком в общий преобразователь seg30:0x078c, а тот
++				// решает по `младший & 7` и по `старший & 3`. У форм 0x8351 и
++				// 0x8251 оба признака совпадают, поэтому различать их незачем
++				// (ledger/0054). Десятибайтовое число -> слово.
 +				if (stack.back().width != 10) {
 +					debug(1, "ToolBook: opcode 71 form %04x non-extended input @0x%x",
 +							form, handler.code + ip - 3);
@@ -3849,8 +3933,9 @@ index 00000000..d3f19f8f
 +			const Handler *messageTarget = handler.ownerScriptRecord ?
 +					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
 +			if (!messageTarget) {
-+				// Обработчик лежит в другом объекте: посылка идёт вверх по
-+				// цепочке, а её порядок ещё не наблюдался (ledger/0053).
++				// Обработчик лежит в другом объекте: получатель приходит со стека
++				// (два дальних указателя), порядок обхода ещё не наблюдался
++				// (ledger/0053).
 +				debug(1, "ToolBook: сообщение %s (селектор %04x) не разрешено @0x%x",
 +						name.c_str(), selector, handler.code + ip - 3);
 +				return false;
@@ -3990,6 +4075,88 @@ index 00000000..d3f19f8f
 +					if (argumentBytes != 16 || args.size() != 4)
 +						return false;
 +					pushNumber(0);
++				} else if (key == "FILEEXISTS") {
++					// TB40DOS: есть ли файл. Дерево игры плоское, поэтому от пути
++					// эталонной установки берём имя файла.
++					if (args.size() != 1)
++						return false;
++					Common::String probe = valueString(args[0]);
++					while (probe.contains('\\'))
++						probe.erase(0, probe.findFirstOf('\\') + 1);
++					bool present = !probe.empty() && SearchMan.hasFile(Common::Path(probe));
++					debug(2, "ToolBook: fileExists %s -> %s", probe.c_str(),
++							present ? "true" : "false");
++					pushString(present ? "true" : "false");
++								} else if (key == "GETINIVAR") {
++					// TB40WIN: чтение переменной из INI-файла. Порядок аргументов взят не
++					// из догадки, а из настоящего файла эталонного стенда
++					// C:\WINDOWS\MTB40.INI: там секция [CACHE FILES], ключ KNTOWER.EXE
++					// (ledger/0054). Путь приводим к имени файла — дерево игры плоское.
++					if (args.size() != 3)
++						return false;
++					Common::String iniSection = valueString(args[0]);
++					Common::String iniEntry = valueString(args[1]);
++					Common::String iniFile = valueString(args[2]);
++					while (iniFile.contains('\\'))
++						iniFile.erase(0, iniFile.findFirstOf('\\') + 1);
++					Common::ScopedPtr<Common::SeekableReadStream> iniStream(
++							SearchMan.createReadStreamForMember(Common::Path(iniFile)));
++					Common::String found;
++					bool inSection = false;
++					while (iniStream && !iniStream->eos()) {
++						Common::String line = iniStream->readLine();
++						while (!line.empty() && (line.lastChar() == ' ' || line.lastChar() == '\r'))
++							line.deleteLastChar();
++						if (line.empty())
++							continue;
++						if (line.firstChar() == '[') {
++							Common::String header(line.c_str() + 1);
++							if (header.contains(']'))
++								header.erase(header.findFirstOf(']'));
++							inSection = header.equalsIgnoreCase(iniSection);
++							continue;
++						}
++						if (!inSection || !line.contains('='))
++							continue;
++						uint32 split = line.findFirstOf('=');
++						Common::String name(line.c_str(), split);
++						while (!name.empty() && name.lastChar() == ' ')
++							name.deleteLastChar();
++						if (name.equalsIgnoreCase(iniEntry)) {
++							found = Common::String(line.c_str() + split + 1);
++							break;
++						}
++					}
++					debug(2, "ToolBook: getIniVar [%s] %s из %s -> «%s»", iniSection.c_str(),
++							iniEntry.c_str(), iniFile.c_str(), found.c_str());
++					pushString(found);
++								} else if (key == "GETWINDOWSDIRECTORY") {
++					// Win16 `UINT GetWindowsDirectory(LPSTR, UINT)`: заполняет буфер и
++					// возвращает длину. Книга заранее берёт буфер через GlobalAlloc и
++					// GlobalLock, поэтому один аргумент — наш буфер, второй его размер;
++					// какой именно, определяем по метке буфера, а не по порядку.
++					// Эталон — Windows 98, там это C:\WINDOWS.
++					if (args.size() != 2)
++						return false;
++					const Value *destination = nullptr, *capacity = nullptr;
++					for (uint i = 0; i < args.size(); i++) {
++						if (args[i].buffer && _nativeBuffers.contains(args[i].buffer))
++							destination = &args[i];
++						else
++							capacity = &args[i];
++					}
++					if (!destination || !capacity)
++						return false;
++					NativeBuffer &buffer = _nativeBuffers[destination->buffer];
++					Common::String windowsDirectory = "C:\\WINDOWS";
++					uint32 room = MIN<uint32>(capacity->number, buffer.data.size());
++					if (room <= windowsDirectory.size())
++						return false;
++					for (uint i = 0; i < windowsDirectory.size(); i++)
++						buffer.data[i] = (byte)windowsDirectory[i];
++					buffer.data[windowsDirectory.size()] = 0;
++					pushNumber(windowsDirectory.size(), 2);
++					debug(2, "ToolBook: GetWindowsDirectory -> %s", windowsDirectory.c_str());
 +				} else if (key == "GETMODULEPATH") {
 +					if (argumentBytes != 4 || args.size() != 1)
 +						return false;
@@ -4083,6 +4250,13 @@ index 00000000..d3f19f8f
 +				} else {
 +					debug(1, "ToolBook: native function %s пока не реализована @0x%x",
 +							name.c_str(), handler.code + ip - 6);
++					// Аргументы уже сняты со стека в порядке, обратном исходному:
++					// печатаем их, чтобы следующий барьер сразу показывал, чего от него
++					// хотят, и не требовал отдельного прогона с пробой.
++					for (uint a = 0; a < args.size(); a++)
++						debug(1, "    аргумент %u (исходный %u): ширина %u число %u стр «%s»%s",
++								a, (uint)(args.size() - 1 - a), args[a].width, args[a].number,
++								valueString(args[a]).c_str(), args[a].buffer ? " буфер" : "");
 +					return false;
 +				}
 +			} else {
