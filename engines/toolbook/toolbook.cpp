@@ -51,6 +51,7 @@ ToolBookEngine::~ToolBookEngine() {
 
 Common::Error ToolBookEngine::run() {
 	initGraphics(640, 480);
+	_startMs = _system->getMillis();
 
 	Common::File file;
 	const char *candidates[] = { "KNTOWER.EXE", "kntower.tbk", "RESOURCE.TBK", nullptr };
@@ -78,7 +79,17 @@ Common::Error ToolBookEngine::run() {
 
 	for (uint i = 0; i < _book->images().size(); i++)
 		_rawImages.push_back(i);
-	debug(0, "ToolBook: картинок: %u", _rawImages.size());
+	debug(0, "ToolBook: картинок: %u, объектов с прямоугольником: %u",
+			_rawImages.size(), _book->objects().size());
+
+	for (uint i = 0; i < _book->pages().size(); i++) {
+		const Page &p = _book->pages()[i];
+		Common::String names;
+		for (uint k = 0; k < p.objects.size() && k < 6; k++)
+			names += p.objects[k].name + " ";
+		debug(1, "ToolBook: страница %2u «%s»: объектов %u — %s",
+				i, p.name.c_str(), p.objects.size(), names.c_str());
+	}
 
 	showPage(0);
 
@@ -98,9 +109,76 @@ Common::Error ToolBookEngine::run() {
 	return Common::kNoError;
 }
 
+// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных прогонов,
+// такой же по смыслу, как в движке director. Строки вида
+//     1500 click 232 215
+//     4000 key 111
+// где первое число — миллисекунды от старта. Нужен, чтобы обход игры был
+// воспроизводимым и снимал одни и те же кадры для сверки с эталоном.
+void ToolBookEngine::loadInputScript() {
+	_inputScriptLoaded = true;
+	if (!ConfMan.hasKey("inputscript"))
+		return;
+
+	Common::File f;
+	if (!f.open(Common::FSNode(ConfMan.getPath("inputscript")))) {
+		warning("ToolBook: не открывается сценарий ввода %s",
+				ConfMan.get("inputscript").c_str());
+		return;
+	}
+	while (!f.eos()) {
+		Common::String line = f.readLine();
+		if (line.empty() || line[0] == '#')
+			continue;
+		uint32 t = 0;
+		char verb[16] = { 0 };
+		int a = 0, b = 0;
+		if (sscanf(line.c_str(), "%u %15s %d %d", &t, verb, &a, &b) < 2)
+			continue;
+		ScriptedInput in;
+		in.timeMs = t;
+		in.x = a;
+		in.y = b;
+		if (!strcmp(verb, "click"))
+			in.action = kInputClick;
+		else if (!strcmp(verb, "key"))
+			in.action = kInputKey;
+		else
+			continue;
+		_inputScript.push_back(in);
+	}
+	debug(0, "ToolBook: сценарий ввода: %u строк", _inputScript.size());
+}
+
+void ToolBookEngine::feedScriptedInput() {
+	if (!_inputScriptLoaded)
+		loadInputScript();
+
+	uint32 now = _system->getMillis() - _startMs;
+	while (_inputScriptPos < _inputScript.size() &&
+			_inputScript[_inputScriptPos].timeMs <= now) {
+		const ScriptedInput &in = _inputScript[_inputScriptPos++];
+		Common::Event ev;
+		if (in.action == kInputClick) {
+			ev.type = Common::EVENT_LBUTTONUP;
+			ev.mouse = Common::Point(in.x, in.y);
+		} else {
+			ev.type = Common::EVENT_KEYDOWN;
+			ev.kbd = Common::KeyState((Common::KeyCode)in.x, in.x);
+		}
+		_injected.push_back(ev);
+	}
+}
+
 void ToolBookEngine::handleEvents() {
+	feedScriptedInput();
+
 	Common::Event event;
-	while (_system->getEventManager()->pollEvent(event)) {
+	while (!_injected.empty() || _system->getEventManager()->pollEvent(event)) {
+		if (!_injected.empty()) {
+			event = _injected[0];
+			_injected.remove_at(0);
+		}
 		switch (event.type) {
 		case Common::EVENT_KEYDOWN:
 			switch (event.kbd.keycode) {
@@ -139,13 +217,27 @@ void ToolBookEngine::handleEvents() {
 				_imageMode = !_imageMode;
 				_needsRedraw = true;
 				break;
+			case Common::KEYCODE_o:
+				// Рамки объектов страницы — проверка разбора прямоугольников.
+				_showHotspots = !_showHotspots;
+				_needsRedraw = true;
+				break;
 			default:
 				break;
 			}
 			break;
-		case Common::EVENT_LBUTTONUP:
-			// Правая половина экрана — вперёд, левая — назад. Настоящие кнопки
-			// страницы появятся, когда будет разобран байт-код OpenScript.
+		case Common::EVENT_LBUTTONUP: {
+			// Сначала спрашиваем объекты страницы: у них теперь есть настоящие
+			// прямоугольники. Пока это только сообщение в лог — исполнять
+			// обработчик нечем, интерпретатора нет.
+			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
+			if (hit) {
+				debug(0, "ToolBook: щелчок по объекту «%s» (%d,%d)-(%d,%d)",
+						hit->name.c_str(), hit->rect.left, hit->rect.top,
+						hit->rect.right, hit->rect.bottom);
+				break;
+			}
+			// Промах — листаем: правая половина вперёд, левая назад.
 			if (event.mouse.x > 320) {
 				if (_currentPage + 1 < (int)_book->pages().size()) {
 					_currentPage++;
@@ -156,9 +248,48 @@ void ToolBookEngine::handleEvents() {
 				_needsRedraw = true;
 			}
 			break;
+		}
 		default:
 			break;
 		}
+	}
+}
+
+const Object *ToolBookEngine::objectAt(int x, int y) const {
+	const Common::Array<Page> &pages = _book->pages();
+	if (_imageMode || _currentPage < 0 || _currentPage >= (int)pages.size())
+		return nullptr;
+
+	// Меньший объект выигрывает: полноэкранные прямоугольники вроде popkaRec
+	// лежат под всеми и не должны перехватывать щелчок.
+	const Object *best = nullptr;
+	int bestArea = 0;
+	const Common::Array<Object> &objs = pages[_currentPage].objects;
+	for (uint i = 0; i < objs.size(); i++) {
+		if (!objs[i].rect.contains(x, y))
+			continue;
+		int area = objs[i].rect.width() * objs[i].rect.height();
+		if (!best || area < bestArea) {
+			best = &objs[i];
+			bestArea = area;
+		}
+	}
+	return best;
+}
+
+void ToolBookEngine::drawObjectFrames(Graphics::Surface *screen, const Page &page) {
+	// Рамки объектов: пока интерпретатора нет, это единственный способ увидеть,
+	// правильно ли разобраны прямоугольники (клавиша o).
+	const uint32 color = screen->format.isCLUT8() ? 255 : screen->format.RGBToColor(0xff, 0, 0xff);
+	for (uint i = 0; i < page.objects.size(); i++) {
+		Common::Rect r = page.objects[i].rect;
+		r.clip(Common::Rect(0, 0, screen->w, screen->h));
+		if (r.isEmpty())
+			continue;
+		screen->drawLine(r.left, r.top, r.right - 1, r.top, color);
+		screen->drawLine(r.left, r.bottom - 1, r.right - 1, r.bottom - 1, color);
+		screen->drawLine(r.left, r.top, r.left, r.bottom - 1, color);
+		screen->drawLine(r.right - 1, r.top, r.right - 1, r.bottom - 1, color);
 	}
 }
 
@@ -200,11 +331,18 @@ void ToolBookEngine::showPage(int index) {
 		drawPageInfo(screen, index, page);
 	}
 
+	if (_showHotspots)
+		drawObjectFrames(screen, page);
+
 	_system->unlockScreen();
 
-	debug(1, "ToolBook: страница %d/%d «%s», фон %d, обработчиков %u, строк текста %u",
+	debug(1, "ToolBook: страница %d/%d «%s», фон %d, объектов %u, обработчиков %u, строк текста %u",
 			index + 1, (int)pages.size(), page.name.c_str(), page.background,
-			page.handlers.size(), page.text.size());
+			page.objects.size(), page.handlers.size(), page.text.size());
+	for (uint i = 0; i < page.objects.size() && i < 8; i++)
+		debug(2, "  объект %s (%d,%d)-(%d,%d)", page.objects[i].name.c_str(),
+				page.objects[i].rect.left, page.objects[i].rect.top,
+				page.objects[i].rect.right, page.objects[i].rect.bottom);
 	for (uint i = 0; i < page.text.size() && i < 3; i++)
 		debug(2, "  текст: %s", page.text[i].c_str());
 }

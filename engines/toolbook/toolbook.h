@@ -32,6 +32,7 @@
 #include "engines/engine.h"
 #include "common/array.h"
 #include "common/error.h"
+#include "common/events.h"
 #include "common/rect.h"
 
 struct ADGameDescription;
@@ -62,6 +63,8 @@ public:
 private:
 	void showPage(int index);
 	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
+	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
+	const struct Object *objectAt(int x, int y) const;
 	void handleEvents();
 
 	const ADGameDescription *_desc;
@@ -75,6 +78,24 @@ private:
 	int _currentPage = 0;
 	bool _quit = false;
 	bool _needsRedraw = true;
+	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): сценарий ввода для безоконных
+	// прогонов; ключ конфига inputscript, см. toolbook.cpp.
+	enum ScriptedInputAction { kInputClick, kInputKey };
+	struct ScriptedInput {
+		uint32 timeMs;
+		ScriptedInputAction action;
+		int x, y;
+	};
+	Common::Array<ScriptedInput> _inputScript;
+	Common::Array<Common::Event> _injected;
+	uint _inputScriptPos = 0;
+	bool _inputScriptLoaded = false;
+	uint32 _startMs = 0;
+
+	void loadInputScript();
+	void feedScriptedInput();
 };
 
 } // End of namespace ToolBook
