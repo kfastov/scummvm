@@ -76,4 +76,5 @@ def main():
             if want is None or abs(k - want) <= 8:
                 print('  %04x: %s %s%s' % (k, v[0], v[1], ' (цепочка)' if not v[2] else ''))
 
-main()
+if __name__ == '__main__':
+    main()
