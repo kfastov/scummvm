@@ -391,7 +391,8 @@ void Book::scanClassNames() {
 // Распаковка потока картинки, см. book.h и ledger/0021.
 static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
 		uint32 stride, uint32 *usedOut) {
-	uint32 in = 0, out = 0, col = 0;
+	(void)stride;
+	uint32 in = 0, out = 0;
 
 	while (in < srcLen && out < dstLen) {
 		byte c = src[in++];
@@ -401,21 +402,16 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 			if (in >= srcLen)
 				break;
 			byte v = src[in++];
-			n = MIN<uint32>(MIN<uint32>(c + 3, stride - col), dstLen - out);
+			n = MIN<uint32>(c + 3, dstLen - out);
 			memset(dst + out, v, n);
-			// Хвост серии, не влезший в строку, отбрасывается: серия не
-			// переходит на следующую строку.
 			out += n;
-			n = MIN<uint32>(c + 3, stride - col);
 		} else {
 			uint32 k = c - 0xf5;
 			n = MIN<uint32>(k, dstLen - out);
 			for (uint32 j = 0; j < n && in < srcLen; j++)
 				dst[out++] = src[in++];
 			in += (k > n) ? (k - n) : 0;
-			n = k;
 		}
-		col = (col + n) % stride;
 	}
 
 	if (usedOut)
@@ -427,7 +423,8 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 // это десятки тысяч попыток, и запись в буфер на каждой съедала бы секунды.
 static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 stride,
 		uint32 &outLen, uint32 &usedLen) {
-	uint32 in = 0, out = 0, col = 0;
+	(void)stride;
+	uint32 in = 0, out = 0;
 	while (out < dstLen && in < srcLen) {
 		byte c = src[in++];
 		uint32 n;
@@ -435,16 +432,12 @@ static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 strid
 			if (in >= srcLen)
 				break;
 			in++;
-			n = MIN<uint32>(c + 3, stride - col);
+			n = c + 3;
 		} else {
-			uint32 k = c - 0xf5;
-			in += k;
-			n = MIN<uint32>(k, stride - col);
+			n = c - 0xf5;
+			in += n;
 		}
 		out += n;
-		col += n;
-		if (col >= stride)
-			col = 0;
 	}
 	outLen = out;
 	usedLen = in;
