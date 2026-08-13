@@ -211,6 +211,15 @@ void Book::scanImages() {
 			}
 		}
 
+		// База сегмента: блок с DIB занимает 4 + 40 + палитра байт, поле
+		// «конец» в его заголовке даёт смещение конца от базы (ledger/0031).
+		if (i >= 4) {
+			uint32 blockEnd = i + 40 + img.colors * 4;
+			uint16 endField = readU16(&_data[i - 4]);
+			if (blockEnd > endField)
+				img.segBase = blockEnd - endField;
+		}
+
 		if (img.rawSize > 0 && (img.raw || img.compSize))
 			_images.push_back(img);
 
@@ -446,38 +455,98 @@ static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 strid
 bool Book::locatePixels(Image &img) {
 	if (img.pixels)
 		return true;
-	if (!img.compSize || !img.rawSize || img.searched)
+	if (!img.compSize || !img.rawSize)
 		return false;
-	img.searched = true;
-
-	const uint32 afterPalette = img.offset + 40 + img.colors * 4;
-	// У части картинок между палитрой и данными вклиниваются другие записи,
-	// поэтому начало ищется перебором. Признак верного начала — распаковка
-	// даёт ровно rawSize байт, израсходовав примерно compSize.
-	//
-	// Окно намеренно узкое: на корпусе из 400 картинок данные лежали сразу за
-	// палитрой у 396, а каждая проверка стоит полной распаковки. С окном в
-	// 64 КБ перелистывание страницы подвисало на секунды (ledger/0029).
-	const uint32 kSearch = 0x8000;
-
-	for (uint32 off = 0; off < kSearch; off++) {
-		uint32 start = afterPalette + off;
-		if (start + img.compSize > _data.size())
-			break;
-
-		uint32 got = 0, used = 0;
-		probeRLE(&_data[start], MIN<uint32>(img.compSize + 512, _data.size() - start),
-				img.rawSize, img.stride, got, used);
-
-		if (got == img.rawSize && used + img.height / 2 + 16 >= img.compSize &&
-				used <= img.compSize + img.height / 2 + 16) {
-			img.pixels = start;
+	if (img.segBase) {
+		locateSegmentPixels(img.segBase);
+		if (img.pixels)
 			return true;
-		}
 	}
-	debug(1, "ToolBook: не нашли пиксели картинки @0x%x %dx%d, raw=%u comp=%u",
-			img.offset, img.width, img.height, img.rawSize, img.compSize);
 	return false;
+}
+
+// Пиксели лежат сплошным потоком за сегментом объектов, потоки идут подряд и
+// опознаются по паре размеров (ledger/0032). Поэтому раскладываем сразу весь
+// сегмент: найдя один поток, следующий ищем сразу за ним, а не по всей книге.
+void Book::locateSegmentPixels(uint32 segBase) {
+	for (uint i = 0; i < _segmentsDone.size(); i++)
+		if (_segmentsDone[i] == segBase)
+			return;
+	_segmentsDone.push_back(segBase);
+
+	// Картинки этого сегмента, по порядку заголовков.
+	Common::Array<uint> mine;
+	for (uint i = 0; i < _images.size(); i++)
+		if (_images[i].segBase == segBase && _images[i].compSize && !_images[i].pixels)
+			mine.push_back(i);
+	if (mine.empty())
+		return;
+
+	// Конец сегмента: идём по цепочке блоков от блока с первым DIB.
+	uint32 p = _images[mine[0]].offset - 4;
+	for (uint step = 0; step < 100000; step++) {
+		if (p + 4 > _data.size())
+			break;
+		uint32 next = segBase + readU16(&_data[p]);
+		if (next <= p || next - p > 0xffff || next + 4 > _data.size())
+			break;
+		p = next;
+	}
+
+	// Потоки начинаются около конца сегмента — бывает, что чуть раньше.
+	uint32 pos = p > 512 ? p - 512 : 0;
+	uint32 maxRaw = 0;
+	for (uint i = 0; i < mine.size(); i++)
+		maxRaw = MAX(maxRaw, _images[mine[i]].rawSize);
+
+	while (!mine.empty()) {
+		bool found = false;
+		for (uint32 shift = 0; shift < 640 && !found; shift++) {
+			uint32 start = pos + shift;
+			if (start + 8 >= _data.size())
+				break;
+
+			// Одна распаковка на позицию: по дороге проверяем все картинки,
+			// у которых выход совпал ровно.
+			uint32 in = 0, out = 0;
+			while (out <= maxRaw && start + in + 1 < _data.size()) {
+				byte c = _data[start + in++];
+				if (c <= 0xf5) {
+					in++;
+					out += c + 3;
+				} else {
+					uint32 k = c - 0xf5;
+					in += k;
+					out += k;
+				}
+				for (uint m = 0; m < mine.size(); m++) {
+					Image &im = _images[mine[m]];
+					if (out != im.rawSize)
+						continue;
+					int32 d = (int32)in - (int32)im.compSize;
+					if (d < 0)
+						d = -d;
+					if (d > 48)
+						continue;
+					im.pixels = start;
+					debug(2, "ToolBook: поток @0x%x -> картинка @0x%x %dx%d comp=%u (вход %u)",
+							start, im.offset, im.width, im.height, im.compSize, in);
+					pos = start + im.compSize;
+					mine.remove_at(m);
+					found = true;
+					break;
+				}
+				if (found)
+					break;
+			}
+		}
+		if (!found)
+			break;
+	}
+
+	uint left = mine.size();
+	if (left)
+		debug(1, "ToolBook: в сегменте 0x%x не разложено %u картинок", segBase, left);
 }
 
 Graphics::Surface *Book::decodeImage(Image &img, Graphics::Palette &palette) {
