@@ -113,7 +113,9 @@ struct HeapSegment {
 struct Handler {
 	uint32 code = 0;                 ///< смещение кода в книге
 	uint32 codeSize = 0;             ///< длина кода до маркера таблицы строк
+	uint32 ownerScriptRecord = 0;    ///< formal top-level ScriptObject record, if any
 	uint16 eventHash = 0;            ///< hash from the owning script directory
+	bool returnsValue = false;       ///< record ends in the alternate return-D marker
 	Common::String name;             ///< buttonClick, mouseEnter, enterPage…
 	Common::Array<Common::String> literals;  ///< строковые литералы
 	Common::Array<Common::String> messages;  ///< имена (с хешем) — сообщения и свойства
@@ -220,6 +222,8 @@ public:
 	const Common::Array<Handler> &handlers() const { return _handlers; }
 	const Common::Array<ScriptObject> &scriptObjects() const { return _scriptObjects; }
 	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
+	const ScriptObject *findScriptObjectByRecord(uint32 record) const;
+	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
 	uint segmentCount() const { return _segmentCount; }
 	uint16 readUint16(uint32 offset) const;
@@ -251,7 +255,7 @@ private:
 	void scanScriptObjectIndex();
 	void readHandlerStrings(uint32 code, Handler &hd) const;
 	void appendScriptHandlers(uint32 script, uint32 scriptEnd,
-			Common::Array<Handler> &out) const;
+			Common::Array<Handler> &out, uint32 ownerScriptRecord = 0) const;
 	bool resolveLocalScript(uint32 segmentBase, uint32 segmentEnd, uint16 handle,
 			uint32 &script, uint32 &scriptEnd) const;
 	bool appendScriptBinding(uint32 segmentBase, uint32 segmentEnd, uint16 binding,
