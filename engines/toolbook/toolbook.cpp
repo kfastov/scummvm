@@ -257,7 +257,14 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					bytes, consumed, handler.code + ip);
 		return consumed == bytes;
 	};
-	auto truth = [&](const Value &v) { return v.isString || v.isObject ? !v.string.empty() : v.number != 0; };
+	auto isNullValue = [&](const Value &v) {
+		return !v.isString && !v.isObject && !v.hasReference &&
+				!v.isBookReference && !v.buffer && v.array.empty() &&
+				(v.number == 0 || v.number == 0x04000001);
+	};
+	auto truth = [&](const Value &v) {
+		return v.isString || v.isObject ? !v.string.empty() : !isNullValue(v);
+	};
 	auto valueString = [&](const Value &v) {
 		if (v.buffer && _nativeBuffers.contains(v.buffer)) {
 			const NativeBuffer &buffer = _nativeBuffers.getVal(v.buffer);
@@ -433,6 +440,17 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				bool eq = a.isString || a.isObject || b.isString || b.isObject ?
 						a.string.equalsIgnoreCase(b.string) : a.number == b.number;
 				pushNumber(eq ? 1 : 0, 2);
+			} else if (id == 63) { // ToolBook `&&`: concatenate with one space
+				Value right = pop();
+				Value left = pop();
+				if ((!left.isString && !isNullValue(left)) ||
+						(!right.isString && !isNullValue(right))) {
+					debug(1, "ToolBook: builtin 63 non-string operands пока не реализованы @0x%x",
+							handler.code + ip - 3);
+					return false;
+				}
+				pushString((isNullValue(left) ? Common::String() : left.string) + " " +
+						(isNullValue(right) ? Common::String() : right.string));
 			} else if (id == 190) { // case-insensitive `does not contain`
 				Value haystack = pop();
 				Value needle = pop();
@@ -447,6 +465,9 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				foldedHaystack.toUppercase();
 				foldedNeedle.toUppercase();
 				pushNumber(foldedHaystack.find(foldedNeedle) == Common::String::npos, 2);
+			} else if (id == 210) { // ToolBook `is null`
+				Value value = pop();
+				pushNumber(isNullValue(value) ? 1 : 0, 2);
 			} else if (id == 23) { // page navigation
 				Value target = pop();
 				if (target.isString || target.isObject)
@@ -483,13 +504,41 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			} else if (id == 62) { // dynamic string concatenation
 				Value right = pop();
 				Value left = pop();
-				if ((!left.isString && !left.isObject) ||
-						(!right.isString && !right.isObject)) {
+				if ((!left.isString && !left.isObject && !isNullValue(left)) ||
+						(!right.isString && !right.isObject && !isNullValue(right))) {
 					debug(1, "ToolBook: builtin 62 non-string operands пока не реализованы @0x%x",
 							handler.code + ip - 3);
 					return false;
 				}
-				pushString(left.string + right.string);
+				pushString((isNullValue(left) ? Common::String() : left.string) +
+						(isNullValue(right) ? Common::String() : right.string));
+			} else if (id == 163) {
+				// The reached form writes an incremented ten-byte numeric value to
+				// an output pointer. Scratch storage is represented as a Value cell,
+				// so return that cell on the abstract stack for the following dup10.
+				Value outputPointer = pop();
+				Value value = pop();
+				if (value.width != 10) {
+					debug(1, "ToolBook: builtin 163 non-extended operand @0x%x",
+							handler.code + ip - 3);
+					return false;
+				}
+				(void)outputPointer;
+				value.number++;
+				value.width = 10;
+				stack.push_back(value);
+			} else if (id == 206) {
+				// RUN91:0c9c compares two ten-byte numeric values. The bytecode
+				// pushes the iterator first and the upper bound second, so the
+				// returned word is true while upperBound >= iterator.
+				Value upperBound = pop();
+				Value iterator = pop();
+				if (upperBound.width != 10 || iterator.width != 10) {
+					debug(1, "ToolBook: builtin 206 non-extended operands @0x%x",
+							handler.code + ip - 3);
+					return false;
+				}
+				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
 			} else if (id == 116) {
 				// Copy a materialized ToolBook string into a Win16 far buffer.
 				// The reached form pushes copyFlag, offset, source, destination;
@@ -545,6 +594,35 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			} else if (id == 364) { // flushMessageQueue: none pending in this VM loop
 				if (op != 0x21)
 					pushNumber(0, op == 0x22 ? 2 : 4);
+			} else if (id == 482) { // callMCI(command, optional notify receiver)
+				Value notifyReceiver = pop();
+				Value commandValue = pop();
+				if (!commandValue.isString) {
+					debug(1, "ToolBook: callMCI non-string command @0x%x", handler.code + ip - 3);
+					return false;
+				}
+				Common::String command = commandValue.string;
+				Common::String folded = command;
+				folded.toLowercase();
+				while (folded.hasSuffix(" wait"))
+					folded.erase(folded.size() - 5);
+				if (folded == "close all") {
+					_mciAliases.clear();
+					pushString(Common::String());
+				} else if (folded == "sysinfo all quantity") {
+					// Win98 exposes the installed MCI driver classes. These are
+					// platform capabilities, not media or page-specific state.
+					pushString("4");
+				} else if (folded.hasPrefix("sysinfo all name ")) {
+					const char *drivers[] = { "CDAudio", "Sequencer", "WaveAudio", "AVIVideo" };
+					uint index = atoi(folded.c_str() + 17);
+					pushString(index >= 1 && index <= ARRAYSIZE(drivers) ?
+							drivers[index - 1] : Common::String());
+				} else {
+					debug(1, "ToolBook: MCI command пока не реализована: %s", command.c_str());
+					return false;
+				}
+				(void)notifyReceiver;
 			} else {
 				debug(1, "ToolBook: builtin %u @0x%x пока не реализован",
 						id, handler.code + ip - 3);
@@ -581,6 +659,18 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		case 0x2c: { // materialize a dynamic value in the requested raw type
 			uint8 type = code[ip++];
 			if (!stack.empty()) {
+				uint8 sourceType = stack.back().type;
+				if (type == 0x22 && stack.back().isString) {
+					// MCI numeric responses are strings until the compiler asks for
+					// ToolBook's ten-byte extended numeric representation.
+					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
+					stack.back().string.clear();
+					stack.back().isString = false;
+				} else if (type == 9 && !stack.back().isString && sourceType == 0x23) {
+					// Reached loop-index conversion used to compose an MCI command.
+					stack.back().string = Common::String::format("%d", (int32)stack.back().number);
+					stack.back().isString = true;
+				}
 				stack.back().type = type;
 				stack.back().width = type < ARRAYSIZE(kTypeWidths) ? kTypeWidths[type] : 4;
 			}
@@ -607,7 +697,26 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			if (!stack.empty())
 				stack.back().width = 4;
 			break;
-		case 0x33: ip++; break;
+		case 0x33: {
+			uint8 mode = code[ip++];
+			Value index = pop();
+			Value aggregate = pop();
+			if (mode == 2 && !aggregate.array.empty() && index.number < aggregate.array.size())
+				pushString(aggregate.array[index.number]);
+			else if (mode == 0 && aggregate.isString && !aggregate.string.empty()) {
+				int32 at = index.number == 0xffff ? -1 : (int32)index.number;
+				if (at < 0)
+					at += aggregate.string.size();
+				pushString(at >= 0 && at < (int32)aggregate.string.size() ?
+						Common::String(aggregate.string[at]) : Common::String());
+			}
+			else {
+				debug(1, "ToolBook: aggregate index mode %u/%u пока не реализован @0x%x",
+						mode, index.number, handler.code + ip - 2);
+				return false;
+			}
+			break;
+		}
 		case 0x3b: {
 			uint8 slot = code[ip++];
 			if (slot == 0) {
@@ -667,6 +776,31 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			ip += 2;
 			locals[off] = pop();
 			locals[off].width = 4;
+			break;
+		}
+		case 0x71: {
+			// 0x71 is a packed conversion family. Implement only the two
+			// machine-verified forms reached by this book's MCI capability loop.
+			uint16 form = read16(ip);
+			ip += 2;
+			if (stack.empty())
+				return false;
+			if (form == 0x8315) {          // signed W -> extended 10-byte number
+				stack.back().number = (uint32)(int32)(int16)stack.back().number;
+				stack.back().type = 0x22;
+				stack.back().width = 10;
+			} else if (form == 0x8351) {   // extended 10-byte number -> W
+				if (stack.back().width != 10) {
+					debug(1, "ToolBook: opcode 71 form %04x non-extended input @0x%x",
+							form, handler.code + ip - 3);
+					return false;
+				}
+				stack.back().width = 2;
+			} else {
+				debug(1, "ToolBook: opcode 71 form %04x @0x%x пока не реализована",
+						form, handler.code + ip - 3);
+				return false;
+			}
 			break;
 		}
 		case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
@@ -790,6 +924,84 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					pushNumber(loaded);
 					debug(1, "ToolBook: AddFontResource %s -> %u",
 							fileName.c_str(), loaded);
+				} else if (key == "SENDMESSAGE") {
+					// The reached call is HWND_BROADCAST / WM_FONTCHANGE. ScummVM
+					// owns its font registry directly, so the Windows broadcast has
+					// no additional consumers. Preserve SendMessage's numeric result.
+					if (argumentBytes != 16 || args.size() != 4)
+						return false;
+					pushNumber(0);
+				} else if (key == "GETMODULEPATH") {
+					if (argumentBytes != 4 || args.size() != 1)
+						return false;
+					Common::String moduleName = valueString(args[0]);
+					if (moduleName.empty())
+						return false;
+					// Win16 returns the loaded module's path. It is only fed to the
+					// generic version-resource query next; retain a DOS-visible name.
+					pushString(moduleName + ".DLL");
+				} else if (key == "GETFILEVERSION") {
+					if (argumentBytes != 4 || args.size() != 1)
+						return false;
+					Common::String fileName = valueString(args[0]);
+					for (uint i = 0; i < fileName.size(); i++)
+						if (fileName[i] == '\\')
+							fileName.setChar('/', i);
+					while (fileName.hasPrefix("./"))
+						fileName.erase(0, 2);
+					Common::ScopedPtr<Common::SeekableReadStream> executable(
+							SearchMan.createReadStreamForMember(Common::Path(fileName)));
+					Common::ScopedPtr<Common::WinResources> resources(executable ?
+							Common::WinResources::createFromEXE(executable.get()) : nullptr);
+					Common::ScopedPtr<Common::WinResources::VersionInfo> version(resources ?
+							resources->getVersionResource(1) : nullptr);
+					Value fields;
+					if (version) {
+						const char *keys[] = { "Path", "FileVersion", "Language", "InternalName",
+							"ProductName", "ProductVersion", "OriginalFilename",
+							"LegalCopyright", "LegalTrademarks" };
+						for (uint i = 0; i < ARRAYSIZE(keys); i++)
+							fields.array.push_back(i == 0 ? fileName :
+									version->hash[keys[i]].encode());
+					} else if (fileName.equalsIgnoreCase("USER.DLL") ||
+							fileName.equalsIgnoreCase("USER.EXE")) {
+						// The original bridge queries the version resource of Win98's
+						// loaded USER.EXE. ScummVM has no host USER.EXE, so expose a
+						// compact compatible Win16 platform record. These are platform
+						// properties; no game branch or page name is encoded here.
+						fields.array.push_back("USER.EXE");       // Path
+						fields.array.push_back("4.10.2222");     // FileVersion
+						fields.array.push_back("Russian");       // Language
+						fields.array.push_back("USER");          // InternalName
+						fields.array.push_back("Microsoft Windows");
+						fields.array.push_back("4.10.2222");     // ProductVersion
+						fields.array.push_back("USER.EXE");
+						fields.array.push_back("Microsoft Corporation");
+						fields.array.push_back(Common::String());
+					}
+					fields.width = 4;
+					stack.push_back(fields);
+				} else if (key == "GETWININIVAR") {
+					if (argumentBytes != 8 || args.size() != 2)
+						return false;
+					// Explicit arguments were popped from the VM stack in reverse
+					// source order: key, then section.
+					Common::String section = valueString(args[1]);
+					Common::String setting = valueString(args[0]);
+					Common::String iniKey = section + "\n" + setting;
+					iniKey.toUppercase();
+					pushString(_winIniValues.contains(iniKey) ?
+							_winIniValues.getVal(iniKey) : Common::String());
+				} else if (key == "SETWININIVAR") {
+					if (argumentBytes != 12 || args.size() != 3)
+						return false;
+					// Reverse pop order: value, key, section.
+					Common::String section = valueString(args[2]);
+					Common::String setting = valueString(args[1]);
+					Common::String iniKey = section + "\n" + setting;
+					iniKey.toUppercase();
+					_winIniValues[iniKey] = valueString(args[0]);
+					pushNumber(1);
 				} else if (key == "DISPLAYFONTS") {
 					const NativeBinding &binding = _nativeFunctions.getVal(key);
 					if (binding.argumentBytes != 4 || argumentBytes != 0) {

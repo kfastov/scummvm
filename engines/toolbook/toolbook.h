@@ -70,6 +70,7 @@ private:
 		bool isBookReference = false;
 		uint32 reference = 0;
 		uint32 buffer = 0;
+		Common::Array<Common::String> array;
 		uint8 type = 0;
 		uint8 width = 4;
 	};
@@ -134,6 +135,8 @@ private:
 	Common::HashMap<Common::String, Common::Array<NativeBinding> > _nativeBindings;
 	Common::HashMap<Common::String, NativeBinding> _nativeFunctions;
 	Common::HashMap<Common::String, NativeFontFace> _nativeFonts;
+	Common::HashMap<Common::String, Common::String> _mciAliases;
+	Common::HashMap<Common::String, Common::String> _winIniValues;
 	bool _runtimeAction12 = false;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
