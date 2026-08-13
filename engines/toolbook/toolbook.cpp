@@ -452,10 +452,16 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				pushString((isNullValue(left) ? Common::String() : left.string) + " " +
 						(isNullValue(right) ? Common::String() : right.string));
 			} else if (id == 70) {
-				// RUN91:09bc consumes a word and returns canonical true iff its
-				// unsigned value is at least one. Reached after myMCITest returns D.
+				// Логическое «не». RUN91:09bc берёт слово и возвращает слово:
+				//     cmp word [bp+6],1  ; CF=1 ⟺ аргумент == 0
+				//     sbb ax,ax          ; ax = -CF
+				//     neg ax             ; ax = CF
+				//     retf 2
+				// То есть 1 возвращается ровно при нулевом аргументе. Раньше здесь
+				// стояло обратное условие, и ветвление после myMCITest уходило не
+				// туда (ledger/0052).
 				Value value = pop();
-				pushNumber((uint16)value.number >= 1 ? 1 : 0, 2);
+				pushNumber((uint16)value.number == 0 ? 1 : 0, 2);
 			} else if (id == 190) { // case-insensitive `does not contain`
 				Value haystack = pop();
 				Value needle = pop();
