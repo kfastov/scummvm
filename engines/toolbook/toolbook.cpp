@@ -451,6 +451,11 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				}
 				pushString((isNullValue(left) ? Common::String() : left.string) + " " +
 						(isNullValue(right) ? Common::String() : right.string));
+			} else if (id == 70) {
+				// RUN91:09bc consumes a word and returns canonical true iff its
+				// unsigned value is at least one. Reached after myMCITest returns D.
+				Value value = pop();
+				pushNumber((uint16)value.number >= 1 ? 1 : 0, 2);
 			} else if (id == 190) { // case-insensitive `does not contain`
 				Value haystack = pop();
 				Value needle = pop();
