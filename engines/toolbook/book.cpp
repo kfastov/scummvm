@@ -30,11 +30,11 @@
 namespace ToolBook {
 
 static const byte kSignature[4] = { 0x03, 'J', 'B', 'O' };
-// Пролог кода обработчика OpenScript, общий для всех 988 обработчиков книги.
-static const byte kHandlerPrologue[] = {
-	0x26, 0x0f, 0xf8, 0xff, 0x3b, 0x03, 0x0d, 0xfc, 0xff, 0x3b, 0x04, 0x0d, 0xf8, 0xff
-};
-static const uint kPrologue = sizeof(kHandlerPrologue);
+// Общий префикс кода обработчика OpenScript. Размер кадра и раскладка
+// аргументов после него различаются; целостность подтверждается полем strOff
+// у маркера таблицы строк, а не длинным шаблоном пролога.
+static const byte kHandlerPrefix[] = { 0x26, 0x0f };
+static const uint kHandlerPrefixSize = sizeof(kHandlerPrefix);
 static const char kPageAnchor[] = "ASYM_TpID";
 
 static inline uint16 readU16(const byte *p) { return p[0] | (p[1] << 8); }
@@ -86,6 +86,44 @@ static bool identifierAt(const Common::Array<byte> &data, uint pos, Common::Stri
 Book::Book() {}
 Book::~Book() {}
 
+uint16 Book::readUint16(uint32 offset) const {
+	return offset + 2 <= _data.size() ? readU16(&_data[offset]) : 0;
+}
+
+uint32 Book::readUint32(uint32 offset) const {
+	return offset + 4 <= _data.size() ? readU32(&_data[offset]) : 0;
+}
+
+const byte *Book::bytes(uint32 offset, uint32 size) const {
+	return offset <= _data.size() && size <= _data.size() - offset ? &_data[offset] : nullptr;
+}
+
+Common::String Book::readString(uint32 offset, uint32 maxLength) const {
+	if (offset >= _data.size())
+		return Common::String();
+	uint32 end = offset;
+	while (end < _data.size() && _data[end] && end - offset <= maxLength)
+		end++;
+	if (end >= _data.size() || end == offset || end - offset > maxLength)
+		return Common::String();
+	return Common::String((const char *)&_data[offset], end - offset);
+}
+
+Common::String Book::handlerString(const Handler &handler, uint32 target) const {
+	if (target < handler.code || target >= _data.size())
+		return Common::String();
+	// Named references point at a two-byte selector/hash followed by the
+	// identifier. A literal points directly at its first character. Prefer the
+	// formal reference spelling when the two bytes at target are not printable
+	// identifier bytes; this keeps dispatch numeric and still exposes the name
+	// for diagnostics/global lookup.
+	if (target + 3 < _data.size() &&
+			(!Common::isAlpha(_data[target]) && _data[target] != '_') &&
+			(Common::isAlpha(_data[target + 2]) || _data[target + 2] == '_'))
+		target += 2;
+	return readString(target);
+}
+
 bool Book::load(Common::SeekableReadStream *stream, uint32 embeddedOffset) {
 	if (!stream)
 		return false;
@@ -115,13 +153,19 @@ bool Book::load(Common::SeekableReadStream *stream, uint32 embeddedOffset) {
 	debug(1, "ToolBook: книга %u байт со смещения 0x%x", size, start);
 
 	scanRecords();
+	scanHandlers();
+	scanScriptObjects();
+	scanScriptObjectIndex();
+	scanHeapSegments();
 	scanImages();
 	scanObjects();
 	scanPages();
+	scanPageOrder();
 	scanClassNames();
 
-	debug(1, "ToolBook: записей %u (сегментов %u), картинок %u, страниц %u, классов %u",
-			_records.size(), _segmentCount, _images.size(), _pages.size(), _classNames.size());
+	debug(1, "ToolBook: записей %u (сегментов %u), картинок %u, страниц %u, обработчиков %u, top-level scripts %u, классов %u",
+			_records.size(), _segmentCount, _images.size(), _pages.size(), _handlers.size(),
+			_scriptObjects.size(), _classNames.size());
 	return true;
 }
 
@@ -159,86 +203,183 @@ void Book::scanRecords() {
 }
 
 void Book::scanImages() {
-	const uint n = _data.size();
-
-	for (uint i = 0; i + 40 <= n; ) {
-		if (!(_data[i] == 0x28 && _data[i + 1] == 0 && _data[i + 2] == 0 && _data[i + 3] == 0)) {
-			i++;
-			continue;
-		}
-
-		int32 w = (int32)readU32(&_data[i + 4]);
-		int32 h = (int32)readU32(&_data[i + 8]);
-		uint16 planes = readU16(&_data[i + 12]);
-		uint16 bpp = readU16(&_data[i + 14]);
-		uint32 comp = readU32(&_data[i + 16]);
-
-		bool plausible = planes == 1 && comp <= 2 &&
-				(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32) &&
-				w > 0 && w <= 2048 && h != 0 && ABS(h) <= 2048;
-
-		if (!plausible) {
-			i++;
-			continue;
-		}
-
-		Image img;
-		img.offset = i;
-		img.width = w;
-		img.height = ABS(h);
-		img.depth = bpp;
-		img.colors = readU32(&_data[i + 32]);
-		if (img.colors == 0 && bpp <= 8)
-			img.colors = 1u << bpp;
-		img.stride = ((w * bpp + 31) / 32) * 4;
-		img.rawSize = img.stride * img.height;
-
-		// Несжатой считаем только ту картинку, перед которой стоит файловая
-		// шапка BM с согласованным bfOffBits: у таких пиксели лежат сразу за
-		// палитрой как есть.
-		if (i >= 14 && _data[i - 14] == 'B' && _data[i - 13] == 'M') {
-			uint32 offBits = readU32(&_data[i - 14 + 10]);
-			img.raw = (offBits == 14 + 40 + img.colors * 4);
-		}
-		if (img.raw)
-			img.pixels = i + 40 + img.colors * 4;
-
-		// Перед заголовком лежит пара размеров: распакованный и сжатый. По ней
-		// и опознаётся сжатый поток — и она же служит проверкой при поиске
-		// начала данных.
-		for (uint32 back = 8; back <= 0x140 && back <= i; back++) {
-			if (readU32(&_data[i - back]) != img.rawSize)
-				continue;
-			uint32 comp = readU32(&_data[i - back + 4]);
-			if (comp > 0 && comp <= img.rawSize * 2) {
-				img.compSize = comp;
+	// Do not scan the whole file for BITMAPINFOHEADER byte patterns: 91 such
+	// patterns occur in compressed data.  Every real image is referenced by a
+	// Picture block (+0x55 is a local handle to a type-0 DIB block), while the
+	// authoritative raw/compressed sizes live in that Picture at +0x2d/+0x31.
+	// This relation resolves exactly all 2393 images in this book.
+	for (uint s = 0; s < _heapSegments.size(); s++) {
+		const HeapSegment &seg = _heapSegments[s];
+		for (uint32 p = seg.base + 0x11; p < seg.end; ) {
+			uint32 next = seg.base + (readU16(&_data[p]) | 1);
+			if (next <= p || next > seg.end)
 				break;
+			if (readU16(&_data[p + 2]) != 0x15 || next - p < 0x57) {
+				p = next;
+				continue;
 			}
+
+			uint16 dibHandle = readU16(&_data[p + 0x55]);
+			uint32 dibBlock = dibHandle >= 3 ? seg.base + dibHandle - 3 : seg.end;
+			uint32 dib = dibBlock + 4;
+			if (dibBlock + 44 > seg.end || readU16(&_data[dibBlock + 2]) != 0 ||
+					readU32(&_data[dib]) != 40) {
+				p = next;
+				continue;
+			}
+
+			int32 w = (int32)readU32(&_data[dib + 4]);
+			int32 h = (int32)readU32(&_data[dib + 8]);
+			uint16 planes = readU16(&_data[dib + 12]);
+			uint16 bpp = readU16(&_data[dib + 14]);
+			uint32 compression = readU32(&_data[dib + 16]);
+			if (planes != 1 || compression > 2 ||
+					!(bpp == 1 || bpp == 4 || bpp == 8 || bpp == 16 || bpp == 24 || bpp == 32) ||
+					w <= 0 || w > 2048 || h == 0 || ABS(h) > 2048) {
+				p = next;
+				continue;
+			}
+
+			Image img;
+			img.offset = dib;
+			img.width = w;
+			img.height = ABS(h);
+			img.depth = bpp;
+			img.colors = readU32(&_data[dib + 32]);
+			if (img.colors == 0 && bpp <= 8)
+				img.colors = 1u << bpp;
+			img.stride = ((w * bpp + 31) / 32) * 4;
+			img.rawSize = readU32(&_data[p + 0x2d]);
+			img.compSize = readU32(&_data[p + 0x31]);
+			img.segBase = seg.base;
+			if (img.rawSize != img.stride * img.height) {
+				p = next;
+				continue;
+			}
+
+			bool duplicate = false;
+			for (uint i = 0; i < _images.size(); i++)
+				if (_images[i].offset == img.offset) {
+					duplicate = true;
+					break;
+				}
+			if (!duplicate)
+				_images.push_back(img);
+			p = next;
 		}
-
-		// База сегмента: блок с DIB занимает 4 + 40 + палитра байт, поле
-		// «конец» в его заголовке даёт смещение конца от базы (ledger/0031).
-		if (i >= 4) {
-			uint32 blockEnd = i + 40 + img.colors * 4;
-			uint16 endField = readU16(&_data[i - 4]);
-			if (blockEnd > endField)
-				img.segBase = blockEnd - endField;
-		}
-
-		if (img.rawSize > 0 && (img.raw || img.compSize))
-			_images.push_back(img);
-
-		i += 40;
 	}
 }
 
 // Единица координат книги: 1/1440 дюйма, книга 640×480 при 96 точках на дюйм.
 static const int kUnit = 15;
 
+static bool isObjectBlockType(uint16 type) {
+	switch (type) {
+	case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c:
+	case 0x0d: case 0x0e: case 0x0f: case 0x10: case 0x12:
+	case 0x13: case 0x15: case 0x1a:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int unitsToPixel(int16 units) {
+	return units >= 0 ? units / kUnit : -((-units + kUnit - 1) / kUnit);
+}
+
+void Book::scanHeapSegments() {
+	// У root-блока Page/Background всегда handle 0x14: он начинается по
+	// segmentBase+0x11, а handle любого блока равен relativeOffset+3. Поле
+	// segmentBase+0x0d задаёт конец цепочки. Ссылки нечётные, поэтому и конец,
+	// и next block нормализуются OR 1 (проверено на всех 181 DIB-сегментах).
+	const uint32 n = _data.size();
+	for (uint32 p = 0x11; p + 20 < n; p++) {
+		uint16 type = readU16(&_data[p + 2]);
+		if (type != 4 && type != 5)
+			continue;
+		if (_data[p + 4] != 0 || _data[p + 5] != 2)
+			continue;
+		uint32 base = p - 0x11;
+		uint32 firstEnd = base + (readU16(&_data[p]) | 1);
+		uint32 heapEnd = base + (readU16(&_data[base + 0x0d]) | 1);
+		if (firstEnd <= p || firstEnd > heapEnd || heapEnd > n)
+			continue;
+		// Не принимаем случайный шаблон в потоке: вся heap-цепочка обязана
+		// закончиться ровно на формальном heapEnd.
+		uint32 block = p;
+		uint count = 0;
+		while (block < heapEnd && count++ < 10000) {
+			uint32 next = base + (readU16(&_data[block]) | 1);
+			if (next <= block || next > heapEnd)
+				break;
+			block = next;
+		}
+		if (block != heapEnd)
+			continue;
+
+		HeapSegment seg;
+		seg.base = base;
+		seg.end = heapEnd;
+		seg.type = type;
+		seg.id = readU16(&_data[p + 6]);
+		seg.selector = readU16(&_data[base + 7]);
+		uint32 nameAt = p + 10, nameEnd = nameAt;
+		while (nameEnd < firstEnd && _data[nameEnd] >= 32 && _data[nameEnd] < 127 &&
+				nameEnd - nameAt <= 31)
+			nameEnd++;
+		if (nameEnd < firstEnd && _data[nameEnd] == 0)
+			seg.name = Common::String((const char *)&_data[nameAt], nameEnd - nameAt);
+		_heapSegments.push_back(seg);
+		p = firstEnd - 1;
+	}
+
+	debug(1, "ToolBook: формальных heap-сегментов %u", _heapSegments.size());
+}
+
+void Book::scanHandlers() {
+	// Тот же строгий критерий, что в tools/osc.py: для каждого общего префикса
+	// берём ближайший следующий маркер таблицы строк. Обработчик цел только
+	// тогда, когда поле strOff указывает ровно за этот маркер.
+	Common::Array<uint32> starts;
+	Common::Array<uint32> marks;
+	const uint32 n = _data.size();
+	for (uint32 i = 0; i + 3 <= n; i++) {
+		if (i + kHandlerPrefixSize <= n && memcmp(&_data[i], kHandlerPrefix, kHandlerPrefixSize) == 0)
+			starts.push_back(i);
+		if (_data[i] == 0x27 && _data[i + 1] == 0x1d && _data[i + 2] == 0x66)
+			marks.push_back(i);
+	}
+
+	uint markIndex = 0;
+	for (uint i = 0; i < starts.size(); i++) {
+		const uint32 code = starts[i];
+		while (markIndex < marks.size() && marks[markIndex] < code)
+			markIndex++;
+		if (markIndex >= marks.size())
+			break;
+
+		const uint32 marker = marks[markIndex];
+		const uint32 codeSize = marker - code;
+		if (marker + 5 > n || codeSize > 0xffff ||
+				readU16(&_data[marker + 3]) != codeSize + 7)
+			continue;
+
+		Handler hd;
+		hd.code = code;
+		hd.codeSize = codeSize;
+		readHandlerStrings(code, hd);
+		_handlers.push_back(hd);
+	}
+
+	debug(1, "ToolBook: обработчиков с целой таблицей строк %u/%u",
+			_handlers.size(), starts.size());
+}
+
 // Таблица строк обработчика: за кодом идёт маркер 27 1d 66, поле смещения и
 // строки. Имена (сообщения, свойства) идут с двухбайтовым хешем впереди,
 // строковые литералы — без него; последняя строка таблицы — имя обработчика.
-void Book::readHandlerStrings(uint32 code, Handler &hd) {
+void Book::readHandlerStrings(uint32 code, Handler &hd) const {
 	uint32 m = code;
 	while (m + 3 < _data.size() && m < code + 8000) {
 		if (_data[m] == 0x27 && _data[m + 1] == 0x1d && _data[m + 2] == 0x66)
@@ -249,6 +390,7 @@ void Book::readHandlerStrings(uint32 code, Handler &hd) {
 		return;
 	if (readU16(&_data[m + 3]) != (m - code) + 7)
 		return;
+	hd.codeSize = m - code;
 
 	uint32 p = m + 5;
 	Common::Array<Common::String> all;
@@ -292,176 +434,630 @@ void Book::readHandlerStrings(uint32 code, Handler &hd) {
 	}
 }
 
-void Book::scanObjects() {
-	// Книга — куча блоков `[u16 конец][u16 тип][данные]`, где «конец» считается
-	// от базы сегмента (ledger/0031). Объект лежит тремя блоками подряд:
-	//
-	//     [свойства, тип 0x10/0x08/0x15]  рамка и число вершин
-	//     [имя, тип 0]                    `[u32 самоссылка][имя\0]`
-	//     [обвод либо DIB, тип 0]         список вершин или картинка
-	//
-	// Вход в цепочку — блок с заголовком DIB: его длина известна (4 + 40 +
-	// палитра), отсюда база сегмента. Объекты, лежащие в сегменте до первой
-	// картинки, так не находятся — это осознанное ограничение.
-	Common::Array<uint32> bases;
-	for (uint k = 0; k < _images.size(); k++) {
-		if (!_images[k].segBase)
+void Book::scanScriptObjects() {
+	// A top-level script is an outer type-1 record. The first six body bytes
+	// identify the record inside its 16-bit segment, and the script header
+	// follows at record+0x10. Requiring both the exact self handle and the
+	// 0x0225 script signature rejects the other type-1 record variants.
+	uint handlerCount = 0;
+	for (uint i = 0; i < _records.size(); i++) {
+		const Record &record = _records[i];
+		if (record.type != 1 || record.offset + 0x28 > _data.size())
 			continue;
-		bool seen = false;
-		for (uint j = 0; j < bases.size(); j++)
-			if (bases[j] == _images[k].segBase)
-				seen = true;
-		if (!seen)
-			bases.push_back(_images[k].segBase);
+		uint32 end = record.body + record.size;
+		uint32 script = record.offset + 0x10;
+		if (end > _data.size() || script + 0x18 > end ||
+				_data[record.body] != 0 || _data[record.body + 3] != 0 ||
+				readU16(&_data[record.body + 1]) != (uint16)(record.segmentOffset + 3) ||
+				readU16(&_data[script + 6]) != 0x0225)
+			continue;
+
+		uint16 count = readU16(&_data[script + 0x16]);
+		uint32 recordBase = script + 0x1a + (uint32)count * 4;
+		if (count > 64 || recordBase > end)
+			continue;
+		bool valid = true;
+		for (uint h = 0; h < count; h++) {
+			uint32 handlerRecord = recordBase + readU16(&_data[script + 0x1a + h * 4]);
+			if (handlerRecord + 29 >= end || _data[handlerRecord + 29] != 0x26) {
+				valid = false;
+				break;
+			}
+		}
+		if (!valid)
+			continue;
+
+		ScriptObject object;
+		object.record = record.offset;
+		object.script = script;
+		appendScriptHandlers(script, end, object.handlers);
+		handlerCount += object.handlers.size();
+		_scriptObjects.push_back(object);
+	}
+	debug(1, "ToolBook: формальных top-level script records %u, handlers %u",
+			_scriptObjects.size(), handlerCount);
+}
+
+const ScriptObject *Book::findScriptObject(uint16 handle, uint16 selector) const {
+	for (uint i = 0; i < _scriptObjects.size(); i++)
+		if (_scriptObjects[i].handle == handle && _scriptObjects[i].selector == selector)
+			return &_scriptObjects[i];
+	return nullptr;
+}
+
+void Book::scanScriptObjectIndex() {
+	if (_scriptObjects.empty())
+		return;
+
+	// Record segments encode their far selector as the high byte at +0x16.
+	// A ScriptObject id-table entry is `{handle, selector, id, flags}` and its
+	// target record is `segmentBase + handle + 0x0d`. This handle convention is
+	// deliberately different from local heap handles. Build the set of exact
+	// formal targets before looking for a table.
+	Common::HashMap<uint32, int> targetByFarRef;
+	for (uint i = 0; i < _scriptObjects.size(); i++) {
+		const ScriptObject &object = _scriptObjects[i];
+		const Record *record = nullptr;
+		for (uint r = 0; r < _records.size(); r++)
+			if (_records[r].offset == object.record) {
+				record = &_records[r];
+				break;
+			}
+		if (!record || record->segmentBase + 0x17 > _data.size() ||
+				record->offset < record->segmentBase + 0x0d)
+			continue;
+		uint32 relative = record->offset - record->segmentBase - 0x0d;
+		if (relative > 0xffff)
+			continue;
+		uint16 selector = (uint16)_data[record->segmentBase + 0x16] << 8;
+		uint32 key = ((uint32)selector << 16) | relative;
+		if (targetByFarRef.contains(key)) {
+			warning("ToolBook: duplicate formal ScriptObject far reference %04x:%04x",
+					selector, (uint16)relative);
+			return;
+		}
+		targetByFarRef[key] = i;
+	}
+	if (targetByFarRef.size() != _scriptObjects.size())
+		return;
+
+	uint32 candidate = 0;
+	uint candidateCount = 0;
+	Common::Array<int> candidateOrder;
+	for (uint32 start = 0; start + 8 <= _data.size(); start++) {
+		// The overwhelming majority of bytes cannot start an id-table. Reject
+		// them before allocating its per-candidate validation state.
+		uint32 firstKey = ((uint32)readU16(&_data[start + 2]) << 16) |
+				readU16(&_data[start]);
+		if (!targetByFarRef.contains(firstKey) || readU16(&_data[start + 6]) > 1)
+			continue;
+		Common::Array<bool> seen;
+		seen.resize(_scriptObjects.size());
+		Common::Array<int> order;
+		uint16 previousId = 0;
+		bool first = true, terminated = false, valid = true;
+		for (uint32 p = start; p + 8 <= _data.size() && order.size() <= _scriptObjects.size(); p += 8) {
+			uint16 handle = readU16(&_data[p]);
+			uint16 selector = readU16(&_data[p + 2]);
+			uint16 id = readU16(&_data[p + 4]);
+			uint16 flags = readU16(&_data[p + 6]);
+			uint32 key = ((uint32)selector << 16) | handle;
+			if (!targetByFarRef.contains(key) || flags > 1 || (!first && id <= previousId)) {
+				valid = false;
+				break;
+			}
+			int object = targetByFarRef[key];
+			if (seen[object]) {
+				valid = false;
+				break;
+			}
+			seen[object] = true;
+			order.push_back(object);
+			previousId = id;
+			first = false;
+			if (flags == 1) {
+				terminated = true;
+				break;
+			}
+		}
+		if (!valid || !terminated || order.size() != _scriptObjects.size())
+			continue;
+		candidate = start;
+		candidateOrder = order;
+		candidateCount++;
+	}
+	if (candidateCount != 1) {
+		warning("ToolBook: expected one formal ScriptObject id table, found %u",
+				candidateCount);
+		return;
 	}
 
-	for (uint b = 0; b < bases.size(); b++) {
-		uint32 segBase = bases[b];
+	for (uint i = 0; i < candidateOrder.size(); i++) {
+		uint32 entry = candidate + i * 8;
+		ScriptObject &object = _scriptObjects[candidateOrder[i]];
+		object.handle = readU16(&_data[entry]);
+		object.selector = readU16(&_data[entry + 2]);
+		object.id = readU16(&_data[entry + 4]);
+	}
+	debug(1, "ToolBook: formal ScriptObject id table @0x%x, %u entries",
+			candidate, candidateOrder.size());
+}
 
-		// самая ранняя картинка сегмента — точка входа
-		uint32 entry = 0;
-		for (uint k = 0; k < _images.size(); k++)
-			if (_images[k].segBase == segBase && (!entry || _images[k].offset - 4 < entry))
-				entry = _images[k].offset - 4;
-		if (!entry)
-			continue;
+void Book::appendScriptHandlers(uint32 script, uint32 scriptEnd,
+		Common::Array<Handler> &out) const {
+	if (script + 0x18 > scriptEnd)
+		return;
+	uint16 count = readU16(&_data[script + 0x16]);
+	uint32 directoryEnd = script + 0x18 + (uint32)count * 4;
+	// The word after the directory is a reserved/flags field, not a required
+	// zero terminator. One real ButtonDown script stores 0x0200 there; handler
+	// record offsets still use the byte immediately after it as their base.
+	uint32 recordBase = directoryEnd + 2;
+	if (!count || count > 64 || recordBase > scriptEnd)
+		return;
 
-		Common::Array<uint32> starts, lens, types;
-		uint32 p = entry;
-		for (uint step = 0; step < 4000; step++) {
-			if (p + 4 > _data.size())
-				break;
-			uint32 next = segBase + readU16(&_data[p]);
-			if (next <= p || next - p > 0xffff || next + 4 > _data.size())
-				break;
-			starts.push_back(p);
-			types.push_back(readU16(&_data[p + 2]));
-			lens.push_back(next - p);
-			p = next;
+	// Directory entries point to serialized handler records. Every record has a
+	// 29-byte header; bytecode begins at record+29. This is equivalent to
+	// script+0x37+4*count for the first record, while later offsets are relative
+	// to recordBase (not to the first code address).
+	if (readU16(&_data[script + 6]) != 0x0225)
+		return;
+	for (uint i = 0; i < count; i++) {
+		uint16 eventHash = readU16(&_data[script + 0x18 + i * 4]);
+		uint16 relative = readU16(&_data[script + 0x1a + i * 4]);
+		uint32 record = recordBase + relative;
+		uint32 recordEnd = scriptEnd;
+		for (uint j = 0; j < count; j++) {
+			uint16 candidate = readU16(&_data[script + 0x1a + j * 4]);
+			if (candidate > relative)
+				recordEnd = MIN(recordEnd, recordBase + candidate);
 		}
-
-		for (uint i = 1; i + 1 < starts.size(); i++) {
-			if (types[i] != 0 || lens[i] < 6 || lens[i] > 32)
+		uint32 code = record + 29;
+		if (code >= recordEnd || _data[code] != 0x26)
+			continue;
+		bool found = false;
+		for (uint h = 0; h < _handlers.size(); h++) {
+			if (_handlers[h].code != code)
 				continue;
-
-			// имя: `[u32 самоссылка][имя\0]`
-			uint32 np = starts[i] + 4;
-			uint32 e = np;
-			while (e < starts[i] + lens[i] && _data[e] >= 32 && _data[e] < 127)
-				e++;
-			if (e == np || e >= starts[i] + lens[i] || _data[e] != 0)
-				continue;
-
-			Object obj;
-			obj.offset = np;
-			obj.name = Common::String((const char *)&_data[np], e - np);
-
-			// свойства лежат в предыдущем блоке: ищем в нём рамку —
-			// четыре u16, кратные 15, дающие осмысленный прямоугольник.
-			const uint32 pp = starts[i - 1] + 4, plen = lens[i - 1] - 4;
-			uint32 nverts = 0;
-			bool haveRect = false;
-			if (plen >= 12) {
-				for (int off = (int)plen - 10; off >= 0; off -= 2) {
-					const byte *q = &_data[pp + off];
-					int l = readU16(q), t = readU16(q + 2), r = readU16(q + 4), bt = readU16(q + 6);
-					if (l % 15 || t % 15 || r % 15 || bt % 15)
-						continue;
-					if (l >= r || t >= bt || r > 640 * 15 || bt > 480 * 15)
-						continue;
-					obj.rect = Common::Rect(l / 15, t / 15, r / 15, bt / 15);
-					nverts = readU16(q + 8);
-					haveRect = true;
-					break;
-				}
-			}
-			if (!haveRect)
-				continue;
-
-			// следом либо картинка, либо список вершин
-			const uint32 dp = starts[i + 1] + 4, dlen = lens[i + 1] - 4;
-			if (dlen >= 40 && _data[dp] == 0x28 && _data[dp + 1] == 0) {
-				obj.picture = true;
-			} else if (nverts && dlen >= nverts * 4) {
-				for (uint32 v = 0; v < nverts; v++) {
-					int x = readU16(&_data[dp + v * 4]);
-					int y = readU16(&_data[dp + v * 4 + 2]);
-					if (x % 15 || y % 15)
-						break;
-					obj.outline.push_back(Common::Point(x / 15, y / 15));
-				}
-			}
-
-			// Скрипт объекта лежит следующими блоками той же цепочки: код
-			// обработчика опознаётся по общему прологу (ledger/0023).
-			for (uint k = i + 1; k < starts.size() && k <= i + 4; k++) {
-				if (lens[k] < 40)
+			Handler handler = _handlers[h];
+			handler.eventHash = eventHash;
+			out.push_back(handler);
+			found = true;
+			break;
+		}
+		// The global scanner deliberately starts from the common `26 0f`
+		// prologue, but a directory may also own a short handler whose second
+		// opcode is something else. The directory supplies an authoritative
+		// record bound, so accept the standard end marker here when its strOff
+		// field points exactly past the marker. This is the same integrity check
+		// as scanHandlers(), without assuming a particular function prologue.
+		if (!found) {
+			for (uint32 marker = code + 1; marker + 5 <= recordEnd; marker++) {
+				if (_data[marker] != 0x27 || _data[marker + 1] != 0x1d ||
+						_data[marker + 2] != 0x66 ||
+						readU16(&_data[marker + 3]) != marker - code + 7)
 					continue;
-				uint32 bp = starts[k] + 4, blen = lens[k] - 4;
-				for (uint32 q = 0; q + kPrologue < blen; q++) {
-					if (memcmp(&_data[bp + q], kHandlerPrologue, kPrologue) != 0)
-						continue;
-					Handler hd;
-					hd.code = bp + q;
-					readHandlerStrings(bp + q, hd);
-					if (!hd.name.empty())
-						obj.handlers.push_back(hd);
-					q += 8;
-				}
+				Handler handler;
+				handler.code = code;
+				handler.codeSize = marker - code;
+				handler.eventHash = eventHash;
+				readHandlerStrings(code, handler);
+				out.push_back(handler);
+				found = true;
+				break;
 			}
-
-			_objects.push_back(obj);
 		}
-	}
-
-	// Сегменты обходятся в порядке картинок, а не файла, поэтому объекты
-	// нужно упорядочить: разбиение по страницам идёт по смещению.
-	for (uint i = 1; i < _objects.size(); i++) {
-		Object tmp = _objects[i];
-		uint j = i;
-		while (j > 0 && _objects[j - 1].offset > tmp.offset) {
-			_objects[j] = _objects[j - 1];
-			j--;
+		// Empty handlers compile to a bare `enterHandler` followed immediately
+		// by the standard END/return marker, so they intentionally have no 0x0f
+		// stack-frame prologue or string table.
+		if (!found && code + 4 <= recordEnd && _data[code] == 0x26 &&
+				_data[code + 1] == 0x27 && _data[code + 2] == 0x1d && _data[code + 3] == 0x66) {
+			Handler handler;
+			handler.code = code;
+			handler.codeSize = 1;
+			handler.eventHash = eventHash;
+			out.push_back(handler);
+			found = true;
 		}
-		_objects[j] = tmp;
+		// A return-value handler may end with the VM's alternate
+		// `returnDynamic/end` marker (28 1c 66) instead of the usual void
+		// marker. Directory record bounds remain authoritative.
+		if (!found) {
+			for (uint32 marker = code; marker + 3 <= recordEnd; marker++) {
+				if (_data[marker] != 0x28 || _data[marker + 1] != 0x1c ||
+						_data[marker + 2] != 0x66)
+					continue;
+				Handler handler;
+				handler.code = code;
+				handler.codeSize = marker - code;
+				handler.eventHash = eventHash;
+				out.push_back(handler);
+				break;
+			}
+		}
 	}
 }
 
+bool Book::resolveLocalScript(uint32 segmentBase, uint32 segmentEnd, uint16 handle,
+		uint32 &script, uint32 &scriptEnd) const {
+	if (handle < 3)
+		return false;
+	script = segmentBase + handle - 3;
+	if (script + 0x1a > segmentEnd || readU16(&_data[script + 2]) != 0 ||
+			readU16(&_data[script + 6]) != 0x0225)
+		return false;
+	scriptEnd = segmentBase + (readU16(&_data[script]) | 1);
+	if (scriptEnd <= script || scriptEnd > segmentEnd)
+		return false;
+
+	uint16 count = readU16(&_data[script + 0x16]);
+	uint32 recordBase = script + 0x1a + (uint32)count * 4;
+	if (count > 64 || recordBase > scriptEnd)
+		return false;
+	for (uint i = 0; i < count; i++) {
+		uint32 record = recordBase + readU16(&_data[script + 0x1a + i * 4]);
+		if (record + 29 >= scriptEnd || _data[record + 29] != 0x26)
+			return false;
+	}
+	return true;
+}
+
+bool Book::appendScriptBinding(uint32 segmentBase, uint32 segmentEnd, uint16 binding,
+		Common::Array<Handler> &out) const {
+	if (!binding)
+		return true;
+
+	uint32 script = 0, scriptEnd = 0;
+	if (resolveLocalScript(segmentBase, segmentEnd, binding, script, scriptEnd)) {
+		// A valid local directory with count zero is still a resolved binding.
+		// It must not fall through to an unrelated ScriptObject whose id happens
+		// to be one less than the local handle.
+		appendScriptHandlers(script, scriptEnd, out);
+		return true;
+	}
+
+	uint16 externalId = binding - 1;
+	for (uint i = 0; i < _scriptObjects.size(); i++) {
+		if (_scriptObjects[i].id != externalId)
+			continue;
+		for (uint h = 0; h < _scriptObjects[i].handlers.size(); h++)
+			out.push_back(_scriptObjects[i].handlers[h]);
+		return true;
+	}
+	return false;
+}
+
+void Book::scanObjects() {
+	// Typed object block: +8 parent handle, +0a name/payload handle, +0f
+	// script handle. Для Picture (0x15) +0x55 указывает на DIB block. Все эти
+	// ссылки разрешаются как segmentBase + handle - 3.
+	for (uint s = 0; s < _heapSegments.size(); s++) {
+		const HeapSegment &seg = _heapSegments[s];
+		Common::Array<uint16> handles, blockTypes;
+		for (uint32 q = seg.base + 0x11; q < seg.end; ) {
+			uint32 next = seg.base + (readU16(&_data[q]) | 1);
+			if (next <= q || next > seg.end)
+				break;
+			handles.push_back((uint16)(q - seg.base + 3));
+			blockTypes.push_back(readU16(&_data[q + 2]));
+			q = next;
+		}
+		uint32 p = seg.base + 0x11;
+		while (p < seg.end) {
+			uint32 next = seg.base + (readU16(&_data[p]) | 1);
+			if (next <= p || next > seg.end)
+				break;
+			uint16 type = readU16(&_data[p + 2]);
+			uint32 len = next - p;
+			uint16 parentHandle = readU16(&_data[p + 8]);
+			bool parentValid = parentHandle == 0x14;
+			for (uint b = 0; !parentValid && b < handles.size(); b++)
+				if (handles[b] == parentHandle && isObjectBlockType(blockTypes[b]))
+					parentValid = true;
+			if (isObjectBlockType(type) && len >= 20 && parentValid) {
+				Object obj;
+				obj.offset = p;
+				obj.block = p;
+				obj.segmentBase = seg.base;
+				obj.handle = (uint16)(p - seg.base + 3);
+				obj.parentHandle = parentHandle;
+				obj.type = type;
+				obj.id = readU32(&_data[p + 4]);
+				obj.ownVisible = len <= 0x23 || (_data[p + 0x23] & 1) != 0;
+				obj.visible = obj.ownVisible;
+
+				// У всех визуальных объектов прямоугольник лежит невыравненно с +0x13.
+				if (len >= 0x1b) {
+					uint32 q = p + 0x13;
+					int16 l = (int16)readU16(&_data[q]), t = (int16)readU16(&_data[q + 2]);
+					int16 r = (int16)readU16(&_data[q + 4]), bt = (int16)readU16(&_data[q + 6]);
+					if (l < r && t < bt)
+						obj.rect = Common::Rect(unitsToPixel(l), unitsToPixel(t),
+								unitsToPixel(r), unitsToPixel(bt));
+				}
+
+				uint16 nameHandle = readU16(&_data[p + 0x0a]);
+				uint32 nameBlock = nameHandle >= 3 ? seg.base + nameHandle - 3 : seg.end;
+				bool validNameBlock = false;
+				for (uint b = 0; b < handles.size(); b++)
+					if (handles[b] == nameHandle && blockTypes[b] == 0)
+						validNameBlock = true;
+				if (validNameBlock && nameBlock + 5 < seg.end) {
+					uint32 e = nameBlock + 4;
+					while (e < seg.end && _data[e] >= 32 && _data[e] < 127)
+						e++;
+					if (e > nameBlock + 4 && e < seg.end && _data[e] == 0) {
+						obj.offset = nameBlock + 4;
+						obj.name = Common::String((const char *)&_data[nameBlock + 4], e - nameBlock - 4);
+					}
+				}
+
+				if (type == 0x15 && len >= 0x57) {
+					uint16 dibHandle = readU16(&_data[p + 0x55]);
+					uint32 dib = seg.base + dibHandle - 3 + 4;
+					for (uint i = 0; i < _images.size(); i++) {
+						if (_images[i].offset == dib) {
+							obj.picture = true;
+							obj.image = i;
+							break;
+						}
+					}
+				}
+
+				// Field text is two formal local references deep:
+				// Field+0x28 -> descriptor type0, descriptor+6 -> text type0.
+				// The text payload is [capacity:u16][logicalLen:u16][bytes].
+				if (type == 0x0a && len >= 0x2a) {
+					obj.field = true;
+					uint16 descriptorHandle = readU16(&_data[p + 0x28]);
+					uint32 descriptor = descriptorHandle >= 3 ?
+							seg.base + descriptorHandle - 3 : seg.end;
+					bool validDescriptor = false;
+					for (uint b = 0; b < handles.size(); b++)
+						if (handles[b] == descriptorHandle && blockTypes[b] == 0)
+							validDescriptor = true;
+					if (validDescriptor && descriptor + 8 <= seg.end) {
+						uint16 textHandle = readU16(&_data[descriptor + 6]);
+						uint32 text = textHandle >= 3 ? seg.base + textHandle - 3 : seg.end;
+						bool validText = false;
+						for (uint b = 0; b < handles.size(); b++)
+							if (handles[b] == textHandle && blockTypes[b] == 0)
+								validText = true;
+						if (validText && text + 8 <= seg.end) {
+							uint32 textEnd = seg.base + (readU16(&_data[text]) | 1);
+							uint16 capacity = readU16(&_data[text + 4]);
+							uint16 logicalLen = readU16(&_data[text + 6]);
+							if (logicalLen <= capacity && text + 8 + capacity <= textEnd) {
+								obj.textBlock = text;
+								obj.textCapacity = capacity;
+								obj.initialText = cp1251ToUtf8(Common::String(
+										(const char *)&_data[text + 8], logicalLen));
+							}
+						}
+					}
+				}
+
+				uint16 scriptBinding = readU16(&_data[p + 0x0f]);
+				if (!appendScriptBinding(seg.base, seg.end, scriptBinding, obj.handlers))
+					warning("ToolBook: unresolved object script binding %u at block 0x%x",
+							scriptBinding, p);
+				_objects.push_back(obj);
+			}
+			p = next;
+		}
+	}
+	debug(1, "ToolBook: формальных дочерних объектов %u", _objects.size());
+}
+
+void Book::appendObjectTree(uint32 segmentBase, uint16 handle, bool parentVisible,
+		Common::Array<Object> &out, uint depth) const {
+	if (depth > 32)
+		return;
+	const Object *source = nullptr;
+	for (uint i = 0; i < _objects.size(); i++) {
+		if (_objects[i].segmentBase == segmentBase && _objects[i].handle == handle) {
+			source = &_objects[i];
+			break;
+		}
+	}
+	if (!source)
+		return;
+
+	Object object = *source;
+	object.visible = parentVisible && object.ownVisible;
+	out.push_back(object);
+	if (object.type != 0x0b || object.block + 0x34 > _data.size())
+		return;
+
+	// A Group owns an ordered type-0 child-list block. Each ten-byte entry is
+	// `[handle, layoutRect]`; coordinates in the child object itself remain the
+	// authoritative absolute page coordinates. The list order is back-to-front.
+	uint16 count = readU16(&_data[object.block + 0x28]);
+	uint16 listHandle = readU16(&_data[object.block + 0x32]);
+	if (!count || listHandle < 3)
+		return;
+	uint32 list = segmentBase + listHandle - 3;
+	if (list + 4 + (uint32)count * 10 > _data.size() || readU16(&_data[list + 2]) != 0)
+		return;
+	for (uint i = 0; i < count; i++)
+		appendObjectTree(segmentBase, readU16(&_data[list + 4 + i * 10]),
+				object.visible, out, depth + 1);
+}
+
+void Book::appendSegmentObjects(uint32 segmentBase, Common::Array<Object> &out) const {
+	const HeapSegment *segment = nullptr;
+	for (uint i = 0; i < _heapSegments.size(); i++) {
+		if (_heapSegments[i].base == segmentBase) {
+			segment = &_heapSegments[i];
+			break;
+		}
+	}
+	if (!segment)
+		return;
+
+	// Root +0x30 points to the type-6 child service. Its +0x06 count and
+	// +0x10 type-0 list handle enumerate every direct child in z-order.
+	uint32 root = segmentBase + 0x11;
+	uint16 serviceHandle = readU16(&_data[root + 0x30]);
+	if (serviceHandle < 3)
+		return;
+	uint32 service = segmentBase + serviceHandle - 3;
+	if (service + 0x12 > segment->end || readU16(&_data[service + 2]) != 6)
+		return;
+	uint16 count = readU16(&_data[service + 0x06]);
+	uint16 listHandle = readU16(&_data[service + 0x10]);
+	if (!count || listHandle < 3)
+		return;
+	uint32 list = segmentBase + listHandle - 3;
+	if (list + 4 + (uint32)count * 2 > segment->end || readU16(&_data[list + 2]) != 0)
+		return;
+	for (uint i = 0; i < count; i++)
+		appendObjectTree(segmentBase, readU16(&_data[list + 4 + i * 2]), true, out, 0);
+}
+
+void Book::appendRootHandlers(uint32 segmentBase, Common::Array<Handler> &out) const {
+	const HeapSegment *segment = nullptr;
+	for (uint i = 0; i < _heapSegments.size(); i++)
+		if (_heapSegments[i].base == segmentBase) {
+			segment = &_heapSegments[i];
+			break;
+		}
+	if (!segment)
+		return;
+
+	// Root +0x2e is a serialized script binding. A strict local type-0 script
+	// handle is stored directly. Otherwise a non-zero value is a one-based
+	// reference to the formal top-level ScriptObject id table. This partition is
+	// exact across all 261 heaps in this book (144 null, 27 local, 90 external).
+	// Validate the local script fully before choosing it: six external ids also
+	// happen to land on an unrelated type-0 block numerically.
+	uint32 root = segmentBase + 0x11;
+	uint16 handle = readU16(&_data[root + 0x2e]);
+	if (!handle)
+		return;
+	if (!appendScriptBinding(segmentBase, segment->end, handle, out))
+		warning("ToolBook: unresolved root script binding %u at heap 0x%x", handle, segmentBase);
+}
+
 void Book::scanPages() {
-	// Страницы разделяются полноэкранными фонами: объекты, лежащие между двумя
-	// соседними фонами, принадлежат одной странице.
-	Common::Array<uint> fullscreen;
-	for (uint k = 0; k < _images.size(); k++)
-		if (_images[k].width == 640 && _images[k].height == 480 && _images[k].depth == 8)
-			fullscreen.push_back(k);
-
-	uint obj = 0;
-	for (uint f = 0; f < fullscreen.size(); f++) {
+	for (uint s = 0; s < _heapSegments.size(); s++) {
+		if (_heapSegments[s].type != 5)
+			continue;
 		Page page;
-		page.background = fullscreen[f];
-		uint32 from = _images[fullscreen[f]].offset;
-		uint32 to = (f + 1 < fullscreen.size()) ? _images[fullscreen[f + 1]].offset : _data.size();
+		page.segmentBase = _heapSegments[s].base;
+		page.id = _heapSegments[s].id;
+		page.selector = _heapSegments[s].selector;
+		page.name = _heapSegments[s].name;
 
-		while (obj < _objects.size() && _objects[obj].offset < from)
-			obj++;
-		for (uint k = obj; k < _objects.size() && _objects[k].offset < to; k++)
-			page.objects.push_back(_objects[k]);
-
-		// Имя страницы: объект во весь экран обычно назван по странице.
-		for (uint k = 0; k < page.objects.size(); k++) {
-			const Common::Rect &r = page.objects[k].rect;
-			if (r.width() >= 620 && r.height() >= 460) {
-				page.name = page.objects[k].name;
+		// Page root +0x4b хранит far reference на Background root. Handle там
+		// всегда 0x14; selector однозначно разрешается среди Background.
+		uint32 root = page.segmentBase + 0x11;
+		uint16 bgHandle = readU16(&_data[root + 0x4b]);
+		uint16 bgSelector = readU16(&_data[root + 0x4d]);
+		if (bgHandle == 0x14) {
+			for (uint b = 0; b < _heapSegments.size(); b++) {
+				if (_heapSegments[b].type != 4 || _heapSegments[b].selector != bgSelector)
+					continue;
+				page.backgroundSegmentBase = _heapSegments[b].base;
+				page.backgroundId = _heapSegments[b].id;
+				uint32 backgroundRoot = page.backgroundSegmentBase + 0x11;
+				uint16 widthUnits = readU16(&_data[backgroundRoot + 0x63]);
+				uint16 heightUnits = readU16(&_data[backgroundRoot + 0x65]);
+				if (widthUnits && heightUnits) {
+					// Client extents are stored in 1/1440-inch units. Some
+					// full-width backgrounds serialize 9597 rather than 9600;
+					// round to the nearest pixel instead of shrinking them.
+					page.canvasWidth = (widthUnits + kUnit / 2) / kUnit;
+					page.canvasHeight = (heightUnits + kUnit / 2) / kUnit;
+				}
+				appendSegmentObjects(page.backgroundSegmentBase, page.objects);
 				break;
 			}
 		}
-		if (page.name.empty() && !page.objects.empty())
-			page.name = page.objects[0].name;
+		appendSegmentObjects(page.segmentBase, page.objects);
+		// A Page is a child of its Background in the ToolBook message
+		// hierarchy. Search its own/shared script first, then the parent
+		// Background script when the Page does not handle the selector.
+		appendRootHandlers(page.segmentBase, page.eventHandlers);
+		appendRootHandlers(page.backgroundSegmentBase, page.eventHandlers);
+		for (uint i = 0; i < page.objects.size(); i++)
+			if (page.objects[i].picture && page.objects[i].rect.width() >= 620 &&
+					page.objects[i].rect.height() >= 460)
+				page.background = page.objects[i].image;
 
 		_pages.push_back(page);
 	}
+}
 
-	scanPageText();
+void Book::scanPageOrder() {
+	// Compiled books serialize an ordered far-reference table separately from
+	// the heap. Each 13-byte entry contains the current Page root, followed by
+	// the Background/Page ids of the next entry. Resolve it structurally: every
+	// Page selector must occur exactly once and every next-id pair must agree
+	// with the following formal heap root. Names and file adjacency play no role.
+	const uint count = _pages.size();
+	if (!count || count > 0xffff || _data.size() < count * 13)
+		return;
+
+	Common::HashMap<uint16, int> bySelector;
+	for (uint i = 0; i < count; i++)
+		bySelector[_pages[i].selector] = i;
+
+	for (uint32 start = 0; start + (uint32)count * 13 <= _data.size(); start++) {
+		if (readU16(&_data[start]) != 0x14 || _data[start + 4] != 0)
+			continue;
+		uint16 firstSelector = readU16(&_data[start + 2]);
+		if (!bySelector.contains(firstSelector))
+			continue;
+
+		Common::Array<int> order;
+		Common::Array<bool> seen;
+		seen.resize(count);
+		bool valid = true;
+		for (uint i = 0; i < count; i++) {
+			uint32 entry = start + i * 13;
+			uint16 selector = readU16(&_data[entry + 2]);
+			if (readU16(&_data[entry]) != 0x14 || _data[entry + 4] != 0 ||
+					!bySelector.contains(selector)) {
+				valid = false;
+				break;
+			}
+			int page = bySelector[selector];
+			if (page < 0 || page >= (int)count || seen[page]) {
+				valid = false;
+				break;
+			}
+			seen[page] = true;
+			order.push_back(page);
+
+			// The last entry points to itself; every earlier one points to the
+			// next far reference. This validates all 13 bytes of every entry.
+			uint32 nextEntry = start + (i + 1 < count ? i + 1 : i) * 13;
+			uint16 nextSelector = readU16(&_data[nextEntry + 2]);
+			if (!bySelector.contains(nextSelector)) {
+				valid = false;
+				break;
+			}
+			const Page &next = _pages[bySelector[nextSelector]];
+			if (readU32(&_data[entry + 5]) != next.backgroundId ||
+					readU32(&_data[entry + 9]) != next.id) {
+				valid = false;
+				break;
+			}
+		}
+		if (!valid || order.size() != count)
+			continue;
+
+		_pageOrder = order;
+		_initialPage = order[0];
+		for (uint i = 0; i < count; i++)
+			_pages[order[i]].nextPage = order[i + 1 < count ? i + 1 : i];
+		debug(1, "ToolBook: formal page-order table @0x%x, %u entries, initial selector %04x",
+				start, count, _pages[_initialPage].selector);
+		return;
+	}
+
+	warning("ToolBook: formal page-order table was not found");
 }
 
 void Book::scanPageText() {
@@ -587,6 +1183,72 @@ static uint32 unpackChunks(const byte *src, uint32 srcLen, byte *dst, uint32 dst
 	return out;
 }
 
+// Большие картинки ToolBook передаются распаковщику как huge-указатель. После
+// каждой группы оригинал проверяет SI и, если он стал 0 или больше 0xfffc,
+// переносит источник на следующий 64-КБ сегмент. Поэтому хвост страницы может
+// быть слаком, хотя он входит в объявленный compSize (MTB40BAS, seg 101:0x41).
+//
+// Здесь страница считается от начала src: живой рантайм передаёт первый кусок
+// с нулевым SI. Проверки строгие — должны сойтись и весь compSize, и rawSize.
+static bool unpackHugeChunks(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
+		uint32 *usedOut) {
+	uint32 in = 0, out = 0;
+	while (in < srcLen && out < dstLen) {
+		uint32 pageOffset = in & 0xffff;
+		if (pageOffset > 0xfffc) {
+			uint32 skip = 0x10000 - pageOffset;
+			if (skip > srcLen - in)
+				break;
+			in += skip;
+			continue;
+		}
+
+		if (srcLen - in < 2)
+			break;
+		uint32 records = src[in] | (src[in + 1] << 8);
+		in += 2;
+		if (!records || records > 0xfff0)
+			break;
+
+		const uint32 pageEnd = (in & 0xffff0000) + 0x10000;
+		bool valid = true;
+		for (uint32 k = 0; k < records; k++) {
+			if (in >= srcLen || in >= pageEnd) {
+				valid = false;
+				break;
+			}
+			byte c = src[in++];
+			if (c <= 0xf5) {
+				uint32 count = c + 3;
+				if (in >= srcLen || in >= pageEnd || count > dstLen - out) {
+					valid = false;
+					break;
+				}
+				byte value = src[in++];
+				if (dst)
+					memset(dst + out, value, count);
+				out += count;
+			} else {
+				uint32 count = c - 0xf5;
+				if (count > srcLen - in || in + count > pageEnd || count > dstLen - out) {
+					valid = false;
+					break;
+				}
+				if (dst)
+					memcpy(dst + out, src + in, count);
+				in += count;
+				out += count;
+			}
+		}
+		if (!valid)
+			break;
+	}
+
+	if (usedOut)
+		*usedOut = in;
+	return in == srcLen && out == dstLen;
+}
+
 static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen,
 		uint32 stride, uint32 *usedOut) {
 	(void)stride;
@@ -617,30 +1279,6 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 	return out;
 }
 
-// Быстрая проба: считает размеры, ничего не записывая. Поиск начала данных —
-// это десятки тысяч попыток, и запись в буфер на каждой съедала бы секунды.
-static void probeRLE(const byte *src, uint32 srcLen, uint32 dstLen, uint32 stride,
-		uint32 &outLen, uint32 &usedLen) {
-	(void)stride;
-	uint32 in = 0, out = 0;
-	while (out < dstLen && in < srcLen) {
-		byte c = src[in++];
-		uint32 n;
-		if (c <= 0xf5) {
-			if (in >= srcLen)
-				break;
-			in++;
-			n = c + 3;
-		} else {
-			n = c - 0xf5;
-			in += n;
-		}
-		out += n;
-	}
-	outLen = out;
-	usedLen = in;
-}
-
 // Сколько байт выхода даст поток, если считать его кусками с числом записей.
 static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
 	uint32 in = 0, out = 0;
@@ -668,6 +1306,40 @@ static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
 	return out;
 }
 
+// Строгая проверка одного обычного chunk stream: поток обязан израсходовать
+// ровно объявленный compressed size и произвести ровно raw size.
+static bool probeChunkStream(const byte *src, uint32 srcLen, uint32 dstLen) {
+	uint32 in = 0, out = 0;
+	while (in < srcLen && out < dstLen) {
+		if (srcLen - in < 2)
+			return false;
+		uint32 records = src[in] | (src[in + 1] << 8);
+		in += 2;
+		if (!records || records > 0xfff0)
+			return false;
+		for (uint32 k = 0; k < records; k++) {
+			if (in >= srcLen)
+				return false;
+			byte c = src[in++];
+			if (c <= 0xf5) {
+				if (in >= srcLen)
+					return false;
+				in++;
+				out += c + 3;
+			} else {
+				uint32 count = c - 0xf5;
+				if (count > srcLen - in)
+					return false;
+				in += count;
+				out += count;
+			}
+			if (out > dstLen)
+				return false;
+		}
+	}
+	return in == srcLen && out == dstLen;
+}
+
 bool Book::locatePixels(Image &img) {
 	if (img.pixels)
 		return true;
@@ -677,6 +1349,26 @@ bool Book::locatePixels(Image &img) {
 	// Основной путь (ledger/0044): поток лежит блоком сразу за блоком DIB и
 	// начинается с числа записей. Проверяем несколько ближайших положений.
 	const uint32 afterPal = img.offset + 40 + img.colors * 4;
+
+	// Большой поток начинается после десятибайтового заголовка
+	// `01 00 00 00 01 00 00 00 00 00`. Его группы живут в huge-span и на
+	// границе source page могут оставлять 1..3 байта слака. Совпадение обоих
+	// размеров обязательно: у фона @0x1757a9 это 232673 -> 307200 байт.
+	static const byte kHugePrefix[10] = { 1, 0, 0, 0, 1, 0, 0, 0, 0, 0 };
+	if (img.compSize && afterPal + sizeof(kHugePrefix) <= _data.size() &&
+			memcmp(&_data[afterPal], kHugePrefix, sizeof(kHugePrefix)) == 0) {
+		uint32 s = afterPal + sizeof(kHugePrefix);
+		if (img.compSize <= _data.size() - s &&
+				unpackHugeChunks(&_data[s], img.compSize, nullptr, img.rawSize, nullptr)) {
+			img.pixels = s;
+			img.chunked = true;
+			img.hugeSpan = true;
+			debug(1, "ToolBook: huge-span картинки @0x%x: поток @0x%x, %u -> %u байт",
+					img.offset, s, img.compSize, img.rawSize);
+			return true;
+		}
+	}
+
 	for (uint32 shift = 4; shift <= 64; shift += 2) {
 		uint32 s = afterPal + shift;
 		if (s + 8 >= _data.size())
@@ -687,6 +1379,158 @@ bool Book::locatePixels(Image &img) {
 			img.pixels = s;
 			img.chunked = true;
 			return true;
+		}
+	}
+
+	// В сегменте с несколькими Picture потоки лежат после всей heap-цепочки,
+	// в порядке object ID (а не DIB/file order), вплотную по compSize. Поля
+	// raw/comp находятся в Picture block +0x2d/+0x31. Normal/hover variants
+	// and other sibling pictures therefore share one ordered stream tail.
+	int imageIndex = -1;
+	for (uint i = 0; i < _images.size(); i++)
+		if (_images[i].offset == img.offset) {
+			imageIndex = i;
+			break;
+		}
+	uint32 segmentBase = 0, segmentEnd = 0;
+	if (imageIndex >= 0) {
+		for (uint i = 0; i < _objects.size(); i++)
+			if (_objects[i].image == imageIndex) {
+				segmentBase = _objects[i].segmentBase;
+				break;
+			}
+	}
+	for (uint i = 0; i < _heapSegments.size(); i++)
+		if (_heapSegments[i].base == segmentBase) {
+			segmentEnd = _heapSegments[i].end;
+			break;
+		}
+	if (segmentEnd) {
+		Common::Array<uint> pictures;
+		for (uint i = 0; i < _objects.size(); i++) {
+				// The tail contains storage for every Picture block. Keep unresolved
+				// pictures in the cursor walk too: they still consume compSize, or
+				// rawSize when the formal compressed-size field is zero.
+			if (_objects[i].segmentBase != segmentBase || _objects[i].type != 0x15)
+				continue;
+
+			// A segment tail contains only pictures which do not already have a
+			// stream beside their DIB. Mixed segments may keep one Picture at
+			// afterPalette+4 while sibling streams live in the ordered tail.
+			// Counting its compSize in both places shifts every subsequent tail
+			// stream. Use the declared sizes as a strict test;
+			// the old size-only probe is deliberately not sufficient here.
+			const Object &object = _objects[i];
+			bool hasLocalStream = false;
+			if (object.image >= 0) {
+				const Image &localImage = _images[object.image];
+				const uint32 localAfterPal = localImage.offset + 40 + localImage.colors * 4;
+				const uint32 raw = readU32(&_data[object.block + 0x2d]);
+				const uint32 comp = readU32(&_data[object.block + 0x31]);
+				for (uint32 shift = 4; shift <= 64 && !hasLocalStream; shift += 2) {
+					const uint32 candidate = localAfterPal + shift;
+					if (candidate <= _data.size() && comp <= _data.size() - candidate)
+						hasLocalStream = probeChunkStream(&_data[candidate], comp, raw);
+				}
+			}
+			if (hasLocalStream)
+				continue;
+
+			uint at = pictures.size();
+			while (at > 0 && _objects[pictures[at - 1]].id > _objects[i].id)
+				at--;
+			pictures.insert_at(at, i);
+		}
+
+		if (!pictures.empty()) {
+			// A zero compressed size is the formal marker for an uncompressed
+			// tail image; it still occupies rawSize bytes. Raw spans may precede
+			// the first compressed stream, so anchor validation starts after all
+			// leading raw images while preserving their total byte count.
+			uint anchor = 0;
+			uint32 rawPrefix = 0;
+			while (anchor < pictures.size()) {
+				const Object &obj = _objects[pictures[anchor]];
+				uint32 comp = readU32(&_data[obj.block + 0x31]);
+				if (comp)
+					break;
+				uint32 raw = readU32(&_data[obj.block + 0x2d]);
+				if (!raw || raw > 0xffffffffU - rawPrefix) {
+					rawPrefix = 0;
+					anchor = pictures.size();
+					break;
+				}
+				rawPrefix += raw;
+				anchor++;
+			}
+
+			if (anchor < pictures.size()) {
+				const Object &first = _objects[pictures[anchor]];
+				uint32 firstRaw = readU32(&_data[first.block + 0x2d]);
+				uint32 firstComp = readU32(&_data[first.block + 0x31]);
+				debug(2, "ToolBook: segment stream probe @0x%x end=0x%x: %u pictures, anchor id=%u raw=%u comp=%u, raw prefix=%u",
+						segmentBase, segmentEnd, pictures.size(), first.id, firstRaw, firstComp, rawPrefix);
+				uint32 stream = 0;
+				for (uint32 shift = 0; shift <= 64; shift++) {
+					uint32 candidate = segmentEnd + shift;
+					if (candidate > _data.size() || rawPrefix > _data.size() - candidate)
+						continue;
+					uint32 packed = candidate + rawPrefix;
+					if (firstComp <= _data.size() - packed &&
+							(probeChunkStream(&_data[packed], firstComp, firstRaw) ||
+							 unpackHugeChunks(&_data[packed], firstComp, nullptr, firstRaw, nullptr))) {
+						stream = candidate;
+						break;
+					}
+				}
+
+				uint32 cursor = stream;
+				bool valid = stream != 0;
+				Common::Array<byte> storage;
+				for (uint i = 0; valid && i < pictures.size(); i++) {
+					const Object &obj = _objects[pictures[i]];
+					uint32 raw = readU32(&_data[obj.block + 0x2d]);
+					uint32 comp = readU32(&_data[obj.block + 0x31]);
+					byte kind = 0; // raw tail bytes
+					if (!comp) {
+						valid = raw && cursor <= _data.size() && raw <= _data.size() - cursor;
+					} else if (cursor <= _data.size() && comp <= _data.size() - cursor &&
+							probeChunkStream(&_data[cursor], comp, raw)) {
+						kind = 1; // ordinary chunk stream
+					} else if (cursor <= _data.size() && comp <= _data.size() - cursor &&
+							unpackHugeChunks(&_data[cursor], comp, nullptr, raw, nullptr)) {
+						kind = 2; // source-page-spanning chunk stream
+					} else {
+						valid = false;
+					}
+					if (valid && obj.image >= 0)
+						valid = raw == _images[obj.image].rawSize;
+					if (valid) {
+						storage.push_back(kind);
+						cursor += comp ? comp : raw;
+					}
+				}
+				if (valid) {
+					cursor = stream;
+					for (uint i = 0; i < pictures.size(); i++) {
+						const Object &obj = _objects[pictures[i]];
+						uint32 raw = readU32(&_data[obj.block + 0x2d]);
+						uint32 comp = readU32(&_data[obj.block + 0x31]);
+						if (obj.image >= 0) {
+							Image &candidate = _images[obj.image];
+							candidate.compSize = comp ? comp : raw;
+							candidate.pixels = cursor;
+							candidate.raw = storage[i] == 0;
+							candidate.chunked = storage[i] != 0;
+							candidate.hugeSpan = storage[i] == 2;
+						}
+						cursor += comp ? comp : raw;
+					}
+					debug(1, "ToolBook: %u потоков сегмента @0x%x начинаются @0x%x",
+							pictures.size(), segmentBase, stream);
+					return img.pixels != 0;
+				}
+			}
 		}
 	}
 
@@ -713,8 +1557,14 @@ Graphics::Surface *Book::decodeImage(Image &img, Graphics::Palette &palette) {
 			return nullptr;
 		memcpy(pixels.begin(), &_data[img.pixels], img.rawSize);
 	} else if (img.chunked) {
-		unpackChunks(&_data[img.pixels], _data.size() - img.pixels,
-				pixels.begin(), img.rawSize, nullptr);
+		if (img.hugeSpan) {
+			if (!unpackHugeChunks(&_data[img.pixels], img.compSize,
+					pixels.begin(), img.rawSize, nullptr))
+				return nullptr;
+		} else {
+			unpackChunks(&_data[img.pixels], _data.size() - img.pixels,
+					pixels.begin(), img.rawSize, nullptr);
+		}
 	} else {
 		unpackRLE(&_data[img.pixels], MIN<uint32>(img.compSize + 512, _data.size() - img.pixels),
 				pixels.begin(), img.rawSize, img.stride, nullptr);
