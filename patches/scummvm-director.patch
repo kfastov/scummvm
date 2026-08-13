@@ -1657,10 +1657,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..b4274844
+index 00000000..3b590ace
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,883 @@
+@@ -0,0 +1,796 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2353,98 +2353,11 @@ index 00000000..b4274844
 +		}
 +	}
 +
-+	if (!img.compSize)
-+		return false;
-+	if (img.segBase) {
-+		locateSegmentPixels(img.segBase);
-+		if (img.pixels)
-+			return true;
-+	}
++	// Запасного пути нет намеренно. Жадный подбор по размерам находил чужие
++	// данные и рисовал неправильные картинки — видимость работы, которая мешала
++	// увидеть настоящую (ledger/0047). Лучше честно не нарисовать ничего.
++	debug(2, "ToolBook: поток картинки @0x%x %dx%d не найден", img.offset, img.width, img.height);
 +	return false;
-+}
-+
-+// Пиксели лежат сплошным потоком за сегментом объектов, потоки идут подряд и
-+// опознаются по паре размеров (ledger/0032). Поэтому раскладываем сразу весь
-+// сегмент: найдя один поток, следующий ищем сразу за ним, а не по всей книге.
-+void Book::locateSegmentPixels(uint32 segBase) {
-+	for (uint i = 0; i < _segmentsDone.size(); i++)
-+		if (_segmentsDone[i] == segBase)
-+			return;
-+	_segmentsDone.push_back(segBase);
-+
-+	// Картинки этого сегмента, по порядку заголовков.
-+	Common::Array<uint> mine;
-+	for (uint i = 0; i < _images.size(); i++)
-+		if (_images[i].segBase == segBase && _images[i].compSize && !_images[i].pixels)
-+			mine.push_back(i);
-+	if (mine.empty())
-+		return;
-+
-+	// Конец сегмента: идём по цепочке блоков от блока с первым DIB.
-+	uint32 p = _images[mine[0]].offset - 4;
-+	for (uint step = 0; step < 100000; step++) {
-+		if (p + 4 > _data.size())
-+			break;
-+		uint32 next = segBase + readU16(&_data[p]);
-+		if (next <= p || next - p > 0xffff || next + 4 > _data.size())
-+			break;
-+		p = next;
-+	}
-+
-+	// Потоки начинаются около конца сегмента — бывает, что чуть раньше.
-+	uint32 pos = p > 512 ? p - 512 : 0;
-+	uint32 maxRaw = 0;
-+	for (uint i = 0; i < mine.size(); i++)
-+		maxRaw = MAX(maxRaw, _images[mine[i]].rawSize);
-+
-+	while (!mine.empty()) {
-+		bool found = false;
-+		for (uint32 shift = 0; shift < 640 && !found; shift++) {
-+			uint32 start = pos + shift;
-+			if (start + 8 >= _data.size())
-+				break;
-+
-+			// Одна распаковка на позицию: по дороге проверяем все картинки,
-+			// у которых выход совпал ровно.
-+			uint32 in = 0, out = 0;
-+			while (out <= maxRaw && start + in + 1 < _data.size()) {
-+				byte c = _data[start + in++];
-+				if (c <= 0xf5) {
-+					in++;
-+					out += c + 3;
-+				} else {
-+					uint32 k = c - 0xf5;
-+					in += k;
-+					out += k;
-+				}
-+				for (uint m = 0; m < mine.size(); m++) {
-+					Image &im = _images[mine[m]];
-+					if (out != im.rawSize)
-+						continue;
-+					int32 d = (int32)in - (int32)im.compSize;
-+					if (d < 0)
-+						d = -d;
-+					if (d > 48)
-+						continue;
-+					im.pixels = start;
-+					debug(2, "ToolBook: поток @0x%x -> картинка @0x%x %dx%d comp=%u (вход %u)",
-+							start, im.offset, im.width, im.height, im.compSize, in);
-+					pos = start + im.compSize;
-+					mine.remove_at(m);
-+					found = true;
-+					break;
-+				}
-+				if (found)
-+					break;
-+			}
-+		}
-+		if (!found)
-+			break;
-+	}
-+
-+	uint left = mine.size();
-+	if (left)
-+		debug(1, "ToolBook: в сегменте 0x%x не разложено %u картинок", segBase, left);
 +}
 +
 +Graphics::Surface *Book::decodeImage(Image &img, Graphics::Palette &palette) {
@@ -2546,10 +2459,10 @@ index 00000000..b4274844
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..c3b90d9b
+index 00000000..555ab519
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,196 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2730,11 +2643,7 @@ index 00000000..c3b90d9b
 +	void readHandlerStrings(uint32 code, Handler &hd);
 +	void scanClassNames();
 +
-+	/// Раскладывает пиксельные потоки по картинкам одного сегмента.
-+	void locateSegmentPixels(uint32 segBase);
-+
 +	Common::Array<Object> _objects;
-+	Common::Array<uint32> _segmentsDone;
 +
 +	Common::Array<byte> _data;
 +	Common::Array<Image> _images;
