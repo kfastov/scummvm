@@ -53,6 +53,7 @@ Debugger::Debugger() {
 	_isActive = false;
 	_firstTime = true;
 	_defaultCommandProcessor = nullptr;
+	_captureOutput = nullptr;
 #ifndef USE_TEXT_CONSOLE_FOR_DEBUGGER
 	_debuggerDialog = new GUI::ConsoleDialog(1.0f, 0.67f);
 	_debuggerDialog->setInputCallback(debuggerInputCallback, this);
@@ -125,6 +126,15 @@ int Debugger::debugPrintf(const char *format, ...) {
 
 	va_start(argptr, format);
 	int count;
+
+	// ЛОКАЛЬНАЯ ПРАВКА: перехват вывода для runCapturedCommand().
+	if (_captureOutput) {
+		Common::String piece = Common::String::vformat(format, argptr);
+		*_captureOutput += piece;
+		va_end(argptr);
+		return piece.size();
+	}
+
 #ifndef USE_TEXT_CONSOLE_FOR_DEBUGGER
 	count = _debuggerDialog->vprintFormat(1, format, argptr);
 #else
@@ -292,6 +302,14 @@ void Debugger::enter() {
 #endif
 
 #endif
+}
+
+void Debugger::runCapturedCommand(const Common::String &cmd, Common::String &output) {
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): см. debugger.h.
+	Common::String *saved = _captureOutput;
+	_captureOutput = &output;
+	parseCommand(cmd.c_str());
+	_captureOutput = saved;
 }
 
 bool Debugger::handleCommand(int argc, const char **argv, bool &result) {

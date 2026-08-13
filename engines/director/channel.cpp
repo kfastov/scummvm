@@ -535,6 +535,25 @@ void Channel::setClean(Sprite *nextSprite, bool partial) {
 		if (_sprite->_puppet || _sprite->_autoPuppet || (!nextSprite->isQDShape() && partial)) {
 			// Updating scripts, etc. does not require a full re-render
 			_sprite->_scriptId = nextSprite->_scriptId;
+			// Behaviours are script attachments just like the script id, and they
+			// have to come across here as well. Without them the channel keeps an
+			// empty list, respondsToMouse() returns false for D6 and later, and the
+			// sprite silently stops reacting to clicks while still drawing fine.
+			_sprite->_behaviors = nextSprite->_behaviors;
+
+			// D6 splits a sprite into spans, and the score hands out a fresh sprite
+			// list entry whenever the playhead crosses into the next one. That entry
+			// carries the frame range the behaviors live in. Keeping the old range
+			// here means createScriptInstances() never sees the channel as being
+			// inside its span, so no behavior is ever instantiated: the sprite draws,
+			// reports that it responds to the mouse, and still gets no mouseUp,
+			// because in D6 events are dispatched per instantiated behavior.
+			if (g_director->getVersion() >= 600) {
+				_sprite->_spriteListIdx = nextSprite->_spriteListIdx;
+				_sprite->_spriteInfo = nextSprite->_spriteInfo;
+				_startFrame = _sprite->_spriteInfo.startFrame;
+				_endFrame = _sprite->_spriteInfo.endFrame;
+			}
 		} else {
 			previousCastId = _sprite->_castId;
 			replaceSprite(nextSprite);

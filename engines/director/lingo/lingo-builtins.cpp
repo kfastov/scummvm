@@ -1277,7 +1277,8 @@ void LB::b_getPropAt(int nargs) {
 	case PARRAY:
 		{
 			if ((index <= 0) || (index > (int)list.u.parr->arr.size())) {
-				g_lingo->lingoError("b_getPropAt(): index out of range");
+				g_lingo->lingoError("b_getPropAt(): index %d out of range, list has %d entries",
+						index, (int)list.u.parr->arr.size());
 				return;
 			}
 			g_lingo->push(list.u.parr->arr[index - 1].p);
@@ -1286,7 +1287,8 @@ void LB::b_getPropAt(int nargs) {
 	case OBJECT:
 		{
 			if ((index <= 0) || (index > (int)list.u.obj->getPropCount())) {
-				g_lingo->lingoError("b_getPropAt(): index out of range");
+				g_lingo->lingoError("b_getPropAt(): index %d out of range, object has %d properties",
+						index, (int)list.u.obj->getPropCount());
 				return;
 			}
 			Common::String key = list.u.obj->getPropAt(index);
@@ -1658,6 +1660,16 @@ void LB::b_getNthFileNameInFolder(int nargs) {
 		return;
 	}
 
+	// Games that hunt for their CD by walking the drive letters stop at the first
+	// one that answers, and every letter answers here, so they settle on C: and
+	// then reject it as writable. A quirk names the letter FileIO already treats
+	// as a read-only CD; make the other letters look empty.
+	if (g_director->_cdDriveLetter && pathRaw.size() >= 2 && pathRaw[1] == ':' &&
+			toupper(pathRaw[0]) != g_director->_cdDriveLetter) {
+		g_lingo->push(Datum(""));
+		return;
+	}
+
 	// getNthFileNameInFolder requires an absolute path as an input.
 	// relative paths will not match anything.
 	Common::Path path = findAbsolutePath(pathRaw, true);
@@ -1705,8 +1717,12 @@ void LB::b_getNthFileNameInFolder(int nargs) {
 	if (!fileNameList.empty() && (uint)fileNum < fileNameList.size()) {
 		// Sort files alphabetically
 		Common::sort(fileNameList.begin(), fileNameList.end());
+
 		r = Datum(fileNameList[fileNum]);
 	}
+
+	debugC(3, kDebugLingoExec, "b_getNthFileNameInFolder(%s, %d): %s",
+			pathRaw.c_str(), fileNum + 1, r.asString().c_str());
 
 	g_lingo->push(r);
 }

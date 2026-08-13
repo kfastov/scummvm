@@ -485,6 +485,12 @@ void Sprite::releaseAutoPuppet(uint32 copyBackMask) {
 		{ kAPBackColor, kSCBBackColor },
 		{ kAPCast,      kSCBCastId },
 		{ kAPLoc,       kSCBStartPoint },
+		// locH and locV were missing here, so a sprite moved from Lingo along a
+		// single axis kept its auto-puppet forever and the score never restored
+		// its position. A frame that loops on itself then applies its movement
+		// again on every pass, and the sprite drifts away for good.
+		{ kAPLocH,      kSCBStartPoint },
+		{ kAPLocV,      kSCBStartPoint },
 		{ kAPHeight,    kSCBCastId | kSCBHeight },
 		{ kAPWidth,     kSCBCastId | kSCBWidth },
 		{ kAPMoveable,  kSCBMoveable }

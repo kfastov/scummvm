@@ -447,12 +447,13 @@ const char *recIndent() {
 }
 
 bool isAbsolutePath(const Common::String &path) {
-	// Starts with Mac directory notation for the game root
-	if (path.hasPrefix(Common::String("@:")) ||
-		path.hasPrefix(Common::String("@\\")) ||
-		path.hasPrefix(Common::String("@/"))) {
-		return true;
-	}
+	// A leading @ is not an absolute path: Director reads it as "the folder of
+	// the movie that is running now", so it can only be resolved against the
+	// current folder. Treating it as absolute made the lookup fall through to a
+	// whole-tree search, which answers with a path that has lost its folders --
+	// and the movie loaded under that path then computes every path of its own
+	// (the pathName & something) from the wrong place.
+	// See isPathWithRelativeMarkers() and rectifyRelativePath().
 	// Starts with a Windows drive letter
 	if (path.size() >= 3
 			&& Common::isAlpha(path[0])
@@ -463,6 +464,9 @@ bool isAbsolutePath(const Common::String &path) {
 }
 
 bool isPathWithRelativeMarkers(const Common::String &path) {
+	// @ means "relative to the folder of the current movie"
+	if (path.hasPrefix("@"))
+		return true;
 	if (path.contains("::"))
 		return true;
 	if (path.hasPrefix(".\\") || path.hasSuffix("\\.") || path.contains("\\.\\"))
@@ -477,10 +481,10 @@ Common::String rectifyRelativePath(const Common::String &path, const Common::Pat
 	Common::StringArray components = base.splitComponents();
 	uint32 idx = 0;
 
-	// If a path is provided that begins with @, it will be relative to the top level, not the base.
+	// A path beginning with @ is relative to the folder of the current movie,
+	// which is what the base already is: skip the marker and keep the base.
 	if ((path.size() > 0) && (path[0] == '@')) {
 		idx++;
-		components.clear();
 	}
 
 	while (idx < path.size()) {
@@ -903,18 +907,16 @@ Common::Path findPath(const Common::String &path, bool currentFolder, bool searc
 		}
 	}
 
-	// Fall back to checking the game root path
-	debugCN(1, kDebugPaths, "%s", recIndent());
-	debugC(1, kDebugPaths, "findPath(): searching game root path");
-	base = Common::Path();
-	result = resolvePartialPathWithFuzz(testPath, base, directory, exts);
-	if (!result.empty()) {
-		debugCN(1, kDebugPaths, "%s", recIndent());
-		debugC(1, kDebugPaths, "findPath(): resolved \"%s\" -> \"%s\"", testPath.c_str(), result.toString().c_str());
-		return result;
-	}
-
-	// Check each of the search paths in sequence
+	// Check each of the search paths in sequence.
+	//
+	// This has to come before the game root fallback below. The root fallback
+	// resolves a bare name against the whole game tree, so it answers with the
+	// name it was given and not with the folder the file actually lives in.
+	// A movie found that way then gets composed against whatever the current
+	// folder happens to be, and the load fails. The search path, on the other
+	// hand, is what the game itself asked us to look at, and it resolves to a
+	// real folder. It also matches how Director looks things up: the file name
+	// as given, then the search path, and only then anything else.
 	if (searchPaths) {
 		Common::Array<Common::String> searchPathList;
 		Datum searchPath = g_director->getLingo()->_searchPath;
@@ -943,6 +945,17 @@ Common::Path findPath(const Common::String &path, bool currentFolder, bool searc
 				return result;
 			}
 		}
+	}
+
+	// Fall back to checking the game root path
+	debugCN(1, kDebugPaths, "%s", recIndent());
+	debugC(1, kDebugPaths, "findPath(): searching game root path");
+	base = Common::Path();
+	result = resolvePartialPathWithFuzz(testPath, base, directory, exts);
+	if (!result.empty()) {
+		debugCN(1, kDebugPaths, "%s", recIndent());
+		debugC(1, kDebugPaths, "findPath(): resolved \"%s\" -> \"%s\"", testPath.c_str(), result.toString().c_str());
+		return result;
 	}
 
 	// Return empty path

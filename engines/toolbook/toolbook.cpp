@@ -551,29 +551,41 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				}
 				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
 			} else if (id == 116) {
-				// Copy a materialized ToolBook string into a Win16 far buffer.
-				// The reached form pushes copyFlag, offset, source, destination;
-				// RUN87:125c returns the source D after lstrcpy.
+				// RUN87:125c, retf 0xc. Аргументы (в порядке укладки): флаг копии,
+				// смещение, приёмник, источник. Функция строит значение-строку по
+				// дальнему указателю `приёмник + смещение` (MTB40BAS.109) и, если
+				// флаг не ноль и источник не пуст, сперва копирует источник туда
+				// (KERNEL.88 = lstrcpy). Возвращается всегда значение, построенное по
+				// приёмнику, — поэтому чтение заполненного буфера идёт этой же
+				// функцией с нулевым флагом (ledger/0054).
 				Value source = pop();
 				Value destination = pop();
 				Value offset = pop();
 				Value copyFlag = pop();
-				if (!source.isString || !destination.buffer ||
-						!_nativeBuffers.contains(destination.buffer) || !truth(copyFlag)) {
-					debug(1, "ToolBook: builtin 116 operands src=%d dstbuf=%u off=%u copy=%u @0x%x",
-							source.isString, destination.buffer, offset.number,
-							copyFlag.number, handler.code + ip - 3);
+				if (!destination.buffer || !_nativeBuffers.contains(destination.buffer)) {
+					debug(1, "ToolBook: builtin 116 приёмник не буфер (%u) 	0x%x",
+							destination.buffer, handler.code + ip - 3);
 					return false;
 				}
 				NativeBuffer &buffer = _nativeBuffers[destination.buffer];
-				uint32 from = MIN<uint32>(offset.number, source.string.size());
-				uint32 count = buffer.data.empty() ? 0 :
-						MIN<uint32>(source.string.size() - from, buffer.data.size() - 1);
-				for (uint32 i = 0; i < count; i++)
-					buffer.data[i] = (byte)source.string[from + i];
-				if (!buffer.data.empty())
-					buffer.data[count] = 0;
-				stack.push_back(source);
+				uint32 from = MIN<uint32>(offset.number, buffer.data.size());
+				if (truth(copyFlag)) {
+					if (!source.isString) {
+						debug(1, "ToolBook: builtin 116 источник не строка 	0x%x",
+								handler.code + ip - 3);
+						return false;
+					}
+					uint32 count = from >= buffer.data.size() ? 0 :
+							MIN<uint32>(source.string.size(), buffer.data.size() - from - 1);
+					for (uint32 i = 0; i < count; i++)
+						buffer.data[from + i] = (byte)source.string[i];
+					if (from + count < buffer.data.size())
+						buffer.data[from + count] = 0;
+				}
+				Common::String text;
+				for (uint32 i = from; i < buffer.data.size() && buffer.data[i]; i++)
+					text += (char)buffer.data[i];
+				pushString(text);
 			} else if (id == 33 || id == 56) { // hide/show object
 				Value object = pop();
 				if (object.isObject || object.isString)
@@ -677,6 +689,16 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
 					stack.back().string.clear();
 					stack.back().isString = false;
+				} else if (stack.back().isString && type != 9 &&
+						(stack.back().string.equalsIgnoreCase("true") ||
+						 stack.back().string.equalsIgnoreCase("false"))) {
+					// Логическое значение ToolBook хранится канонической строкой
+					// `true`/`false`. При материализации в числовой тип оно должно
+					// стать 1/0: стартовый скрипт отдаёт результат myMCITest именно
+					// так, а builtin 70 (логическое «не», RUN91:09bc) читает слово.
+					// Без этого «true» приходило нулём и книга уходила в ветку
+					// «звуковое устройство не обнаружено» (ledger/0054).
+					stack.back().number = stack.back().string.equalsIgnoreCase("true") ? 1 : 0;
 				} else if (type == 9 && !stack.back().isString && sourceType == 0x23) {
 					// Reached loop-index conversion used to compose an MCI command.
 					stack.back().string = Common::String::format("%d", (int32)stack.back().number);
@@ -838,8 +860,9 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			const Handler *messageTarget = handler.ownerScriptRecord ?
 					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
 			if (!messageTarget) {
-				// Обработчик лежит в другом объекте: посылка идёт вверх по
-				// цепочке, а её порядок ещё не наблюдался (ledger/0053).
+				// Обработчик лежит в другом объекте: получатель приходит со стека
+				// (два дальних указателя), порядок обхода ещё не наблюдался
+				// (ledger/0053).
 				debug(1, "ToolBook: сообщение %s (селектор %04x) не разрешено @0x%x",
 						name.c_str(), selector, handler.code + ip - 3);
 				return false;
@@ -979,6 +1002,33 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					if (argumentBytes != 16 || args.size() != 4)
 						return false;
 					pushNumber(0);
+				} else if (key == "GETWINDOWSDIRECTORY") {
+					// Win16 `UINT GetWindowsDirectory(LPSTR, UINT)`: заполняет буфер и
+					// возвращает длину. Книга заранее берёт буфер через GlobalAlloc и
+					// GlobalLock, поэтому один аргумент — наш буфер, второй его размер;
+					// какой именно, определяем по метке буфера, а не по порядку.
+					// Эталон — Windows 98, там это C:\WINDOWS.
+					if (args.size() != 2)
+						return false;
+					const Value *destination = nullptr, *capacity = nullptr;
+					for (uint i = 0; i < args.size(); i++) {
+						if (args[i].buffer && _nativeBuffers.contains(args[i].buffer))
+							destination = &args[i];
+						else
+							capacity = &args[i];
+					}
+					if (!destination || !capacity)
+						return false;
+					NativeBuffer &buffer = _nativeBuffers[destination->buffer];
+					Common::String windowsDirectory = "C:\\WINDOWS";
+					uint32 room = MIN<uint32>(capacity->number, buffer.data.size());
+					if (room <= windowsDirectory.size())
+						return false;
+					for (uint i = 0; i < windowsDirectory.size(); i++)
+						buffer.data[i] = (byte)windowsDirectory[i];
+					buffer.data[windowsDirectory.size()] = 0;
+					pushNumber(windowsDirectory.size(), 2);
+					debug(2, "ToolBook: GetWindowsDirectory -> %s", windowsDirectory.c_str());
 				} else if (key == "GETMODULEPATH") {
 					if (argumentBytes != 4 || args.size() != 1)
 						return false;
@@ -1072,6 +1122,13 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				} else {
 					debug(1, "ToolBook: native function %s пока не реализована @0x%x",
 							name.c_str(), handler.code + ip - 6);
+					// Аргументы уже сняты со стека в порядке, обратном исходному:
+					// печатаем их, чтобы следующий барьер сразу показывал, чего от него
+					// хотят, и не требовал отдельного прогона с пробой.
+					for (uint a = 0; a < args.size(); a++)
+						debug(1, "    аргумент %u (исходный %u): ширина %u число %u стр «%s»%s",
+								a, (uint)(args.size() - 1 - a), args[a].width, args[a].number,
+								valueString(args[a]).c_str(), args[a].buffer ? " буфер" : "");
 					return false;
 				}
 			} else {
