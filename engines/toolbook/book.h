@@ -178,11 +178,7 @@ private:
 	void readHandlerStrings(uint32 code, Handler &hd);
 	void scanClassNames();
 
-	/// Раскладывает пиксельные потоки по картинкам одного сегмента.
-	void locateSegmentPixels(uint32 segBase);
-
 	Common::Array<Object> _objects;
-	Common::Array<uint32> _segmentsDone;
 
 	Common::Array<byte> _data;
 	Common::Array<Image> _images;
