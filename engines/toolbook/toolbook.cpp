@@ -68,6 +68,14 @@ static void blitTransparent(Graphics::Surface *dst, const Graphics::Surface &src
 	}
 }
 
+// Ключ свойства в нашем подобии CDB: имя объекта плюс номер свойства.
+// Имена объектов книга сравнивает без учёта регистра.
+static Common::String propertyKey(const Common::String &object, uint32 property) {
+	Common::String key = object;
+	key.toUppercase();
+	return key + Common::String::format("#%04x", property);
+}
+
 ToolBookEngine::ToolBookEngine(OSystem *syst, const ADGameDescription *desc)
 		: Engine(syst), _desc(desc) {
 }
@@ -567,7 +575,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value second = pop();
 				Value first = pop();
 				if (secondTag.width != 2 || second.width != 10 || first.width != 10) {
-					debug(1, "ToolBook: builtin 69 неожиданная форма операндов 	0x%x",
+					debug(1, "ToolBook: builtin 69 неожиданная форма операндов @0x%x",
 							handler.code + ip - 3);
 					return false;
 				}
@@ -576,6 +584,56 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				difference.type = 0x22;
 				difference.width = 10;
 				stack.push_back(difference);
+						} else if (id == 139) {
+				// Запись свойства объекта. RUN81:0x021c ветвится по классу объекта
+				// (`байт[bp+0dh] and 0FCh`), неизвестные номера уходят общим путём в
+				// `seg8:0x04ea`, а тот зовёт `MTB40BAS.CDBSetValueEx` — то есть
+				// свойства это записи базы объектов. Аргументы (в порядке укладки):
+				// объект, значение, номер свойства; `retf 8` (ledger/0056).
+				Value propertyId = pop();
+				Value propertyValue = pop();
+				Value object = pop();
+				if (object.string.empty()) {
+					debug(1, "ToolBook: builtin 139 без объекта @0x%x", handler.code + ip - 3);
+					return false;
+				}
+				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
+				debug(2, "ToolBook: свойство 0x%04x объекта «%s» := %u",
+						propertyId.number, object.string.c_str(), propertyValue.number);
+				if (op != 0x21)
+					stack.push_back(propertyValue);
+						} else if (id == 143) {
+				// То же, что 139, но значение — четырёхбайтовое (RUN81:0x0440: тот же
+				// разбор, только класс объекта читается на два слова дальше).
+				Value propertyId = pop();
+				Value propertyValue = pop();
+				Value object = pop();
+				if (object.string.empty()) {
+					debug(1, "ToolBook: builtin 143 без объекта @0x%x", handler.code + ip - 3);
+					return false;
+				}
+				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
+				debug(2, "ToolBook: свойство 0x%04x объекта «%s» := «%s»",
+						propertyId.number, object.string.c_str(),
+						valueString(propertyValue).c_str());
+				if (op != 0x21)
+					stack.push_back(propertyValue);
+						} else if (id == 140) {
+				// Чтение свойства: RUN66:0x0726, `retf 6` — объект и номер, значение
+				// возвращается. Внутри это MTB40BAS.37 по той же базе объектов.
+				// Пока отдаём то, что сами записали; если свойство не ставилось,
+				// значение пустое, и это видно в логе — оригинал взял бы умолчание
+				// из сериализованной записи объекта (ledger/0056).
+				Value propertyId = pop();
+				Value object = pop();
+				Common::String storeKey = propertyKey(object.string, propertyId.number);
+				if (_objectProperties.contains(storeKey)) {
+					stack.push_back(_objectProperties[storeKey]);
+				} else {
+					debug(1, "ToolBook: свойство 0x%04x объекта «%s» не ставилось @0x%x",
+							propertyId.number, object.string.c_str(), handler.code + ip - 3);
+					pushString(Common::String());
+				}
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
@@ -585,7 +643,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value haystack = pop();
 				Value needle = pop();
 				if (!haystack.isString || !needle.isString) {
-					debug(1, "ToolBook: builtin 106 нестроковые операнды 	0x%x",
+					debug(1, "ToolBook: builtin 106 нестроковые операнды @0x%x",
 							handler.code + ip - 3);
 					return false;
 				}
@@ -606,7 +664,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value offset = pop();
 				Value copyFlag = pop();
 				if (!destination.buffer || !_nativeBuffers.contains(destination.buffer)) {
-					debug(1, "ToolBook: builtin 116 приёмник не буфер (%u) 	0x%x",
+					debug(1, "ToolBook: builtin 116 приёмник не буфер (%u) @0x%x",
 							destination.buffer, handler.code + ip - 3);
 					return false;
 				}
@@ -614,7 +672,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				uint32 from = MIN<uint32>(offset.number, buffer.data.size());
 				if (truth(copyFlag)) {
 					if (!source.isString) {
-						debug(1, "ToolBook: builtin 116 источник не строка 	0x%x",
+						debug(1, "ToolBook: builtin 116 источник не строка @0x%x",
 								handler.code + ip - 3);
 						return false;
 					}
@@ -811,7 +869,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			Value from = pop();
 			Value text = pop();
 			if (unit != 0 || !text.isString) {
-				debug(1, "ToolBook: опкод 0x35 единица %u/строка %d 	0x%x",
+				debug(1, "ToolBook: опкод 0x35 единица %u/строка %d @0x%x",
 						unit, text.isString, handler.code + ip - 2);
 				return false;
 			}
@@ -921,7 +979,24 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			}
 			break;
 		}
-		case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
+case 0x48: {
+			// RUN34:0x179e: `inc word ss:[bx]`, при переносе — `inc word ss:[bx+2]`.
+			// То есть прибавление единицы к четырёхбайтовому значению на стеке.
+			if (stack.empty())
+				return false;
+			stack.back().number++;
+			break;
+		}
+		case 0x49: {
+			// RUN34:0x1883: снимает два четырёхбайтовых значения и сравнивает
+			// старшие слова со знаком, при равенстве младшие без знака; кладёт
+			// слово 1, если верхнее не меньше следующего, иначе 0.
+			Value upper = pop();
+			Value lower = pop();
+			pushNumber((int32)upper.number >= (int32)lower.number ? 1 : 0, 2);
+			break;
+		}
+				case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
 		case 0x59: ip += 2; pushNumber(0, 2); break;
 		case 0x6c: {
 			// Посылка сообщения по имени неявному получателю. RUN34:0x4960
@@ -938,7 +1013,7 @@ uint16 selector = _book->readUint16(nameTarget);
 			Common::String name = _book->readString(nameTarget + 2, 255);
 			if (count) {
 				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
-				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано 	0x%x",
+				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
 						name.c_str(), count, handler.code + ip - 3);
 				return false;
 			}
@@ -955,7 +1030,7 @@ uint16 selector = _book->readUint16(nameTarget);
 			if (!messageTarget && handler.ownerScriptRecord)
 				messageTarget = _book->findScriptHandler(handler.ownerScriptRecord, selector);
 			if (!messageTarget) {
-				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено 	0x%x",
+				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено @0x%x",
 						name.c_str(), selector, receiverName.c_str(), handler.code + ip - 3);
 				return false;
 			}

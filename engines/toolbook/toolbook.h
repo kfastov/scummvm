@@ -137,6 +137,11 @@ private:
 	Common::HashMap<Common::String, NativeFontFace> _nativeFonts;
 	Common::HashMap<Common::String, Common::String> _mciAliases;
 	Common::HashMap<Common::String, Common::String> _winIniValues;
+	/// Свойства объектов книги. У оригинала это CDB — база записей, куда
+	/// `builtin 139` пишет через `MTB40BAS.CDBSetValueEx`. Своей CDB у движка
+	/// нет, но наблюдаемое поведение то же: значение по паре
+	/// «объект, номер свойства» кладётся и потом читается (ledger/0056).
+	Common::HashMap<Common::String, ScriptValue> _objectProperties;
 	bool _runtimeAction12 = false;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
