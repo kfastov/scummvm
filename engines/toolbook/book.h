@@ -79,6 +79,21 @@ struct Image {
 	/// Правда, если перед заголовком стоит файловая шапка BM: тогда пиксели
 	/// лежат несжатыми сразу за палитрой.
 	bool raw = false;
+	/// Начало данных уже искали и не нашли — второй раз не искать. Перебор
+	/// стоит десятки тысяч распаковок, и без этого перерисовка страницы
+	/// подвисает на секунды.
+	bool searched = false;
+};
+
+/// Объект на странице: кнопка, многоугольник, картинка.
+///
+/// Координаты в книге — в 1/1440 дюйма; книга 640×480 точек при 96 точках на
+/// дюйм, поэтому единица = 15 и **все координаты кратны 15**. Кратность и
+/// служит проверкой при поиске прямоугольника (ledger/0028).
+struct Object {
+	uint32 offset = 0;      ///< смещение имени в книге
+	Common::String name;
+	Common::Rect rect;      ///< в точках экрана
 };
 
 /// Страница книги.
@@ -88,6 +103,7 @@ struct Page {
 	Common::String name;       ///< имя страницы, если распознано
 	Common::Array<Common::String> handlers; ///< имена обработчиков рядом с якорем
 	Common::Array<Common::String> text;     ///< текст страницы (CP1251 → UTF-8)
+	Common::Array<Object> objects;          ///< объекты, лежащие до следующего фона
 };
 
 /// Запись книги.
@@ -115,6 +131,7 @@ public:
 	const Common::Array<Image> &images() const { return _images; }
 	const Common::Array<Page> &pages() const { return _pages; }
 	const Common::Array<Record> &records() const { return _records; }
+	const Common::Array<Object> &objects() const { return _objects; }
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
 	uint segmentCount() const { return _segmentCount; }
 
@@ -131,7 +148,11 @@ private:
 	void scanRecords();
 	void scanImages();
 	void scanPages();
+	void scanPageText();
+	void scanObjects();
 	void scanClassNames();
+
+	Common::Array<Object> _objects;
 
 	Common::Array<byte> _data;
 	Common::Array<Image> _images;

@@ -78,7 +78,17 @@ Common::Error ToolBookEngine::run() {
 
 	for (uint i = 0; i < _book->images().size(); i++)
 		_rawImages.push_back(i);
-	debug(0, "ToolBook: картинок: %u", _rawImages.size());
+	debug(0, "ToolBook: картинок: %u, объектов с прямоугольником: %u",
+			_rawImages.size(), _book->objects().size());
+
+	for (uint i = 0; i < _book->pages().size(); i++) {
+		const Page &p = _book->pages()[i];
+		Common::String names;
+		for (uint k = 0; k < p.objects.size() && k < 6; k++)
+			names += p.objects[k].name + " ";
+		debug(1, "ToolBook: страница %2u «%s»: объектов %u — %s",
+				i, p.name.c_str(), p.objects.size(), names.c_str());
+	}
 
 	showPage(0);
 
@@ -99,6 +109,7 @@ Common::Error ToolBookEngine::run() {
 }
 
 void ToolBookEngine::handleEvents() {
+
 	Common::Event event;
 	while (_system->getEventManager()->pollEvent(event)) {
 		switch (event.type) {
@@ -143,9 +154,18 @@ void ToolBookEngine::handleEvents() {
 				break;
 			}
 			break;
-		case Common::EVENT_LBUTTONUP:
-			// Правая половина экрана — вперёд, левая — назад. Настоящие кнопки
-			// страницы появятся, когда будет разобран байт-код OpenScript.
+		case Common::EVENT_LBUTTONUP: {
+			// Сначала спрашиваем объекты страницы: у них теперь есть настоящие
+			// прямоугольники. Пока это только сообщение в лог — исполнять
+			// обработчик нечем, интерпретатора нет.
+			const Object *hit = objectAt(event.mouse.x, event.mouse.y);
+			if (hit) {
+				debug(0, "ToolBook: щелчок по объекту «%s» (%d,%d)-(%d,%d)",
+						hit->name.c_str(), hit->rect.left, hit->rect.top,
+						hit->rect.right, hit->rect.bottom);
+				break;
+			}
+			// Промах — листаем: правая половина вперёд, левая назад.
 			if (event.mouse.x > 320) {
 				if (_currentPage + 1 < (int)_book->pages().size()) {
 					_currentPage++;
@@ -156,10 +176,33 @@ void ToolBookEngine::handleEvents() {
 				_needsRedraw = true;
 			}
 			break;
+		}
 		default:
 			break;
 		}
 	}
+}
+
+const Object *ToolBookEngine::objectAt(int x, int y) const {
+	const Common::Array<Page> &pages = _book->pages();
+	if (_imageMode || _currentPage < 0 || _currentPage >= (int)pages.size())
+		return nullptr;
+
+	// Меньший объект выигрывает: полноэкранные прямоугольники вроде popkaRec
+	// лежат под всеми и не должны перехватывать щелчок.
+	const Object *best = nullptr;
+	int bestArea = 0;
+	const Common::Array<Object> &objs = pages[_currentPage].objects;
+	for (uint i = 0; i < objs.size(); i++) {
+		if (!objs[i].rect.contains(x, y))
+			continue;
+		int area = objs[i].rect.width() * objs[i].rect.height();
+		if (!best || area < bestArea) {
+			best = &objs[i];
+			bestArea = area;
+		}
+	}
+	return best;
 }
 
 void ToolBookEngine::showPage(int index) {
@@ -202,9 +245,13 @@ void ToolBookEngine::showPage(int index) {
 
 	_system->unlockScreen();
 
-	debug(1, "ToolBook: страница %d/%d «%s», фон %d, обработчиков %u, строк текста %u",
+	debug(1, "ToolBook: страница %d/%d «%s», фон %d, объектов %u, обработчиков %u, строк текста %u",
 			index + 1, (int)pages.size(), page.name.c_str(), page.background,
-			page.handlers.size(), page.text.size());
+			page.objects.size(), page.handlers.size(), page.text.size());
+	for (uint i = 0; i < page.objects.size() && i < 8; i++)
+		debug(2, "  объект %s (%d,%d)-(%d,%d)", page.objects[i].name.c_str(),
+				page.objects[i].rect.left, page.objects[i].rect.top,
+				page.objects[i].rect.right, page.objects[i].rect.bottom);
 	for (uint i = 0; i < page.text.size() && i < 3; i++)
 		debug(2, "  текст: %s", page.text[i].c_str());
 }

@@ -111,6 +111,7 @@ bool Book::load(Common::SeekableReadStream *stream, uint32 embeddedOffset) {
 
 	scanRecords();
 	scanImages();
+	scanObjects();
 	scanPages();
 	scanClassNames();
 
@@ -217,7 +218,91 @@ void Book::scanImages() {
 	}
 }
 
+// Единица координат книги: 1/1440 дюйма, книга 640×480 при 96 точках на дюйм.
+static const int kUnit = 15;
+
+void Book::scanObjects() {
+	const uint n = _data.size();
+
+	// Запись объекта кончается на `<u16 next><u32 self><имя\0>`; прямоугольник
+	// из четырёх u16 лежит перед ней, но на расстоянии, зависящем от класса
+	// объекта. Опознаётся по кратности координат пятнадцати (ledger/0028).
+	for (uint i = 64; i + 2 < n; i++) {
+		byte c = _data[i];
+		if (!Common::isAlpha(c) && c != '_')
+			continue;
+		if (Common::isAlnum(_data[i - 1]) || _data[i - 1] == '_')
+			continue;
+
+		uint e = i;
+		while (e < n && (Common::isAlnum(_data[e]) || _data[e] == '_'))
+			e++;
+		if (e >= n || _data[e] != 0 || e - i < 2 || e - i > 24)
+			continue;
+
+		uint32 self = readU32(&_data[i - 4]);
+		if (self == 0 || self >= 0x10000)
+			continue;
+
+		for (uint back = 6; back < 48; back++) {
+			const byte *p = &_data[i - 4 - back];
+			int l = readU16(p), t = readU16(p + 2), r = readU16(p + 4), b = readU16(p + 6);
+			if (l % kUnit || t % kUnit || r % kUnit || b % kUnit)
+				continue;
+			if (l >= r || t >= b || r > 640 * kUnit || b > 480 * kUnit)
+				continue;
+			if (r - l < 2 * kUnit || b - t < 2 * kUnit)
+				continue;
+
+			Object obj;
+			obj.offset = i;
+			obj.name = Common::String((const char *)&_data[i], e - i);
+			obj.rect = Common::Rect(l / kUnit, t / kUnit, r / kUnit, b / kUnit);
+			_objects.push_back(obj);
+			break;
+		}
+		i = e;
+	}
+}
+
 void Book::scanPages() {
+	// Страницы разделяются полноэкранными фонами: объекты, лежащие между двумя
+	// соседними фонами, принадлежат одной странице.
+	Common::Array<uint> fullscreen;
+	for (uint k = 0; k < _images.size(); k++)
+		if (_images[k].width == 640 && _images[k].height == 480 && _images[k].depth == 8)
+			fullscreen.push_back(k);
+
+	uint obj = 0;
+	for (uint f = 0; f < fullscreen.size(); f++) {
+		Page page;
+		page.background = fullscreen[f];
+		uint32 from = _images[fullscreen[f]].offset;
+		uint32 to = (f + 1 < fullscreen.size()) ? _images[fullscreen[f + 1]].offset : _data.size();
+
+		while (obj < _objects.size() && _objects[obj].offset < from)
+			obj++;
+		for (uint k = obj; k < _objects.size() && _objects[k].offset < to; k++)
+			page.objects.push_back(_objects[k]);
+
+		// Имя страницы: объект во весь экран обычно назван по странице.
+		for (uint k = 0; k < page.objects.size(); k++) {
+			const Common::Rect &r = page.objects[k].rect;
+			if (r.width() >= 620 && r.height() >= 460) {
+				page.name = page.objects[k].name;
+				break;
+			}
+		}
+		if (page.name.empty() && !page.objects.empty())
+			page.name = page.objects[0].name;
+
+		_pages.push_back(page);
+	}
+
+	scanPageText();
+}
+
+void Book::scanPageText() {
 	const uint n = _data.size();
 	const uint anchorLen = sizeof(kPageAnchor) - 1;
 
@@ -225,25 +310,21 @@ void Book::scanPages() {
 		if (_data[i] != 'A' || memcmp(&_data[i], kPageAnchor, anchorLen) != 0 || _data[i + anchorLen] != 0)
 			continue;
 
-		Page page;
-		page.anchor = i;
-
-		// Фон — ближайший следующий DIB; полноэкранному отдаём предпочтение,
-		// а среди них — тому, который умеем развернуть.
-		for (uint k = 0; k < _images.size(); k++) {
-			if (_images[k].offset <= i)
+		// Якорь ASYM_TpID есть не у всех страниц (51 против 57 фонов), но там,
+		// где он есть, рядом лежат имена обработчиков и текст.
+		Page *page = nullptr;
+		for (uint k = 0; k < _pages.size(); k++) {
+			if (_pages[k].background < 0)
 				continue;
-			if (_images[k].offset - i > 8192)
+			if (_images[_pages[k].background].offset > i)
 				break;
-			if (page.background < 0)
-				page.background = k;
-			if (_images[k].width >= 600 && _images[k].height >= 440) {
-				page.background = k;
-				break;
-			}
+			page = &_pages[k];
 		}
+		if (!page || page->anchor)
+			continue;
+		page->anchor = i;
 
-		// Имена перед якорем: имя страницы и имена обработчиков.
+		// Имена перед якорем: имена обработчиков страницы.
 		uint lo = i > 600 ? i - 600 : 0;
 		for (uint p = lo; p < i; ) {
 			Common::String id;
@@ -251,14 +332,12 @@ void Book::scanPages() {
 			if (identifierAt(_data, p, id, end)) {
 				if (!id.equals("true") && !id.equals("false") && !id.equals("script") &&
 						!id.hasPrefix("ASYM_"))
-					page.handlers.push_back(id);
+					page->handlers.push_back(id);
 				p = end;
 			} else {
 				p++;
 			}
 		}
-		if (!page.handlers.empty())
-			page.name = page.handlers[page.handlers.size() - 1];
 
 		// Текст страницы: русские строки в CP1251 рядом с якорем.
 		uint tlo = i > 4096 ? i - 4096 : 0;
@@ -272,14 +351,12 @@ void Book::scanPages() {
 				run += (char)(c == '\r' || c == '\n' ? ' ' : c);
 			} else {
 				if (run.size() >= 24)
-					page.text.push_back(cp1251ToUtf8(run));
+					page->text.push_back(cp1251ToUtf8(run));
 				run.clear();
 			}
 		}
 		if (run.size() >= 24)
-			page.text.push_back(cp1251ToUtf8(run));
-
-		_pages.push_back(page);
+			page->text.push_back(cp1251ToUtf8(run));
 	}
 }
 
@@ -349,14 +426,19 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 bool Book::locatePixels(Image &img) {
 	if (img.pixels)
 		return true;
-	if (!img.compSize || !img.rawSize)
+	if (!img.compSize || !img.rawSize || img.searched)
 		return false;
+	img.searched = true;
 
 	const uint32 afterPalette = img.offset + 40 + img.colors * 4;
 	// У части картинок между палитрой и данными вклиниваются другие записи,
 	// поэтому начало ищется перебором. Признак верного начала — распаковка
 	// даёт ровно rawSize байт, израсходовав примерно compSize.
-	const uint32 kSearch = 0x10000;
+	//
+	// Окно намеренно узкое: на корпусе из 400 картинок данные лежали сразу за
+	// палитрой у 396, а каждая проверка стоит полной распаковки. С окном в
+	// 64 КБ перелистывание страницы подвисало на секунды (ledger/0029).
+	const uint32 kSearch = 0x600;
 	Common::Array<byte> tmp;
 	tmp.resize(img.rawSize);
 
