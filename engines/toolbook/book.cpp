@@ -502,6 +502,30 @@ const Handler *Book::findScriptHandler(uint32 ownerRecord, uint16 selector) cons
 	return nullptr;
 }
 
+const Handler *Book::findMessageHandler(const Common::String &receiver, uint16 selector) const {
+	// Посылка 0x6c адресная: получатель лежит на стеке (RUN31:0x0194 кладёт его
+	// в описатель посылки). Ищем сегмент кучи с таким именем и разбираем его
+	// привязку скрипта тем же правилом, что и корневую (ledger/0055).
+	for (uint i = 0; i < _heapSegments.size(); i++) {
+		if (!_heapSegments[i].name.equalsIgnoreCase(receiver))
+			continue;
+		uint32 root = _heapSegments[i].base + 0x11;
+		if (root + 0x30 > _data.size())
+			continue;
+		uint16 binding = readU16(&_data[root + 0x2e]);
+		if (!binding)
+			continue;
+		for (uint k = 0; k < _scriptObjects.size(); k++) {
+			if (_scriptObjects[k].id != (uint32)(binding - 1))
+				continue;
+			for (uint n = 0; n < _scriptObjects[k].handlers.size(); n++)
+				if (_scriptObjects[k].handlers[n].eventHash == selector)
+					return &_scriptObjects[k].handlers[n];
+		}
+	}
+	return nullptr;
+}
+
 void Book::scanScriptObjectIndex() {
 	if (_scriptObjects.empty())
 		return;

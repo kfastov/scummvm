@@ -799,6 +799,29 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			}
 			break;
 		}
+		case 0x35: {
+			// RUN34:0x44bc: `lodsb` — единица измерения, затем со стека снимаются
+			// два слова (`pop cx` — верхняя граница, `pop dx` — нижняя) и строка.
+			// Дальше считается длина и вызывается вырезка. Достигнута только
+			// единица 0 — символы; границы включительные и считаются с единицы,
+			// что видно по результату: `chars 1 to 15` от
+			// `C:\NMG\KNTOWER\KNTOWER.TBC` даёт каталог (ledger/0054).
+			uint8 unit = code[ip++];
+			Value to = pop();
+			Value from = pop();
+			Value text = pop();
+			if (unit != 0 || !text.isString) {
+				debug(1, "ToolBook: опкод 0x35 единица %u/строка %d 	0x%x",
+						unit, text.isString, handler.code + ip - 2);
+				return false;
+			}
+			uint32 first = from.number > 0 ? from.number - 1 : 0;
+			uint32 last = MIN<uint32>(to.number, text.string.size());
+			pushString(last > first ?
+					Common::String(text.string.c_str() + first, last - first) :
+					Common::String());
+			break;
+		}
 		case 0x3b: {
 			uint8 slot = code[ip++];
 			if (slot == 0) {
@@ -911,27 +934,35 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
 			uint8 count = code[ip + 2];
 			ip += 3;
-			uint16 selector = _book->readUint16(nameTarget);
+uint16 selector = _book->readUint16(nameTarget);
 			Common::String name = _book->readString(nameTarget + 2, 255);
 			if (count) {
 				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
-				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
+				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано 	0x%x",
 						name.c_str(), count, handler.code + ip - 3);
 				return false;
 			}
-			const Handler *messageTarget = handler.ownerScriptRecord ?
-					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
+			// Получателя кладут предыдущие инструкции: RUN31:0x0194 снимает со стека
+			// два дальних указателя (сам вызов 0x6c кладёт только 12 байт из 20) и
+			// записывает их в описатель посылки как получателя и контекст. Поэтому
+			// сообщение адресное: обработчик ищется у названного объекта, и лишь
+			// затем у себя (ledger/0055).
+			Value messageContext = pop();
+			Value messageReceiver = pop();
+			Common::String receiverName = messageReceiver.string;
+			const Handler *messageTarget = receiverName.empty() ? nullptr :
+					_book->findMessageHandler(receiverName, selector);
+			if (!messageTarget && handler.ownerScriptRecord)
+				messageTarget = _book->findScriptHandler(handler.ownerScriptRecord, selector);
 			if (!messageTarget) {
-				// Обработчик лежит в другом объекте: получатель приходит со стека
-				// (два дальних указателя), порядок обхода ещё не наблюдался
-				// (ledger/0053).
-				debug(1, "ToolBook: сообщение %s (селектор %04x) не разрешено @0x%x",
-						name.c_str(), selector, handler.code + ip - 3);
+				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено 	0x%x",
+						name.c_str(), selector, receiverName.c_str(), handler.code + ip - 3);
 				return false;
 			}
-			Common::Array<Value> noArguments;
+			(void)messageContext;
+						Common::Array<Value> noArguments;
 			Value messageResult;
-			if (!runHandler(*messageTarget, noArguments, receiver,
+			if (!runHandler(*messageTarget, noArguments, messageReceiver,
 					messageTarget->returnsValue ? &messageResult : nullptr, depth + 1))
 				return false;
 			if (messageTarget->returnsValue)
@@ -1076,6 +1107,16 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					debug(2, "ToolBook: fileExists %s -> %s", probe.c_str(),
 							present ? "true" : "false");
 					pushString(present ? "true" : "false");
+								} else if (key == "SETFILEATTRIBUTES") {
+					// TB40DOS: смена атрибутов файла. Своей файловой системы у движка
+					// нет — атрибуты DOS ни на что не влияют, а на эталонном стенде
+					// вызов удаётся, поэтому возвращаем тот же успех. Ветку выбирает
+					// книга, и она должна выбрать ту же, что на стенде.
+					if (args.size() != 2)
+						return false;
+					debug(2, "ToolBook: setFileAttributes %s «%s» (пропущено)",
+							valueString(args[1]).c_str(), valueString(args[0]).c_str());
+					pushNumber(1);
 								} else if (key == "GETINIVAR") {
 					// TB40WIN: чтение переменной из INI-файла. Порядок аргументов взят не
 					// из догадки, а из настоящего файла эталонного стенда
@@ -1265,6 +1306,11 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			break;
 		default:
 			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, handler.code + ip - 1);
+			// Верхушка стека — то, с чем зовут неизвестный опкод.
+			for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 6; v--, n++)
+				debug(1, "    стек [-%d]: ширина %u тип %02x число %u стр «%s»",
+						n, stack[v].width, stack[v].type, stack[v].number,
+						valueString(stack[v]).c_str());
 			return false;
 		}
 	}
