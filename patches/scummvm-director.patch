@@ -4068,10 +4068,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..831e024a
+index 00000000..769c6e23
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2832 @@
+@@ -0,0 +1,2847 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4146,6 +4146,32 @@ index 00000000..831e024a
 +
 +// Ключ свойства в нашем подобии CDB: имя объекта плюс номер свойства.
 +// Имена объектов книга сравнивает без учёта регистра.
++// Имена классов ToolBook по типу блока кучи.
++//
++// Массив лежит в `MTB40UTL.DLL` со смещения 0x0d1e4 — нуль-терминированные
++// строки подряд, индекс равен типу блока. Соответствие проверено по четырём
++// независимым якорям: тип сегмента 4 — Background и 5 — Page (book.cpp), тип
++// блока 9 — кнопка и 10 — поле (объекты диалога). Пустые места в массиве среда
++// занимает словом `Error`; здесь они пусты.
++//
++// Отсюда же видно, что 2393 объекта с DIB — это **PaintObject**, а не Picture
++// (книга и сравнивает с `paintobject`), а 1067 областей карты —
++// `irregularPolygon` (ledger/0079).
++static const char *const kClassNames[] = {
++	nullptr, "Book", nullptr, nullptr, "Background", "Page", nullptr, nullptr,
++	"Rectangle", "Button", "Field", "Group", "Ellipse", "RoundedRectangle",
++	"Line", "Polygon", "IrregularPolygon", "Arc", "Pie", "AngledLine", "Curve",
++	"PaintObject", "RecordField", "Hotword", "Hotword", "Picture", "Stage",
++	"Table", "Chart", "reportSection", "GroupedButton", "DataBaseField", nullptr,
++	"MultipleSelection", "ComboBox", "Viewer", "OLE", "TableColumn"
++};
++
++static Common::String classNameOfType(uint16 type) {
++	if (type >= ARRAYSIZE(kClassNames) || !kClassNames[type])
++		return Common::String();
++	return kClassNames[type];
++}
++
 +static Common::String uppercased(const Common::String &s) {
 +	Common::String key = s;
 +	key.toUppercase();
@@ -4738,20 +4764,9 @@ index 00000000..831e024a
 +					// ToolBook — `button`, `field`, `group`, `rectangle`, `ellipse`,
 +					// `paintobject`, `irregularpolygon` (ledger/0078).
 +					//
-+					// Имена классов и типы блоков кучи — разные нумерации, поэтому
-+					// сопоставлены только те, что подтверждены: тип блока совпадает с
-+					// аргументом класса у builtin 182, а объекты диалога дали
-+					// 0x09 — кнопку, 0x0a — поле, 0x15 — картинку. Остальные типы
-+					// оставлены без имени: движок называет их в логе, а не угадывает.
++					// Имена берутся из таблицы классов среды (см. classNameOfType).
 +					const Object *object = findCurrentObject(value.string);
-+					Common::String className;
-+					switch (object ? object->type : 0) {
-+					case 0x09: className = "button"; break;
-+					case 0x0a: className = "field"; break;
-+					case 0x15: className = "picture"; break;
-+					default:
-+						break;
-+					}
++					Common::String className = classNameOfType(object ? object->type : 0);
 +					if (className.empty()) {
 +						// Пустое имя класса — не «никакой класс», а «мы не знаем».
 +						// Книга сравнивает это значение с именем класса, и пустая
