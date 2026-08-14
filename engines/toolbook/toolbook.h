@@ -35,6 +35,7 @@
 #include "common/random.h"
 #include "audio/mixer.h"
 #include "common/rect.h"
+#include "common/ustr.h"
 
 struct ADGameDescription;
 
@@ -112,12 +113,28 @@ private:
 	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
 	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
 	const struct Object *objectAt(int x, int y) const;
+	const struct Object *objectIn(const struct Page &page, Common::Point origin,
+			int x, int y) const;
+	/// Начало координат показанного окна на экране.
+	Common::Point viewerOrigin(const struct Page &page) const;
 	const struct Object *findCurrentObject(const Common::String &name) const;
 	const struct Object *findCurrentObject(uint32 block) const;
 	bool objectVisible(const struct Page &page, const struct Object &object,
 			uint depth = 0) const;
 	void setObjectVisible(const Common::String &name, bool visible);
 	Common::String fieldText(const struct Object &object) const;
+	/// Поле по значению скрипта: имя плюс вместилище из builtin 182.
+	const struct Object *findFieldObject(const ScriptValue &value) const;
+	/// Шрифт нужного кегля (в пунктах) и разметка текста поля по словам.
+	const Graphics::Font *fieldFont(int points) const;
+	int fieldPoints(const struct Object &object) const;
+	const Graphics::Font *layoutField(const struct Object &object,
+			Common::Array<Common::U32String> &lines) const;
+	/// Помещается ли текст в прямоугольник поля: этим книга выбирает страницу
+	/// диалога (свойства 0x4030 и 0x41f8, ledger/0078).
+	bool fieldTextFits(const struct Object &object) const;
+	void drawField(Graphics::Surface *screen, const struct Object &object,
+			Common::Point origin);
 	Common::Point pageOrigin(const struct Page &page) const;
 	static bool pointInOutline(const struct Object &obj, int x, int y);
 	void handleEvents();
@@ -129,6 +146,8 @@ private:
 			const ScriptValue &receiver, ScriptValue *result, uint depth);
 	void dispatchPageEvent(uint16 eventHash);
 	void dispatchObjectEvent(const struct Object &object, uint16 eventHash);
+	/// Страница, на которой лежит объект: сначала показанное окно, потом книга.
+	int pageOfObject(const struct Object &object) const;
 
 	const ADGameDescription *_desc;
 	Book *_book = nullptr;
@@ -145,6 +164,9 @@ private:
 	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
 	Common::HashMap<uint32, bool> _visibilityOverrides;
 	Common::HashMap<uint32, Common::String> _fieldValues;
+	/// Кегль поля в пунктах (свойство 0x400f), по блоку объекта.
+	Common::HashMap<uint32, int> _fieldSizes;
+	mutable Common::HashMap<int, const Graphics::Font *> _fontCache;
 	Common::HashMap<Common::String, ScriptValue> _scriptGlobals;
 	Common::HashMap<uint32, NativeBuffer> _nativeBuffers;
 	uint32 _nextNativeBuffer = 1;
