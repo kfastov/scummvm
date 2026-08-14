@@ -717,7 +717,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 							propertyId.number, valueString(object).c_str());
 					pushString(Common::String());
 				}
-						} else if (id == 149) {
+						} else if (id == 149 || id == 151) {
 				// Запись свойства без явного объекта (RUN81:0x0c0a — сегмент записи
 				// свойств): со стека снимаются номер и значение, объект берётся из
 				// получателя текущего обработчика.
@@ -728,11 +728,20 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					return false;
 				}
 				_objectProperties[propertyKey(receiver.string, propertyId.number)] = propertyValue;
-				debug(2, "ToolBook: свойство 0x%04x получателя «%s» := «%s»",
+				debug(2, "ToolBook: свойство 0x%04x получателя «%s» := «%s» (форма %u)",
 						propertyId.number, receiver.string.c_str(),
-						valueString(propertyValue).c_str());
+						valueString(propertyValue).c_str(), id);
 				if (op != 0x21)
 					stack.push_back(propertyValue);
+						} else if (id == 346) {
+				// Действие над объектом (RUN67:0x12d0, `retf 4`): объект проверяется на
+				// пустую ссылку (1, 0x400), затем зовётся общий исполнитель
+				// seg30:0x02c8 с парой констант-обработчиков. Что именно он делает,
+				// пока не прочитано; значения не возвращает и на ветвление не влияет,
+				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
+				Value object = pop();
+				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется 	0x%x",
+						object.string.c_str(), handler.code + ip - 3);
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
