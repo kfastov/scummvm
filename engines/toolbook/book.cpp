@@ -157,6 +157,7 @@ bool Book::load(Common::SeekableReadStream *stream, uint32 embeddedOffset) {
 	scanScriptObjects();
 	scanScriptObjectIndex();
 	scanHeapSegments();
+	scanViewers();
 	scanImages();
 	scanObjects();
 	scanPages();
@@ -335,6 +336,99 @@ void Book::scanHeapSegments() {
 	}
 
 	debug(1, "ToolBook: формальных heap-сегментов %u", _heapSegments.size());
+}
+
+// Нуль-терминированная строка кучи: имя объекта или тело блока типа 0.
+static Common::String heapString(const Common::Array<byte> &data, uint32 p, uint32 limit) {
+	uint32 e = p;
+	while (e < limit && data[e] >= 32 && data[e] < 127 && e - p <= 64)
+		e++;
+	if (e == p || e >= limit || data[e] != 0)
+		return Common::String();
+	return Common::String((const char *)&data[p], e - p);
+}
+
+void Book::scanViewers() {
+	// Окна книги живут в собственном сегменте кучи: root-блок типа 0x25 стоит
+	// по `base + 0x11`, конец цепочки лежит в `base + 0x0d`, как у сегментов
+	// страниц и фонов. Отличается только тип root-блока, поэтому scanHeapSegments
+	// (он берёт 4 и 5) этот сегмент и пропускал.
+	const uint32 n = _data.size();
+	for (uint32 p = 0x11; p + 20 < n; p++) {
+		if (readU16(&_data[p + 2]) != 0x25)
+			continue;
+		const uint32 base = p - 0x11;
+		const uint32 heapEnd = base + (readU16(&_data[base + 0x0d]) | 1);
+		const uint32 firstEnd = base + (readU16(&_data[p]) | 1);
+		if (firstEnd <= p || firstEnd > heapEnd || heapEnd > n)
+			continue;
+
+		// Тот же строгий критерий, что у сегментов страниц: цепочка блоков
+		// обязана закончиться ровно на формальном конце, иначе это случайное
+		// совпадение в потоке пикселей.
+		uint32 block = p;
+		uint count = 0;
+		while (block < heapEnd && count++ < 10000) {
+			uint32 next = base + (readU16(&_data[block]) | 1);
+			if (next <= block || next > heapEnd)
+				break;
+			block = next;
+		}
+		if (block != heapEnd)
+			continue;
+
+		for (block = p; block < heapEnd; ) {
+			const uint32 next = base + (readU16(&_data[block]) | 1);
+			if (next <= block || next > heapEnd)
+				break;
+			if (readU16(&_data[block + 2]) == 0x26 && next - block >= 0x30) {
+				Viewer viewer;
+				viewer.block = block;
+				viewer.segmentBase = base;
+				viewer.handle = (uint16)(block - base + 3);
+				viewer.index = readU32(&_data[block + 6]);
+				viewer.name = heapString(_data, block + 0x0a, next);
+				// Поле +0x2e — handle блока со строкой-выражением `page "…"`.
+				// У окон, чью страницу назначает скрипт, оно нулевое.
+				uint16 pageHandle = readU16(&_data[block + 0x2e]);
+				if (pageHandle >= 3) {
+					uint32 target = base + pageHandle - 3;
+					if (target > base && target + 5 < heapEnd && readU16(&_data[target + 2]) == 0)
+						viewer.pageExpression = heapString(_data, target + 4, heapEnd);
+				}
+				// Выражение всегда вида `page "имя"`; берём имя в кавычках.
+				const char *open = strchr(viewer.pageExpression.c_str(), '"');
+				const char *close = open ? strchr(open + 1, '"') : nullptr;
+				if (close)
+					viewer.initialPage = Common::String(open + 1, close - open - 1);
+				if (!viewer.name.empty())
+					_viewers.push_back(viewer);
+			}
+			block = next;
+		}
+		p = heapEnd;
+	}
+
+	for (uint i = 0; i < _viewers.size(); i++)
+		debug(1, "ToolBook: окно %u «%s» страница «%s» (%s)", _viewers[i].index,
+				_viewers[i].name.c_str(), _viewers[i].initialPage.c_str(),
+				_viewers[i].pageExpression.c_str());
+	debug(1, "ToolBook: окон книги %u", _viewers.size());
+}
+
+const Viewer *Book::findViewer(const Common::String &name) const {
+	for (uint i = 0; i < _viewers.size(); i++)
+		if (_viewers[i].name.equalsIgnoreCase(name))
+			return &_viewers[i];
+	return nullptr;
+}
+
+int Book::pageOfObject(const Common::String &objectName) const {
+	for (uint i = 0; i < _pages.size(); i++)
+		for (uint o = 0; o < _pages[i].objects.size(); o++)
+			if (_pages[i].objects[o].name.equalsIgnoreCase(objectName))
+				return (int)i;
+	return -1;
 }
 
 void Book::scanHandlers() {

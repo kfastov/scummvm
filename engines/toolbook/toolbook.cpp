@@ -72,10 +72,14 @@ static void blitTransparent(Graphics::Surface *dst, const Graphics::Surface &src
 
 // Ключ свойства в нашем подобии CDB: имя объекта плюс номер свойства.
 // Имена объектов книга сравнивает без учёта регистра.
-static Common::String propertyKey(const Common::String &object, uint32 property) {
-	Common::String key = object;
+static Common::String uppercased(const Common::String &s) {
+	Common::String key = s;
 	key.toUppercase();
-	return key + Common::String::format("#%04x", property);
+	return key;
+}
+
+static Common::String propertyKey(const Common::String &object, uint32 property) {
+	return uppercased(object) + Common::String::format("#%04x", property);
 }
 
 ToolBookEngine::ToolBookEngine(OSystem *syst, const ADGameDescription *desc)
@@ -473,10 +477,22 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				pop(); // book/context
 				if (op != 0x21) pushObject(name.string);
 			} else if (id == 182) { // object(owner, name, class)
-				pop(); // class selector
+				// Класс — номер из таблицы классов книги: 10 — Field, 21 — Picture,
+				// 38 — Viewer. Окна лежат отдельной таблицей и объектами страниц не
+				// являются, поэтому имя разрешается по ней (ledger/0076, 0077).
+				Value klass = pop();
 				Value name = pop();
-				pop(); // page/background owner
-				if (op != 0x21) pushObject(name.string);
+				Value owner = pop();
+				Value resolved;
+				resolved.string = name.string;
+				resolved.isObject = true;
+				resolved.width = 4;
+				resolved.owner = valueString(owner);
+				resolved.isViewer = klass.number == 38;
+				if (resolved.isViewer && !_book->findViewer(name.string))
+					debug(1, "ToolBook: окно «%s» не найдено в таблице окон @0x%x",
+							name.string.c_str(), ip - 3);
+				if (op != 0x21) stack.push_back(resolved);
 			} else if (id == 329) { // resource(owner, name, class)
 				pop();
 				Value name = pop();
@@ -653,6 +669,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					debug(1, "ToolBook: builtin 143 без объекта @0x%x", ip - 3);
 					return false;
 				}
+				setFieldProperty(object, propertyId.number, propertyValue);
 				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
 				debug(2, "ToolBook: свойство 0x%04x объекта «%s» := «%s»",
 						propertyId.number, object.string.c_str(),
@@ -696,20 +713,37 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				range.width = 4;
 				stack.push_back(range);
 						} else if (id == 152) {
-				// Чтение свойства у объекта, названного внутри другого (RUN66:0x103a —
-				// тот же сегмент, что и обычное чтение 140, и та же ветвь по классу).
-				// Со стека снимаются номер свойства, объект и вместилище.
+				// Ещё одно чтение свойства (RUN66:0x103a — тот же сегмент, что и
+				// обычное чтение 140). `retf 6`: со стека снимаются только номер
+				// свойства и объект. Раньше здесь снималось ещё и «вместилище», и
+				// лишний операнд съедал объект, приготовленный для следующей записи
+				// свойства — а та брала объект из получателя. Две ошибки гасили друг
+				// друга, пока не понадобилось именно то, что съедалось (ledger/0077).
 				Value propertyId = pop();
 				Value object = pop();
-				Value container = pop();
-				Common::String storeKey = propertyKey(object.string, propertyId.number);
-				if (_objectProperties.contains(storeKey)) {
-					stack.push_back(_objectProperties[storeKey]);
+				if (propertyId.number == 0x4020) {
+					// «Страница этого объекта»: RUN66:0x177e разрешает вместилище
+					// объекта. Книга так добирается от поля «Message» до страницы,
+					// которую потом показывает окно.
+					Common::String page = object.owner;
+					if (page.empty()) {
+						int index = _book->pageOfObject(object.string);
+						if (index >= 0)
+							page = _book->pages()[index].name;
+					}
+					if (page.empty())
+						debug(1, "ToolBook: страница объекта «%s» не найдена @0x%x",
+								object.string.c_str(), ip - 3);
+					pushObject(page);
 				} else {
-					debug(1, "ToolBook: свойство 0x%04x объекта «%s» (в «%s») не ставилось @0x%x",
-							propertyId.number, object.string.c_str(), container.string.c_str(),
-							ip - 3);
-					pushString(Common::String());
+					Common::String storeKey = propertyKey(object.string, propertyId.number);
+					if (_objectProperties.contains(storeKey)) {
+						stack.push_back(_objectProperties[storeKey]);
+					} else {
+						debug(1, "ToolBook: свойство 0x%04x объекта «%s» не ставилось (builtin 152) @0x%x",
+								propertyId.number, object.string.c_str(), ip - 3);
+						pushString(Common::String());
+					}
 				}
 						} else if (id == 150) {
 				// Ещё одна форма чтения свойства (RUN66:0x0dea, тот же сегмент разбора
@@ -725,47 +759,66 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					pushString(Common::String());
 				}
 						} else if (id == 149 || id == 151) {
-				// Запись свойства без явного объекта (RUN81:0x0c0a — сегмент записи
-				// свойств): со стека снимаются номер и значение, объект берётся из
-				// получателя текущего обработчика.
+				// Запись свойства (RUN81:0x0c0a и 0x0e26 — сегмент записи свойств).
+				// У обоих `retf 0xa`: номер свойства, четырёхбайтовое значение и
+				// объект. Объект приходит со стека, а не из получателя обработчика:
+				// именно так книга пишет `page of Dial` — окно кладётся вызовом 182
+				// прямо перед значением (ledger/0077).
 				Value propertyId = pop();
 				Value propertyValue = pop();
-				if (receiver.string.empty()) {
-					debug(1, "ToolBook: builtin 149 без получателя @0x%x", ip - 3);
+				Value object = pop();
+				Common::String target = object.string.empty() ? receiver.string : object.string;
+				if (target.empty()) {
+					debug(1, "ToolBook: builtin %u без объекта @0x%x", id, ip - 3);
 					return false;
 				}
-				_objectProperties[propertyKey(receiver.string, propertyId.number)] = propertyValue;
-				debug(2, "ToolBook: свойство 0x%04x получателя «%s» := «%s» (форма %u)",
-						propertyId.number, receiver.string.c_str(),
+				if (object.isViewer && propertyId.number == 0x40d7) {
+					// «Страница окна»: единственное свойство класса 0x26 в разборе
+					// чтения (RUN66:0x1318 проверяет класс перед разбором). Им книга
+					// и говорит, что показывать в диалоге.
+					Common::String page = valueString(propertyValue);
+					_viewerStates[uppercased(target)].page = page;
+					_needsRedraw = true;
+					debug(2, "ToolBook: окно «%s» показывает страницу «%s»",
+							target.c_str(), page.c_str());
+				}
+				_objectProperties[propertyKey(target, propertyId.number)] = propertyValue;
+				debug(2, "ToolBook: свойство 0x%04x объекта «%s» := «%s» (форма %u)",
+						propertyId.number, target.c_str(),
 						valueString(propertyValue).c_str(), id);
 				if (op != 0x21)
 					stack.push_back(propertyValue);
 			} else if (id == 324) {
-				// RUN90:0x0276, `retf 0xc`: объект, два слова и значение. Вызывается
-				// вариантом 0x21 — без возвращаемого значения, и в обработчике
-				// сообщения это последний оператор. Что именно делает, не прочитано;
-				// на ветвление не влияет, поэтому отмечаем и идём дальше.
+				// Показать окно. RUN90:0x0276, `retf 0xc`: окно и три постоянных
+				// операнда (2, 0, 0 — во всех одиннадцати вызовах книги). Исполнитель
+				// RUN90:0x02d8 работает только с классом 0x26 и в конце пишет окну
+				// свойство 0x4035 (ledger/0077).
 				Value value = pop();
 				Value second = pop();
 				Value first = pop();
 				Value object = pop();
-				debug(1, "ToolBook: действие 324 над «%s» (%u, %u, «%s») пока не выполняется @0x%x",
+				ViewerState &viewer = _viewerStates[uppercased(object.string)];
+				viewer.visible = true;
+				_needsRedraw = true;
+				debug(2, "ToolBook: окно «%s» показано (%u, %u, «%s») @0x%x",
 						object.string.c_str(), first.number, second.number,
 						valueString(value).c_str(), ip - 3);
-			} else if (id == 346) {
-				// Действие над объектом (RUN67:0x12d0, `retf 4`): объект проверяется на
-				// пустую ссылку (1, 0x400), затем зовётся общий исполнитель
-				// seg30:0x02c8 с парой констант-обработчиков. Что именно он делает,
-				// пока не прочитано; значения не возвращает и на ветвление не влияет,
-				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
+			} else if (id == 346 || id == 347) {
+				// Открыть (346, RUN67:0x12d0) и закрыть (347, RUN67:0x1332) окно.
+				// Обе `retf 4` и различаются одним операндом общего исполнителя
+				// RUN67:0x15f6: тот работает только с классом 0x26 (`cmp byte
+				// [bp+0xa], 0x26`) и зовёт seg24:0x0000 с режимом 1 либо 2 — режим 1
+				// создаёт окно, дальше идёт `IsWindow` (ledger/0077).
 				Value object = pop();
-				// 346 обходит объект и его потомков (RUN30:0x02c8). Что делает в узле —
-				// не прочитано, но объект книга называет по имени, и рисовать надо тот
-				// сегмент, где он лежит: диалог — это отдельный набор объектов.
-				_shownOverlay = object.string;
+				ViewerState &viewer = _viewerStates[uppercased(object.string)];
+				viewer.open = (id == 346);
+				if (id == 347) {
+					viewer.visible = false;
+					viewer.page.clear();
+				}
 				_needsRedraw = true;
-				debug(2, "ToolBook: действие 346 над «%s» (объектов в его сегменте %u)",
-						object.string.c_str(), _book->objectsAround(object.string).size());
+				debug(2, "ToolBook: окно «%s» %s", object.string.c_str(),
+						id == 346 ? "открыто" : "закрыто");
 						} else if (id == 175) {
 				// Запуск внешней программы (RUN83:0x0000 -> MTB40BAS.157). Книга так
 				// показывает вступительный ролик `.\demo\knt_demo.exe` — отдельный
@@ -2026,12 +2079,16 @@ void ToolBookEngine::handleEvents() {
 					_needsRedraw = true;
 				}
 				break;
-			case Common::KEYCODE_m:
-				// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): показать страницу диалога
-				// поверх текущей — проверка модели окна глазами (ledger/0073).
-				_shownOverlay = _shownOverlay.empty() ? Common::String("message1") : Common::String();
+			case Common::KEYCODE_m: {
+				// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): открыть диалог вручную —
+				// проверка модели окна глазами (ledger/0073, 0077).
+				ViewerState &viewer = _viewerStates[uppercased("Dial")];
+				bool shown = viewer.open && viewer.visible;
+				viewer.open = viewer.visible = !shown;
+				viewer.page = shown ? Common::String() : Common::String("message1");
 				_needsRedraw = true;
 				break;
+			}
 			case Common::KEYCODE_o:
 				// Рамки объектов страницы — проверка разбора прямоугольников.
 				if (ConfMan.getBool("toolbook_resource_viewer")) {
@@ -2116,6 +2173,58 @@ void ToolBookEngine::setObjectVisible(const Common::String &name, bool visible) 
 Common::String ToolBookEngine::fieldText(const Object &object) const {
 	return _fieldValues.contains(object.block) ?
 			_fieldValues.getVal(object.block) : object.initialText;
+}
+
+void ToolBookEngine::setFieldProperty(const ScriptValue &object, uint32 property,
+		const ScriptValue &value) {
+	// 0x402e — текст поля. Книга кладёт его свойством, а не вводом: обработчик
+	// `myMessage` так раскладывает сообщение по полю «Message» той страницы,
+	// которую потом показывает окно (ledger/0077).
+	if (property != 0x402e)
+		return;
+	// Имя поля неуникально — «Message» есть на каждой странице фона, — поэтому
+	// ищем в той странице, в которой книга объект и разрешила (builtin 182).
+	int pageIndex = object.owner.empty() ? _book->pageOfObject(object.string) :
+			findPageIndex(object.owner);
+	if (pageIndex < 0) {
+		debug(1, "ToolBook: поле «%s» (в «%s») не нашлось", object.string.c_str(),
+				object.owner.c_str());
+		return;
+	}
+	const Common::Array<Object> &objects = _book->pages()[pageIndex].objects;
+	for (uint i = 0; i < objects.size(); i++) {
+		if (!objects[i].field || !objects[i].name.equalsIgnoreCase(object.string))
+			continue;
+		// Литералы книги — в CP1251, а в `_fieldValues` лежит UTF-8: там же
+		// оказывается набранное игроком. Переводим на границе, как это делает
+		// разбор текста страниц.
+		Common::String text = value.isString || value.isObject ?
+				cp1251ToUtf8(value.string) : Common::String();
+		_fieldValues[objects[i].block] = text;
+		_needsRedraw = true;
+		debug(2, "ToolBook: текст поля «%s» страницы «%s» := «%s»",
+				objects[i].name.c_str(), _book->pages()[pageIndex].name.c_str(), text.c_str());
+		return;
+	}
+	debug(1, "ToolBook: поля «%s» на странице «%s» нет", object.string.c_str(),
+			_book->pages()[pageIndex].name.c_str());
+}
+
+int ToolBookEngine::shownViewerPage() const {
+	// Показывается окно, которое книга открыла (346), показала (324) и которому
+	// назначила страницу (свойство 0x40d7). Порядок именно такой: страница
+	// приходит между открытием и показом (ledger/0077).
+	for (Common::HashMap<Common::String, ViewerState>::const_iterator it = _viewerStates.begin();
+			it != _viewerStates.end(); ++it) {
+		if (!it->_value.open || !it->_value.visible || it->_value.page.empty())
+			continue;
+		int index = findPageIndex(it->_value.page);
+		if (index >= 0)
+			return index;
+		debug(1, "ToolBook: окно «%s» показывает неизвестную страницу «%s»",
+				it->_key.c_str(), it->_value.page.c_str());
+	}
+	return -1;
 }
 
 Common::Point ToolBookEngine::pageOrigin(const Page &page) const {
@@ -2224,42 +2333,51 @@ void ToolBookEngine::showPage(int index) {
 		drawn = true;
 	}
 
-	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
-	// отдельным Background, а страница под ним остаётся.
-	if (!_shownOverlay.empty()) {
-		// Диалог у ToolBook — это страница фона, показанная окном поверх текущей
-		// (ledger/0072). Поэтому сначала ищем страницу с таким именем, и лишь
-		// затем — сегмент, где лежит объект с таким именем.
-		Common::Array<Object> extra;
-		int overlayPage = findPageIndex(_shownOverlay);
-		debug(3, "ПОВЕРХ: «%s» страница %d", _shownOverlay.c_str(), overlayPage);
-		if (overlayPage >= 0)
-			extra = _book->pages()[overlayPage].objects;
-		else
-			extra = _book->objectsAround(_shownOverlay);
-		for (uint o = 0; o < extra.size(); o++) {
-			const Object &obj = extra[o];
-			debug(3, "ПОВЕРХ: объект «%s» индекс=%d raw=%u comp=%u бит=%u",
-					obj.name.c_str(), obj.image,
-					obj.image >= 0 ? _book->images()[obj.image].rawSize : 0,
-					obj.image >= 0 ? _book->images()[obj.image].compSize : 0,
-					obj.image >= 0 ? _book->images()[obj.image].depth : 0);
-			if (!obj.picture || obj.image < 0)
+	// Окно книги рисуется поверх страницы: у ToolBook диалог живёт отдельной
+	// страницей, которую показывает окно (ledger/0072, 0077). Страница под ним
+	// остаётся, поэтому кадр не чистится.
+	int viewerPage = shownViewerPage();
+	if (viewerPage >= 0) {
+		const Page &shown = _book->pages()[viewerPage];
+		// Своей геометрии у диалога в таблице окон нет — все её поля нулевые
+		// (у окон с сохранённым положением там лежат 800×600 и 1024×768). Окно
+		// без положения ToolBook разворачивает по странице и ставит по центру
+		// родительского окна.
+		Common::Point viewerOrigin((screen->w - (int)shown.canvasWidth) / 2,
+				(screen->h - (int)shown.canvasHeight) / 2);
+		debug(3, "ОКНО: страница «%s» %ux%u в (%d, %d), объектов %u",
+				shown.name.c_str(), shown.canvasWidth, shown.canvasHeight,
+				viewerOrigin.x, viewerOrigin.y, shown.objects.size());
+		for (uint o = 0; o < shown.objects.size(); o++) {
+			const Object &obj = shown.objects[o];
+			if (!objectVisible(shown, obj) || !obj.picture || obj.image < 0)
 				continue;
 			Graphics::Palette palette(256);
 			Graphics::Surface *img = _book->decodeImage(
 					const_cast<Image &>(_book->images()[obj.image]), palette);
 			if (!img || !img->format.isCLUT8()) {
 				if (img) { img->free(); delete img; }
-				debug(3, "ПОВЕРХ: декодер не дал картинку %d (img=%d)",
-						obj.image, img != nullptr);
+				debug(3, "ОКНО: декодер не дал картинку %d", obj.image);
 				continue;
 			}
 			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
-			blitTransparent(screen, *img, obj.rect.left, obj.rect.top, 253);
+			blitTransparent(screen, *img, obj.rect.left + viewerOrigin.x,
+					obj.rect.top + viewerOrigin.y, 253);
 			img->free();
 			delete img;
 			drawn = true;
+		}
+		if (_fieldFont) {
+			for (uint o = 0; o < shown.objects.size(); o++) {
+				const Object &obj = shown.objects[o];
+				if (!obj.field || !objectVisible(shown, obj))
+					continue;
+				Common::U32String text = fieldText(obj).decode(Common::kUtf8);
+				_fieldFont->drawString(screen, text, obj.rect.left + viewerOrigin.x + 2,
+						obj.rect.top + viewerOrigin.y +
+						MAX(0, (obj.rect.height() - _fieldFont->getFontHeight()) / 2),
+						MAX(0, obj.rect.width() - 4), 0);
+			}
 		}
 	}
 
