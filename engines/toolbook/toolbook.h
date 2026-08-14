@@ -62,6 +62,8 @@ public:
 
 private:
 	struct ScriptValue {
+	bool isHandlerRef = false;   ///< разрешённый адрес обработчика (посылка 0x6c)
+	Common::String receiverName;  ///< кому послано
 		uint32 number = 0;
 		Common::String string;
 		bool isString = false;
