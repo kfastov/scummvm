@@ -237,10 +237,14 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		locals[argumentOffset] = arguments[i];
 		argumentOffset += arguments[i].width;
 	}
-	const byte *code = _book->bytes(handler.code, handler.codeSize);
+	// Указатель инструкций — абсолютное смещение по книге, как `ds:si` у среды
+	// (RUN34:0x1416 при возврате снимает со стека именно пару «сегмент,
+	// смещение»). Это первый шаг к её модели: один поток кода вместо буфера на
+	// каждый обработчик (ledger/0068).
+	const byte *code = _book->bytes(0, _book->size());
 	if (!code)
 		return false;
-	uint32 ip = 0;
+	uint32 ip = handler.code;
 	auto pushNumber = [&](uint32 n, uint8 width = 4) { Value v; v.number = n; v.width = width; stack.push_back(v); };
 	auto pushString = [&](const Common::String &s, uint8 width = 4) { Value v; v.string = s; v.isString = true; v.width = width; stack.push_back(v); };
 	auto pushReference = [&](uint32 reference, const Common::String &s, uint8 width) {
@@ -262,7 +266,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		}
 		if (consumed != bytes)
 			debug(1, "ToolBook: stack cleanup %u bytes consumed %u @0x%x",
-					bytes, consumed, handler.code + ip);
+					bytes, consumed, ip);
 		return consumed == bytes;
 	};
 	auto isNullValue = [&](const Value &v) {
@@ -292,7 +296,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 	};
 	auto local = [&](int off) { return locals.contains(off) ? locals[off] : Value(); };
 	auto read16 = [&](uint32 at) { return (uint16)(code[at] | (code[at + 1] << 8)); };
-	auto branch = [&](uint32 end, uint16 rel) { ip = (uint16)(end + rel); };
+	auto branch = [&](uint32 end, uint16 rel) { ip = (uint32)((int32)end + (int16)rel); };
 	auto parseNativeDescriptor = [&](uint32 base, Common::Array<NativeBinding> *out) {
 		uint16 count = _book->readUint16(base);
 		if (!count || count > 64 || !_book->bytes(base + 2, (uint32)count * 10))
@@ -342,11 +346,12 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 	};
 	auto globalName = [&](uint32 operand) {
 		uint16 rel = read16(operand + 2);
-		return _book->handlerString(handler, handler.code + (uint16)(operand + 4 + rel) + 5);
+		return _book->handlerString(handler, (uint32)((int32)(operand + 4) + (int16)rel) + 5);
 	};
-	for (uint steps = 0; ip < handler.codeSize && steps < 10000; steps++) {
+	const uint32 codeEnd = handler.code + handler.codeSize;
+	for (uint steps = 0; ip < codeEnd && steps < 10000; steps++) {
 		uint8 op = code[ip++];
-		debug(6, "ToolBook: опкод %02x @0x%x (стек %u)", op, handler.code + ip - 1, stack.size());
+		debug(6, "ToolBook: опкод %02x @0x%x (стек %u)", op, ip - 1, stack.size());
 		switch (op) {
 		case 0x02: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 4; stack.push_back(value); break; }
 		case 0x01: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 2; stack.push_back(value); break; }
@@ -356,7 +361,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		case 0x07: case 0x08: {
 			uint16 rel = read16(ip);
 			ip += 2;
-			uint32 reference = handler.code + (uint16)(ip + rel);
+			uint32 reference = (uint32)((int32)(ip) + (int16)rel);
 			Common::String literal;
 			if (op != 0x08 || !parseNativeDescriptor(reference, nullptr))
 				// RUN34:0x0f38 и 0x0f60 кладут указатель ровно на байты по
@@ -400,7 +405,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			bool condition = truth(tested);
 			bool taken = (op == 0x13 && condition) || (op == 0x14 && !condition);
 			debug(5, "ToolBook: ветвление %02x @0x%x условие=%d («%s», число %u) переход=%d",
-					op, handler.code + ip - 3, condition, valueString(tested).c_str(),
+					op, ip - 3, condition, valueString(tested).c_str(),
 					tested.number, taken);
 			if (taken) branch(ip, rel);
 			break;
@@ -410,7 +415,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			Value tested = pop();
 			bool condition = truth(tested);
 			debug(5, "ToolBook: ветвление 15 @0x%x условие=%d («%s», число %u) переход=%d",
-					handler.code + ip - 3, condition, valueString(tested).c_str(),
+					ip - 3, condition, valueString(tested).c_str(),
 					tested.number, !condition);
 			if (!condition) branch(ip, rel);
 			break;
@@ -420,7 +425,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			uint8 cleanup = code[ip++];
 			if (id != 192) {
 				debug(1, "ToolBook: variadic builtin %u @0x%x пока не реализован",
-						id, handler.code + ip - 4);
+						id, ip - 4);
 				return false;
 			}
 			// Aggregate constructor: cleanup includes flag/count words and N
@@ -439,7 +444,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value module = pop();
 				if ((!module.isString && !module.isObject) || !descriptor.hasReference) {
 					debug(1, "ToolBook: builtin 8 binding operands пока не реализованы @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				uint32 base = descriptor.reference;
@@ -495,7 +500,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				if ((!left.isString && !isNullValue(left)) ||
 						(!right.isString && !isNullValue(right))) {
 					debug(1, "ToolBook: builtin 63 non-string operands пока не реализованы @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				pushString((isNullValue(left) ? Common::String() : left.string) + " " +
@@ -517,7 +522,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				if ((!haystack.isString && !haystack.isObject) ||
 						(!needle.isString && !needle.isObject)) {
 					debug(1, "ToolBook: builtin 190 non-string operands @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				Common::String foldedHaystack = haystack.string;
@@ -545,7 +550,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value value = pop();
 				if (selector.number != 0x401b) {
 					debug(1, "ToolBook: builtin 144 selector %04x пока не реализован @0x%x",
-							selector.number, handler.code + ip - 3);
+							selector.number, ip - 3);
 					return false;
 				}
 				stack.push_back(value);
@@ -553,7 +558,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value value = pop();
 				if (!value.isString && !value.isObject) {
 					debug(1, "ToolBook: builtin 98 non-string conversion пока не реализован @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				value.string.toUppercase();
@@ -567,7 +572,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				if ((!left.isString && !left.isObject && !isNullValue(left)) ||
 						(!right.isString && !right.isObject && !isNullValue(right))) {
 					debug(1, "ToolBook: builtin 62 non-string operands пока не реализованы @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				pushString((isNullValue(left) ? Common::String() : left.string) +
@@ -580,7 +585,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value value = pop();
 				if (value.width != 10) {
 					debug(1, "ToolBook: builtin 163 non-extended operand @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				(void)outputPointer;
@@ -595,7 +600,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value iterator = pop();
 				if (upperBound.width != 10 || iterator.width != 10) {
 					debug(1, "ToolBook: builtin 206 non-extended operands @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
@@ -610,7 +615,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value first = pop();
 				if (secondTag.width != 2 || second.width != 10 || first.width != 10) {
 					debug(1, "ToolBook: builtin 69 неожиданная форма операндов @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				Value difference = first;
@@ -628,7 +633,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value propertyValue = pop();
 				Value object = pop();
 				if (object.string.empty()) {
-					debug(1, "ToolBook: builtin 139 без объекта @0x%x", handler.code + ip - 3);
+					debug(1, "ToolBook: builtin 139 без объекта @0x%x", ip - 3);
 					return false;
 				}
 				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
@@ -643,7 +648,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value propertyValue = pop();
 				Value object = pop();
 				if (object.string.empty()) {
-					debug(1, "ToolBook: builtin 143 без объекта @0x%x", handler.code + ip - 3);
+					debug(1, "ToolBook: builtin 143 без объекта @0x%x", ip - 3);
 					return false;
 				}
 				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
@@ -665,7 +670,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					stack.push_back(_objectProperties[storeKey]);
 				} else {
 					debug(1, "ToolBook: свойство 0x%04x объекта «%s» не ставилось @0x%x",
-							propertyId.number, object.string.c_str(), handler.code + ip - 3);
+							propertyId.number, object.string.c_str(), ip - 3);
 					pushString(Common::String());
 				}
 						} else if (id == 212) {
@@ -679,7 +684,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// Наш 0x33 вычисляет подстроку сразу, поэтому здесь остаётся только
 				// убедиться, что на стеке материализованное строковое значение.
 				if (stack.empty()) {
-					debug(1, "ToolBook: builtin 212 без операнда @0x%x", handler.code + ip - 3);
+					debug(1, "ToolBook: builtin 212 без операнда @0x%x", ip - 3);
 					return false;
 				}
 				Value range = pop();
@@ -701,7 +706,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				} else {
 					debug(1, "ToolBook: свойство 0x%04x объекта «%s» (в «%s») не ставилось @0x%x",
 							propertyId.number, object.string.c_str(), container.string.c_str(),
-							handler.code + ip - 3);
+							ip - 3);
 					pushString(Common::String());
 				}
 						} else if (id == 150) {
@@ -724,7 +729,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value propertyId = pop();
 				Value propertyValue = pop();
 				if (receiver.string.empty()) {
-					debug(1, "ToolBook: builtin 149 без получателя @0x%x", handler.code + ip - 3);
+					debug(1, "ToolBook: builtin 149 без получателя @0x%x", ip - 3);
 					return false;
 				}
 				_objectProperties[propertyKey(receiver.string, propertyId.number)] = propertyValue;
@@ -744,7 +749,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value object = pop();
 				debug(1, "ToolBook: действие 324 над «%s» (%u, %u, «%s») пока не выполняется @0x%x",
 						object.string.c_str(), first.number, second.number,
-						valueString(value).c_str(), handler.code + ip - 3);
+						valueString(value).c_str(), ip - 3);
 			} else if (id == 346) {
 				// Действие над объектом (RUN67:0x12d0, `retf 4`): объект проверяется на
 				// пустую ссылку (1, 0x400), затем зовётся общий исполнитель
@@ -753,7 +758,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 				Value object = pop();
 				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется 	0x%x",
-						object.string.c_str(), handler.code + ip - 3);
+						object.string.c_str(), ip - 3);
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
@@ -764,7 +769,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value needle = pop();
 				if (!haystack.isString || !needle.isString) {
 					debug(1, "ToolBook: builtin 106 нестроковые операнды @0x%x",
-							handler.code + ip - 3);
+							ip - 3);
 					return false;
 				}
 				const char *at = needle.string.empty() ? nullptr :
@@ -785,7 +790,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value copyFlag = pop();
 				if (!destination.buffer || !_nativeBuffers.contains(destination.buffer)) {
 					debug(1, "ToolBook: builtin 116 приёмник не буфер (%u) @0x%x",
-							destination.buffer, handler.code + ip - 3);
+							destination.buffer, ip - 3);
 					return false;
 				}
 				NativeBuffer &buffer = _nativeBuffers[destination.buffer];
@@ -793,7 +798,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				if (truth(copyFlag)) {
 					if (!source.isString) {
 						debug(1, "ToolBook: builtin 116 источник не строка @0x%x",
-								handler.code + ip - 3);
+								ip - 3);
 						return false;
 					}
 					uint32 count = from >= buffer.data.size() ? 0 :
@@ -823,7 +828,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value value = pop();
 				if (action.number != 12 || truth(value)) {
 					debug(1, "ToolBook: builtin 127 action %u/value пока не реализован @0x%x",
-							action.number, handler.code + ip - 3);
+							action.number, ip - 3);
 					return false;
 				}
 				_runtimeAction12 = true;
@@ -842,7 +847,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value notifyReceiver = pop();
 				Value commandValue = pop();
 				if (!commandValue.isString) {
-					debug(1, "ToolBook: callMCI non-string command @0x%x", handler.code + ip - 3);
+					debug(1, "ToolBook: callMCI non-string command @0x%x", ip - 3);
 					return false;
 				}
 				Common::String command = commandValue.string;
@@ -869,7 +874,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				(void)notifyReceiver;
 			} else {
 				debug(1, "ToolBook: builtin %u @0x%x пока не реализован",
-						id, handler.code + ip - 3);
+						id, ip - 3);
 				// Верхушка стека — операнды нереализованного builtin: печатаем их,
 				// чтобы барьер сразу показывал, с чем его зовут.
 				for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 8; v--, n++)
@@ -972,7 +977,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			}
 			else {
 				debug(1, "ToolBook: aggregate index mode %u/%u пока не реализован @0x%x",
-						mode, index.number, handler.code + ip - 2);
+						mode, index.number, ip - 2);
 				return false;
 			}
 			break;
@@ -990,7 +995,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			Value text = pop();
 			if (unit != 0 || !text.isString) {
 				debug(1, "ToolBook: опкод 0x35 единица %u/строка %d @0x%x",
-						unit, text.isString, handler.code + ip - 2);
+						unit, text.isString, ip - 2);
 				return false;
 			}
 			uint32 first = from.number > 0 ? from.number - 1 : 0;
@@ -1088,13 +1093,13 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// (ledger/0054). Десятибайтовое число -> слово.
 				if (stack.back().width != 10) {
 					debug(1, "ToolBook: opcode 71 form %04x non-extended input @0x%x",
-							form, handler.code + ip - 3);
+							form, ip - 3);
 					return false;
 				}
 				stack.back().width = 2;
 			} else {
 				debug(1, "ToolBook: opcode 71 form %04x @0x%x пока не реализована",
-						form, handler.code + ip - 3);
+						form, ip - 3);
 				return false;
 			}
 			break;
@@ -1126,7 +1131,7 @@ case 0x48: {
 			// аргументов (+6), u16 по цели (+8) и указатель на строку цель+2
 			// (+2/+4). То есть по цели лежит `[u16 селектор][имя\0]`.
 			uint16 rel = read16(ip);
-			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
+			uint32 nameTarget = (uint32)((int32)(ip + 2) + (int16)rel);
 			uint8 count = code[ip + 2];
 			ip += 3;
 uint16 selector = _book->readUint16(nameTarget);
@@ -1134,7 +1139,7 @@ uint16 selector = _book->readUint16(nameTarget);
 			if (count) {
 				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
 				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
-						name.c_str(), count, handler.code + ip - 3);
+						name.c_str(), count, ip - 3);
 				return false;
 			}
 			// Получателя кладут предыдущие инструкции: RUN31:0x0194 снимает со стека
@@ -1151,7 +1156,7 @@ uint16 selector = _book->readUint16(nameTarget);
 				messageTarget = _book->findScriptHandler(handler.ownerScriptRecord, selector);
 			if (!messageTarget) {
 				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено @0x%x",
-						name.c_str(), selector, receiverName.c_str(), handler.code + ip - 3);
+						name.c_str(), selector, receiverName.c_str(), ip - 3);
 				return false;
 			}
 			(void)messageContext;
@@ -1166,7 +1171,7 @@ uint16 selector = _book->readUint16(nameTarget);
 		}
 		case 0x6d: {
 			uint16 rel = read16(ip);
-			uint32 nameTarget = handler.code + (uint16)(ip + 2 + rel);
+			uint32 nameTarget = (uint32)((int32)(ip + 2) + (int16)rel);
 			uint8 kind = code[ip + 2];
 			uint16 argumentBytes = read16(ip + 3);
 			ip += 5;
@@ -1180,7 +1185,7 @@ uint16 selector = _book->readUint16(nameTarget);
 					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
 			if (kind == 1 && !scriptTarget && _nativeFunctions.contains(key))
 				debug(3, "ToolBook: платформенный вызов %s @0x%x", name.c_str(),
-						handler.code + ip - 6);
+						ip - 6);
 			if (kind == 1 && (scriptTarget || _nativeFunctions.contains(key))) {
 				// The linked thunk has its own marshalling signature. It is not
 				// equal to the wire's explicit byte count: a property-style call
@@ -1202,7 +1207,7 @@ uint16 selector = _book->readUint16(nameTarget);
 					for (int i = (int)args.size() - 1; i >= 0; i--)
 						orderedArgs.push_back(args[i]);
 					Value callResult;
-					debug(3, "ToolBook: вызов обработчика %s @0x%x", name.c_str(), handler.code + ip - 6);
+					debug(3, "ToolBook: вызов обработчика %s @0x%x", name.c_str(), ip - 6);
 					if (!runHandler(*scriptTarget, orderedArgs, callReceiver,
 							scriptTarget->returnsValue ? &callResult : nullptr, depth + 1))
 						return false;
@@ -1481,7 +1486,7 @@ uint16 selector = _book->readUint16(nameTarget);
 					pushString(fontList);
 				} else {
 					debug(1, "ToolBook: native function %s пока не реализована @0x%x",
-							name.c_str(), handler.code + ip - 6);
+							name.c_str(), ip - 6);
 					// Аргументы уже сняты со стека в порядке, обратном исходному:
 					// печатаем их, чтобы следующий барьер сразу показывал, чего от него
 					// хотят, и не требовал отдельного прогона с пробой.
@@ -1493,7 +1498,7 @@ uint16 selector = _book->readUint16(nameTarget);
 				}
 			} else {
 				debug(1, "ToolBook: named dispatch %s kind %u/%u пока не реализован @0x%x",
-						name.c_str(), kind, argumentBytes, handler.code + ip - 6);
+						name.c_str(), kind, argumentBytes, ip - 6);
 				return false;
 			}
 			break;
@@ -1507,7 +1512,7 @@ uint16 selector = _book->readUint16(nameTarget);
 			stack.back().width = 4;
 			break;
 		default:
-			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, handler.code + ip - 1);
+			debug(1, "ToolBook: OpenScript opcode %02x @0x%x пока не реализован", op, ip - 1);
 			// Верхушка стека — то, с чем зовут неизвестный опкод.
 			for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 6; v--, n++)
 				debug(1, "    стек [-%d]: ширина %u тип %02x число %u стр «%s»",
