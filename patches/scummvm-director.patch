@@ -858,10 +858,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..de81a8c2
+index 00000000..507e3f2c
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,1720 @@
+@@ -0,0 +1,1732 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1364,6 +1364,18 @@ index 00000000..de81a8c2
 +		if (owner->handlers[i].eventHash == selector)
 +			return &owner->handlers[i];
 +	return nullptr;
++}
++
++Common::Array<Object> Book::objectsAround(const Common::String &objectName) const {
++	Common::Array<Object> out;
++	for (uint i = 0; i < _heapSegments.size(); i++) {
++		Common::Array<Object> here;
++		appendSegmentObjects(_heapSegments[i].base, here);
++		for (uint k = 0; k < here.size(); k++)
++			if (here[k].name.equalsIgnoreCase(objectName))
++				return here;
++	}
++	return out;
 +}
 +
 +Common::Array<Object> Book::objectsOfSegment(const Common::String &name) const {
@@ -2584,10 +2596,10 @@ index 00000000..de81a8c2
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..9de10212
+index 00000000..2afd9a7d
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,297 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2818,6 +2830,8 @@ index 00000000..9de10212
 +	const Handler *findHandlerByCode(uint32 code) const;
 +	/// Объекты сегмента кучи с таким именем (фон-диалог показывается поверх страницы).
 +	Common::Array<Object> objectsOfSegment(const Common::String &name) const;
++	/// Объекты того сегмента, где лежит объект с таким именем.
++	Common::Array<Object> objectsAround(const Common::String &objectName) const;
 +	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
 +	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 +	const Common::Array<Common::String> &classNames() const { return _classNames; }
@@ -3062,10 +3076,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..42e8b3b9
+index 00000000..7ddb7c2b
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2362 @@
+@@ -0,0 +1,2364 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3827,11 +3841,13 @@ index 00000000..42e8b3b9
 +				// пока не прочитано; значения не возвращает и на ветвление не влияет,
 +				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 +				Value object = pop();
-+				// RUN30:0x02c8 обходит объект и его потомков, вызывая переданный
-+				// обработчик. Что именно он делает с каждым узлом, не прочитано;
-+				// проба «это показ фона» не подтвердилась (ledger/0071).
-+				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется @0x%x",
-+						object.string.c_str(), ip - 3);
++				// 346 обходит объект и его потомков (RUN30:0x02c8). Что делает в узле —
++				// не прочитано, но объект книга называет по имени, и рисовать надо тот
++				// сегмент, где он лежит: диалог — это отдельный набор объектов.
++				_shownOverlay = object.string;
++				_needsRedraw = true;
++				debug(2, "ToolBook: действие 346 над «%s» (объектов в его сегменте %u)",
++						object.string.c_str(), _book->objectsAround(object.string).size());
 +						} else if (id == 175) {
 +				// Запуск внешней программы (RUN83:0x0000 -> MTB40BAS.157). Книга так
 +				// показывает вступительный ролик `.\demo\knt_demo.exe` — отдельный
@@ -5287,7 +5303,7 @@ index 00000000..42e8b3b9
 +	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
 +	// отдельным Background, а страница под ним остаётся.
 +	if (!_shownOverlay.empty()) {
-+		Common::Array<Object> extra = _book->objectsOfSegment(_shownOverlay);
++		Common::Array<Object> extra = _book->objectsAround(_shownOverlay);
 +		for (uint o = 0; o < extra.size(); o++) {
 +			const Object &obj = extra[o];
 +			if (!obj.picture || obj.image < 0)
