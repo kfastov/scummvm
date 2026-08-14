@@ -2232,12 +2232,18 @@ void ToolBookEngine::showPage(int index) {
 		// затем — сегмент, где лежит объект с таким именем.
 		Common::Array<Object> extra;
 		int overlayPage = findPageIndex(_shownOverlay);
+		debug(3, "ПОВЕРХ: «%s» страница %d", _shownOverlay.c_str(), overlayPage);
 		if (overlayPage >= 0)
 			extra = _book->pages()[overlayPage].objects;
 		else
 			extra = _book->objectsAround(_shownOverlay);
 		for (uint o = 0; o < extra.size(); o++) {
 			const Object &obj = extra[o];
+			debug(3, "ПОВЕРХ: объект «%s» индекс=%d raw=%u comp=%u бит=%u",
+					obj.name.c_str(), obj.image,
+					obj.image >= 0 ? _book->images()[obj.image].rawSize : 0,
+					obj.image >= 0 ? _book->images()[obj.image].compSize : 0,
+					obj.image >= 0 ? _book->images()[obj.image].depth : 0);
 			if (!obj.picture || obj.image < 0)
 				continue;
 			Graphics::Palette palette(256);
@@ -2245,6 +2251,8 @@ void ToolBookEngine::showPage(int index) {
 					const_cast<Image &>(_book->images()[obj.image]), palette);
 			if (!img || !img->format.isCLUT8()) {
 				if (img) { img->free(); delete img; }
+				debug(3, "ПОВЕРХ: декодер не дал картинку %d (img=%d)",
+						obj.image, img != nullptr);
 				continue;
 			}
 			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
