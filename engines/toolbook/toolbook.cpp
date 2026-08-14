@@ -1058,6 +1058,9 @@ uint16 selector = _book->readUint16(nameTarget);
 			uint16 selector = _book->readUint16(nameTarget);
 			const Handler *scriptTarget = kind == 1 && handler.ownerScriptRecord ?
 					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
+			if (kind == 1 && !scriptTarget && _nativeFunctions.contains(key))
+				debug(3, "ToolBook: платформенный вызов %s @0x%x", name.c_str(),
+						handler.code + ip - 6);
 			if (kind == 1 && (scriptTarget || _nativeFunctions.contains(key))) {
 				// The linked thunk has its own marshalling signature. It is not
 				// equal to the wire's explicit byte count: a property-style call
