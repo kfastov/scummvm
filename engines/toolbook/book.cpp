@@ -1366,7 +1366,7 @@ static uint32 unpackRLE(const byte *src, uint32 srcLen, byte *dst, uint32 dstLen
 }
 
 // Сколько байт выхода даст поток, если считать его кусками с числом записей.
-static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
+static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want, uint32 *consumed = nullptr) {
 	uint32 in = 0, out = 0;
 	while (out < want && in + 2 <= srcLen) {
 		uint32 records = src[in] | (src[in + 1] << 8);
@@ -1389,6 +1389,8 @@ static uint32 probeChunks(const byte *src, uint32 srcLen, uint32 want) {
 				return 0;
 		}
 	}
+	if (consumed)
+		*consumed = in;
 	return out;
 }
 
@@ -1452,6 +1454,26 @@ bool Book::locatePixels(Image &img) {
 			debug(1, "ToolBook: huge-span картинки @0x%x: поток @0x%x, %u -> %u байт",
 					img.offset, s, img.compSize, img.rawSize);
 			return true;
+		}
+	}
+
+	// Второй признак: у картинки известен и сжатый размер. Требовать совпадения
+	// **обоих** — выход ровно `rawSize` и вход ровно `compSize` — гораздо надёжнее,
+	// чем одного размера (0029), и позволяет искать в широком окне: у рамки диалога
+	// поток лежит на +1028 и не начинается с заголовка блока (ledger/0075).
+	if (img.compSize) {
+		for (uint32 shift = 4; shift <= 8192; shift++) {
+			uint32 s = afterPal + shift;
+			if (s + 8 >= _data.size())
+				break;
+			uint32 used = 0;
+			uint32 got = probeChunks(&_data[s], MIN<uint32>(_data.size() - s, img.rawSize + 65536),
+					img.rawSize, &used);
+			if (got == img.rawSize && used == img.compSize) {
+				img.pixels = s;
+				img.chunked = true;
+				return true;
+			}
 		}
 	}
 
