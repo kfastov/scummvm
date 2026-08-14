@@ -671,19 +671,21 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					// оставлены без имени: движок называет их в логе, а не угадывает.
 					const Object *object = findCurrentObject(value.string);
 					Common::String className;
-					if (object) {
-						switch (object->type) {
-						case 0x09: className = "button"; break;
-						case 0x0a: className = "field"; break;
-						case 0x15: className = "picture"; break;
-						default:
-							debug(1, "ToolBook: имя класса для типа 0x%02x («%s») неизвестно @0x%x",
-									object->type, value.string.c_str(), ip - 3);
-							break;
-						}
-					} else {
-						debug(1, "ToolBook: объект «%s» для имени класса не найден @0x%x",
-								value.string.c_str(), ip - 3);
+					switch (object ? object->type : 0) {
+					case 0x09: className = "button"; break;
+					case 0x0a: className = "field"; break;
+					case 0x15: className = "picture"; break;
+					default:
+						break;
+					}
+					if (className.empty()) {
+						// Пустое имя класса — не «никакой класс», а «мы не знаем».
+						// Книга сравнивает это значение с именем класса, и пустая
+						// строка молча увела бы её в чужую ветку. Останавливаем
+						// обработчик, как и на любой неразобранной операции.
+						debug(1, "ToolBook: имя класса объекта «%s» (тип 0x%02x) не разобрано @0x%x",
+								value.string.c_str(), object ? object->type : 0, ip - 3);
+						return false;
 					}
 					pushString(className);
 				} else if (selector.number == 0x401b) {
