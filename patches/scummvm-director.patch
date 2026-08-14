@@ -858,10 +858,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..0cdff31f
+index 00000000..de81a8c2
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,1710 @@
+@@ -0,0 +1,1720 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -1364,6 +1364,16 @@ index 00000000..0cdff31f
 +		if (owner->handlers[i].eventHash == selector)
 +			return &owner->handlers[i];
 +	return nullptr;
++}
++
++Common::Array<Object> Book::objectsOfSegment(const Common::String &name) const {
++	Common::Array<Object> out;
++	for (uint i = 0; i < _heapSegments.size(); i++)
++		if (_heapSegments[i].name.equalsIgnoreCase(name)) {
++			appendSegmentObjects(_heapSegments[i].base, out);
++			break;
++		}
++	return out;
 +}
 +
 +const Handler *Book::findHandlerByCode(uint32 code) const {
@@ -2574,10 +2584,10 @@ index 00000000..0cdff31f
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..7b4026e3
+index 00000000..9de10212
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,295 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2806,6 +2816,8 @@ index 00000000..7b4026e3
 +	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
 +	/// Обработчик по адресу его кода (посылка разрешается в адрес, ledger/0069).
 +	const Handler *findHandlerByCode(uint32 code) const;
++	/// Объекты сегмента кучи с таким именем (фон-диалог показывается поверх страницы).
++	Common::Array<Object> objectsOfSegment(const Common::String &name) const;
 +	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
 +	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 +	const Common::Array<Common::String> &classNames() const { return _classNames; }
@@ -3050,10 +3062,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..69c281b0
+index 00000000..42e8b3b9
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2336 @@
+@@ -0,0 +1,2362 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3815,6 +3827,9 @@ index 00000000..69c281b0
 +				// пока не прочитано; значения не возвращает и на ветвление не влияет,
 +				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 +				Value object = pop();
++				// RUN30:0x02c8 обходит объект и его потомков, вызывая переданный
++				// обработчик. Что именно он делает с каждым узлом, не прочитано;
++				// проба «это показ фона» не подтвердилась (ledger/0071).
 +				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется @0x%x",
 +						object.string.c_str(), ip - 3);
 +						} else if (id == 175) {
@@ -5269,6 +5284,29 @@ index 00000000..69c281b0
 +		drawn = true;
 +	}
 +
++	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
++	// отдельным Background, а страница под ним остаётся.
++	if (!_shownOverlay.empty()) {
++		Common::Array<Object> extra = _book->objectsOfSegment(_shownOverlay);
++		for (uint o = 0; o < extra.size(); o++) {
++			const Object &obj = extra[o];
++			if (!obj.picture || obj.image < 0)
++				continue;
++			Graphics::Palette palette(256);
++			Graphics::Surface *img = _book->decodeImage(
++					const_cast<Image &>(_book->images()[obj.image]), palette);
++			if (!img || !img->format.isCLUT8()) {
++				if (img) { img->free(); delete img; }
++				continue;
++			}
++			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
++			blitTransparent(screen, *img, obj.rect.left, obj.rect.top, 253);
++			img->free();
++			delete img;
++			drawn = true;
++		}
++	}
++
 +	// ToolBook Fields are native text overlays; their frame and labels are
 +	// already part of the surrounding Picture DIB. Draw only the mutable text.
 +	const Graphics::Font *fieldFont = _fieldFont;
@@ -5392,10 +5430,10 @@ index 00000000..69c281b0
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..e3868239
+index 00000000..67af3641
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,184 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -5549,6 +5587,8 @@ index 00000000..e3868239
 +	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
 +	Audio::SoundHandle _mediaHandle;
 +	Common::String _playingAlias;
++	/// Имя объекта, который книга показала последним действием 346.
++	Common::String _shownOverlay;
 +	void playMedia(const Common::String &alias);
 +	void stopMedia(const Common::String &alias);
 +	bool _runtimeAction12 = false;
