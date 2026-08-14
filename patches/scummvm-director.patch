@@ -3031,10 +3031,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..1448f5b3
+index 00000000..51d4a7ca
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,1908 @@
+@@ -0,0 +1,1981 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3396,7 +3396,12 @@ index 00000000..1448f5b3
 +			uint32 reference = handler.code + (uint16)(ip + rel);
 +			Common::String literal;
 +			if (op != 0x08 || !parseNativeDescriptor(reference, nullptr))
-+				literal = _book->handlerString(handler, reference);
++				// RUN34:0x0f38 и 0x0f60 кладут указатель ровно на байты по
++				// ссылке (`lodsw; add ax,si; push ax`) — никакого пропуска
++				// двухбайтового хеша тут нет. Прежняя догадка «если байт не
++				// буква, пропустить два» ломала односимвольные литералы вроде
++				// «\\»: сравнение брало соседнюю строку (ledger/0063).
++				literal = _book->readString(reference, 255);
 +			pushReference(reference, literal,
 +					op == 0x07 ? 2 : 4);
 +			break;
@@ -3517,6 +3522,9 @@ index 00000000..1448f5b3
 +				Value b = pop(), a = pop();
 +				bool eq = a.isString || a.isObject || b.isString || b.isObject ?
 +						a.string.equalsIgnoreCase(b.string) : a.number == b.number;
++				debug(4, "ToolBook: сравнение %u: «%s»(стр=%d,чис=%u) и «%s»(стр=%d,чис=%u) -> равны=%d",
++						id, valueString(a).c_str(), a.isString, a.number,
++						valueString(b).c_str(), b.isString, b.number, eq);
 +				pushNumber((id == 194 ? eq : !eq) ? 1 : 0, 2);
 +			} else if (id == 63) { // ToolBook `&&`: concatenate with one space
 +				Value right = pop();
@@ -3697,6 +3705,71 @@ index 00000000..1448f5b3
 +							propertyId.number, object.string.c_str(), handler.code + ip - 3);
 +					pushString(Common::String());
 +				}
++						} else if (id == 212) {
++				// Материализация текстового диапазона. У оригинала опкод 0x33 строит
++				// описатель (совокупность, единица измерения, номер), а RUN86:0x00ea
++				// его исполняет: берёт длину исходной строки (KERNEL.90), ищет границы
++				// (MTB40BAS.69) и собирает значение (MTB40BAS.109/106). По всей книге
++				// 212 вызывается ровно после 0x33 — восемь раз с `char -1` и дважды с
++				// единицей 1 (ledger/0063).
++				//
++				// Наш 0x33 вычисляет подстроку сразу, поэтому здесь остаётся только
++				// убедиться, что на стеке материализованное строковое значение.
++				if (stack.empty()) {
++					debug(1, "ToolBook: builtin 212 без операнда @0x%x", handler.code + ip - 3);
++					return false;
++				}
++				Value range = pop();
++				if (!range.isString)
++					range.string = valueString(range);
++				range.isString = true;
++				range.width = 4;
++				stack.push_back(range);
++						} else if (id == 152) {
++				// Чтение свойства у объекта, названного внутри другого (RUN66:0x103a —
++				// тот же сегмент, что и обычное чтение 140, и та же ветвь по классу).
++				// Со стека снимаются номер свойства, объект и вместилище.
++				Value propertyId = pop();
++				Value object = pop();
++				Value container = pop();
++				Common::String storeKey = propertyKey(object.string, propertyId.number);
++				if (_objectProperties.contains(storeKey)) {
++					stack.push_back(_objectProperties[storeKey]);
++				} else {
++					debug(1, "ToolBook: свойство 0x%04x объекта «%s» (в «%s») не ставилось @0x%x",
++							propertyId.number, object.string.c_str(), container.string.c_str(),
++							handler.code + ip - 3);
++					pushString(Common::String());
++				}
++						} else if (id == 150) {
++				// Ещё одна форма чтения свойства (RUN66:0x0dea, тот же сегмент разбора
++				// свойств): со стека снимаются номер и значение, называющее объект.
++				Value propertyId = pop();
++				Value object = pop();
++				Common::String storeKey = propertyKey(valueString(object), propertyId.number);
++				if (_objectProperties.contains(storeKey)) {
++					stack.push_back(_objectProperties[storeKey]);
++				} else {
++					debug(1, "ToolBook: свойство 0x%04x у «%s» не ставилось (builtin 150)",
++							propertyId.number, valueString(object).c_str());
++					pushString(Common::String());
++				}
++						} else if (id == 149) {
++				// Запись свойства без явного объекта (RUN81:0x0c0a — сегмент записи
++				// свойств): со стека снимаются номер и значение, объект берётся из
++				// получателя текущего обработчика.
++				Value propertyId = pop();
++				Value propertyValue = pop();
++				if (receiver.string.empty()) {
++					debug(1, "ToolBook: builtin 149 без получателя @0x%x", handler.code + ip - 3);
++					return false;
++				}
++				_objectProperties[propertyKey(receiver.string, propertyId.number)] = propertyValue;
++				debug(2, "ToolBook: свойство 0x%04x получателя «%s» := «%s»",
++						propertyId.number, receiver.string.c_str(),
++						valueString(propertyValue).c_str());
++				if (op != 0x21)
++					stack.push_back(propertyValue);
 +						} else if (id == 106) {
 +				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 +				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
