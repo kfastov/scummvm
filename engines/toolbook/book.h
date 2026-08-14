@@ -226,6 +226,8 @@ public:
 	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
 	/// Обработчик по адресу его кода (посылка разрешается в адрес, ledger/0069).
 	const Handler *findHandlerByCode(uint32 code) const;
+	/// Объекты сегмента кучи с таким именем (фон-диалог показывается поверх страницы).
+	Common::Array<Object> objectsOfSegment(const Common::String &name) const;
 	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
 	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }

@@ -151,6 +151,8 @@ private:
 	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
 	Audio::SoundHandle _mediaHandle;
 	Common::String _playingAlias;
+	/// Имя объекта, который книга показала последним действием 346.
+	Common::String _shownOverlay;
 	void playMedia(const Common::String &alias);
 	void stopMedia(const Common::String &alias);
 	bool _runtimeAction12 = false;
