@@ -346,6 +346,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 	};
 	for (uint steps = 0; ip < handler.codeSize && steps < 10000; steps++) {
 		uint8 op = code[ip++];
+		debug(6, "ToolBook: опкод %02x @0x%x (стек %u)", op, handler.code + ip - 1, stack.size());
 		switch (op) {
 		case 0x02: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 4; stack.push_back(value); break; }
 		case 0x01: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 2; stack.push_back(value); break; }
