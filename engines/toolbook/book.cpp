@@ -423,6 +423,21 @@ const Viewer *Book::findViewer(const Common::String &name) const {
 	return nullptr;
 }
 
+Common::Array<int> Book::pagesOfBackground(const Common::String &name) const {
+	// Страницы фона идут в том порядке, в каком лежат в книге: `page 1 of
+	// background "Message"` — это первая из них. Фон опознаётся по имени своего
+	// сегмента кучи (тип 4), страница привязана к нему `backgroundSegmentBase`.
+	Common::Array<int> out;
+	for (uint s = 0; s < _heapSegments.size(); s++) {
+		if (_heapSegments[s].type != 4 || !_heapSegments[s].name.equalsIgnoreCase(name))
+			continue;
+		for (uint p = 0; p < _pages.size(); p++)
+			if (_pages[p].backgroundSegmentBase == _heapSegments[s].base)
+				out.push_back((int)p);
+	}
+	return out;
+}
+
 int Book::pageOfObject(const Common::String &objectName) const {
 	for (uint i = 0; i < _pages.size(); i++)
 		for (uint o = 0; o < _pages[i].objects.size(); o++)
