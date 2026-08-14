@@ -2026,6 +2026,12 @@ void ToolBookEngine::handleEvents() {
 					_needsRedraw = true;
 				}
 				break;
+			case Common::KEYCODE_m:
+				// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): показать страницу диалога
+				// поверх текущей — проверка модели окна глазами (ledger/0073).
+				_shownOverlay = _shownOverlay.empty() ? Common::String("message1") : Common::String();
+				_needsRedraw = true;
+				break;
 			case Common::KEYCODE_o:
 				// Рамки объектов страницы — проверка разбора прямоугольников.
 				if (ConfMan.getBool("toolbook_resource_viewer")) {
@@ -2221,7 +2227,15 @@ void ToolBookEngine::showPage(int index) {
 	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
 	// отдельным Background, а страница под ним остаётся.
 	if (!_shownOverlay.empty()) {
-		Common::Array<Object> extra = _book->objectsAround(_shownOverlay);
+		// Диалог у ToolBook — это страница фона, показанная окном поверх текущей
+		// (ledger/0072). Поэтому сначала ищем страницу с таким именем, и лишь
+		// затем — сегмент, где лежит объект с таким именем.
+		Common::Array<Object> extra;
+		int overlayPage = findPageIndex(_shownOverlay);
+		if (overlayPage >= 0)
+			extra = _book->pages()[overlayPage].objects;
+		else
+			extra = _book->objectsAround(_shownOverlay);
 		for (uint o = 0; o < extra.size(); o++) {
 			const Object &obj = extra[o];
 			if (!obj.picture || obj.image < 0)
