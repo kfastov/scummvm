@@ -759,11 +759,13 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// пока не прочитано; значения не возвращает и на ветвление не влияет,
 				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 				Value object = pop();
-				// RUN30:0x02c8 обходит объект и его потомков, вызывая переданный
-				// обработчик. Что именно он делает с каждым узлом, не прочитано;
-				// проба «это показ фона» не подтвердилась (ledger/0071).
-				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется @0x%x",
-						object.string.c_str(), ip - 3);
+				// 346 обходит объект и его потомков (RUN30:0x02c8). Что делает в узле —
+				// не прочитано, но объект книга называет по имени, и рисовать надо тот
+				// сегмент, где он лежит: диалог — это отдельный набор объектов.
+				_shownOverlay = object.string;
+				_needsRedraw = true;
+				debug(2, "ToolBook: действие 346 над «%s» (объектов в его сегменте %u)",
+						object.string.c_str(), _book->objectsAround(object.string).size());
 						} else if (id == 175) {
 				// Запуск внешней программы (RUN83:0x0000 -> MTB40BAS.157). Книга так
 				// показывает вступительный ролик `.\demo\knt_demo.exe` — отдельный
@@ -2219,7 +2221,7 @@ void ToolBookEngine::showPage(int index) {
 	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
 	// отдельным Background, а страница под ним остаётся.
 	if (!_shownOverlay.empty()) {
-		Common::Array<Object> extra = _book->objectsOfSegment(_shownOverlay);
+		Common::Array<Object> extra = _book->objectsAround(_shownOverlay);
 		for (uint o = 0; o < extra.size(); o++) {
 			const Object &obj = extra[o];
 			if (!obj.picture || obj.image < 0)
