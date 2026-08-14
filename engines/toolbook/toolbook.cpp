@@ -759,6 +759,9 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// пока не прочитано; значения не возвращает и на ветвление не влияет,
 				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 				Value object = pop();
+				// RUN30:0x02c8 обходит объект и его потомков, вызывая переданный
+				// обработчик. Что именно он делает с каждым узлом, не прочитано;
+				// проба «это показ фона» не подтвердилась (ledger/0071).
 				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется @0x%x",
 						object.string.c_str(), ip - 3);
 						} else if (id == 175) {
@@ -2211,6 +2214,29 @@ void ToolBookEngine::showPage(int index) {
 		img->free();
 		delete img;
 		drawn = true;
+	}
+
+	// Показанный книгой фон рисуется поверх страницы: у ToolBook диалог живёт
+	// отдельным Background, а страница под ним остаётся.
+	if (!_shownOverlay.empty()) {
+		Common::Array<Object> extra = _book->objectsOfSegment(_shownOverlay);
+		for (uint o = 0; o < extra.size(); o++) {
+			const Object &obj = extra[o];
+			if (!obj.picture || obj.image < 0)
+				continue;
+			Graphics::Palette palette(256);
+			Graphics::Surface *img = _book->decodeImage(
+					const_cast<Image &>(_book->images()[obj.image]), palette);
+			if (!img || !img->format.isCLUT8()) {
+				if (img) { img->free(); delete img; }
+				continue;
+			}
+			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
+			blitTransparent(screen, *img, obj.rect.left, obj.rect.top, 253);
+			img->free();
+			delete img;
+			drawn = true;
+		}
 	}
 
 	// ToolBook Fields are native text overlays; their frame and labels are
