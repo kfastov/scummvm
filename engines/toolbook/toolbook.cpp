@@ -759,7 +759,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// пока не прочитано; значения не возвращает и на ветвление не влияет,
 				// поэтому движок отмечает вызов и продолжает, ничего не выдумывая.
 				Value object = pop();
-				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется 	0x%x",
+				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется @0x%x",
 						object.string.c_str(), ip - 3);
 						} else if (id == 175) {
 				// Запуск внешней программы (RUN83:0x0000 -> MTB40BAS.157). Книга так
@@ -893,6 +893,14 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value bound = pop();
 				uint32 n = bound.number ? bound.number : 1;
 				pushNumber(_random.getRandomNumberRng(1, n), op == 0x22 ? 2 : 4);
+						} else if (id == 125) {
+				// Настройка среды по номеру (RUN95:0x0000 разбирает номер длинной
+				// цепочкой). Вызывается вариантом 0x21 — без результата, парой
+				// «значение, номер». На ветвление не влияет: отмечаем и идём дальше.
+				Value which = pop();
+				Value value = pop();
+				debug(1, "ToolBook: настройка %u := %u (builtin 125) пока не применяется 	0x%x",
+						which.number, value.number, ip - 3);
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
