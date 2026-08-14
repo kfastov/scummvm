@@ -32,6 +32,8 @@
 #include "common/error.h"
 #include "common/events.h"
 #include "common/hashmap.h"
+#include "common/random.h"
+#include "audio/mixer.h"
 #include "common/rect.h"
 
 struct ADGameDescription;
@@ -144,6 +146,13 @@ private:
 	/// нет, но наблюдаемое поведение то же: значение по паре
 	/// «объект, номер свойства» кладётся и потом читается (ledger/0056).
 	Common::HashMap<Common::String, ScriptValue> _objectProperties;
+	/// Датчик случайных чисел книги: она сама засевает его временем (builtin 50).
+	Common::RandomSource _random{"toolbook"};
+	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
+	Audio::SoundHandle _mediaHandle;
+	Common::String _playingAlias;
+	void playMedia(const Common::String &alias);
+	void stopMedia(const Common::String &alias);
 	bool _runtimeAction12 = false;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
