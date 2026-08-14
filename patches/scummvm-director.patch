@@ -3031,10 +3031,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..0585b365
+index 00000000..24b0c570
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,1875 @@
+@@ -0,0 +1,1878 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4095,6 +4095,9 @@ index 00000000..0585b365
 +			uint16 selector = _book->readUint16(nameTarget);
 +			const Handler *scriptTarget = kind == 1 && handler.ownerScriptRecord ?
 +					_book->findScriptHandler(handler.ownerScriptRecord, selector) : nullptr;
++			if (kind == 1 && !scriptTarget && _nativeFunctions.contains(key))
++				debug(3, "ToolBook: платформенный вызов %s @0x%x", name.c_str(),
++						handler.code + ip - 6);
 +			if (kind == 1 && (scriptTarget || _nativeFunctions.contains(key))) {
 +				// The linked thunk has its own marshalling signature. It is not
 +				// equal to the wire's explicit byte count: a property-style call
