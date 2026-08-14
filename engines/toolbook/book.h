@@ -228,6 +228,8 @@ public:
 	const Handler *findHandlerByCode(uint32 code) const;
 	/// Объекты сегмента кучи с таким именем (фон-диалог показывается поверх страницы).
 	Common::Array<Object> objectsOfSegment(const Common::String &name) const;
+	/// Объекты того сегмента, где лежит объект с таким именем.
+	Common::Array<Object> objectsAround(const Common::String &objectName) const;
 	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
 	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
