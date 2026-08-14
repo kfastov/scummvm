@@ -733,7 +733,19 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 						valueString(propertyValue).c_str(), id);
 				if (op != 0x21)
 					stack.push_back(propertyValue);
-						} else if (id == 346) {
+			} else if (id == 324) {
+				// RUN90:0x0276, `retf 0xc`: объект, два слова и значение. Вызывается
+				// вариантом 0x21 — без возвращаемого значения, и в обработчике
+				// сообщения это последний оператор. Что именно делает, не прочитано;
+				// на ветвление не влияет, поэтому отмечаем и идём дальше.
+				Value value = pop();
+				Value second = pop();
+				Value first = pop();
+				Value object = pop();
+				debug(1, "ToolBook: действие 324 над «%s» (%u, %u, «%s») пока не выполняется @0x%x",
+						object.string.c_str(), first.number, second.number,
+						valueString(value).c_str(), handler.code + ip - 3);
+			} else if (id == 346) {
 				// Действие над объектом (RUN67:0x12d0, `retf 4`): объект проверяется на
 				// пустую ссылку (1, 0x400), затем зовётся общий исполнитель
 				// seg30:0x02c8 с парой констант-обработчиков. Что именно он делает,
