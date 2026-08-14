@@ -163,6 +163,28 @@ struct Object {
 	Common::Array<Handler> handlers;
 };
 
+/// Окно книги (класс Viewer в таблице классов ToolBook).
+///
+/// Окна лежат отдельным сегментом кучи — тем самым `*WINDOWSEG*`, что стоит в
+/// списке служебных сегментов. Root-блок сегмента имеет тип `0x25`, а каждое
+/// окно — блок типа `0x26` длиной 0x56 байт; между ними попадаются блоки типа 0
+/// со строками. Раскладка блока та же, что у объектов страницы: имя лежит по
+/// +0x0a, ссылки разрешаются как `segmentBase + handle - 3` (ledger/0077).
+///
+/// Окно — не объект страницы, поэтому обход сегментов его не находил: диалог
+/// «Dial» искали среди объектов и не находили нигде (ledger/0076).
+struct Viewer {
+	uint32 block = 0;
+	uint32 segmentBase = 0;
+	uint16 handle = 0;
+	uint32 index = 0;              ///< порядковый номер окна, поле +6
+	Common::String name;
+	/// Выражение OpenScript из поля +0x2e: `page "Begin"`, `page "popka0"`…
+	/// У окон, которым страницу назначает скрипт (диалог `Dial`), поля нет.
+	Common::String pageExpression;
+	Common::String initialPage;    ///< имя страницы, вынутое из выражения
+};
+
 /// Страница книги.
 struct Page {
 	uint32 segmentBase = 0;
@@ -217,6 +239,11 @@ public:
 	const Common::Array<Record> &records() const { return _records; }
 	const Common::Array<Object> &objects() const { return _objects; }
 	const Common::Array<HeapSegment> &heapSegments() const { return _heapSegments; }
+	const Common::Array<Viewer> &viewers() const { return _viewers; }
+	/// Окно по имени (регистр не важен: книга пишет `Dial` и `dial`).
+	const Viewer *findViewer(const Common::String &name) const;
+	/// Страница, на которой лежит объект с таким именем; -1 — не нашлась.
+	int pageOfObject(const Common::String &objectName) const;
 	/// Все обработчики с целой таблицей строк. Пока не привязаны к страницам:
 	/// одного соседства в файле для доказуемой привязки недостаточно.
 	const Common::Array<Handler> &handlers() const { return _handlers; }
@@ -258,6 +285,7 @@ private:
 	void scanPageText();
 	void scanObjects();
 	void scanHeapSegments();
+	void scanViewers();
 	void scanHandlers();
 	void scanScriptObjects();
 	void scanScriptObjectIndex();
@@ -276,6 +304,7 @@ private:
 
 	Common::Array<Object> _objects;
 	Common::Array<HeapSegment> _heapSegments;
+	Common::Array<Viewer> _viewers;
 	Common::Array<Handler> _handlers;
 	Common::Array<ScriptObject> _scriptObjects;
 

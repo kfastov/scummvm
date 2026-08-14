@@ -75,8 +75,20 @@ private:
 		uint32 reference = 0;
 		uint32 buffer = 0;
 		Common::Array<Common::String> array;
+		/// Вместилище, в котором объект был разрешён по имени (builtin 182):
+		/// `field "Message" of page "message3"` даёт owner = «message3».
+		/// Через него читается свойство 0x4020 — «страница этого объекта».
+		Common::String owner;
+		bool isViewer = false;   ///< разрешён как класс 38 (Viewer)
 		uint8 type = 0;
 		uint8 width = 4;
+	};
+	/// Состояние окна книги. 346 открывает окно, 324 показывает, 347 закрывает;
+	/// показываемую страницу кладёт свойство 0x40d7 (ledger/0077).
+	struct ViewerState {
+		bool open = false;
+		bool visible = false;
+		Common::String page;
 	};
 	struct NativeBinding {
 		Common::String name;
@@ -151,8 +163,13 @@ private:
 	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
 	Audio::SoundHandle _mediaHandle;
 	Common::String _playingAlias;
-	/// Имя объекта, который книга показала последним действием 346.
-	Common::String _shownOverlay;
+	/// Окна книги по имени (регистр приведён к верхнему).
+	Common::HashMap<Common::String, ViewerState> _viewerStates;
+	/// Открытое и показанное окно с назначенной страницей, иначе -1.
+	int shownViewerPage() const;
+	/// Свойство 0x402e — текст поля; книга задаёт его свойством, а не вводом.
+	void setFieldProperty(const ScriptValue &object, uint32 property,
+			const ScriptValue &value);
 	void playMedia(const Common::String &alias);
 	void stopMedia(const Common::String &alias);
 	bool _runtimeAction12 = false;
