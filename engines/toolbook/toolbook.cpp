@@ -39,6 +39,8 @@
 
 #include "toolbook/book.h"
 #include "toolbook/toolbook.h"
+#include "audio/audiostream.h"
+#include "audio/decoders/wave.h"
 
 namespace ToolBook {
 
@@ -811,6 +813,86 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				const uint32 unitsPerInch = 1440, dotsPerInch = 96;
 				pushString(Common::String::format("%u,%u", unitsPerInch / dotsPerInch,
 						unitsPerInch / dotsPerInch));
+						} else if (id == 130) {
+				// Метрика среды по номеру (RUN85:0x106e). Номер 39 уходит на 0x111c,
+				// где вызывается seg1:0x06e6 — а это прямой вызов DOS `mov ah,2ch`,
+				// «получить системное время». Из ответа берутся три байта (часы,
+				// минуты, секунды) и складываются в трёхсимвольное значение
+				// (ledger/0070). Отдаём то же самое по часам системы.
+				Value which = pop();
+				if (which.number != 39) {
+					debug(1, "ToolBook: метрика %u (builtin 130) пока не реализована 	0x%x",
+							which.number, ip - 3);
+					return false;
+				}
+				TimeDate now;
+				g_system->getTimeAndDate(now);
+				char stamp[3] = { (char)now.tm_hour, (char)now.tm_min, (char)now.tm_sec };
+				pushString(Common::String(stamp, 3));
+						} else if (id == 168) {
+				// Преобразование в единицы времени (RUN80:0x0144 через MTB40BAS.94).
+				// Достигнутая форма — (значение, 0, «seconds»): книга берёт отсчёт
+				// времени в секундах. Отдаём текущее время суток по часам системы —
+				// разность двух таких вызовов и есть то, ради чего книга их делает
+				// (ledger/0070).
+				Value units = pop();
+				Value amount = pop();
+				Value source = pop();
+				Common::String unitName = valueString(units);
+				if (!unitName.equalsIgnoreCase("seconds")) {
+					debug(1, "ToolBook: преобразование в «%s» (builtin 168) пока не реализовано 	0x%x",
+							unitName.c_str(), ip - 3);
+					return false;
+				}
+				TimeDate now;
+				g_system->getTimeAndDate(now);
+				uint32 seconds = now.tm_hour * 3600u + now.tm_min * 60u + now.tm_sec +
+						amount.number;
+				(void)source;
+				pushString(Common::String::format("%u", seconds));
+			} else if (id == 71) {
+				// Остаток от деления (RUN91:0x02e2): значения грузятся как целые или
+				// двойные по признаку, затем `fdiv`, `fmul` и `fsubr` — то есть
+				// `a − (a/b)·b`. Перед этим делитель сверяется с нулём (ledger/0070).
+				Value flag = pop();
+				Value divisor = pop();
+				Value dividend = pop();
+				if (divisor.width != 10 || dividend.width != 10) {
+					debug(1, "ToolBook: builtin 71 неожиданная форма операндов 	0x%x", ip - 3);
+					return false;
+				}
+				Value result = dividend;
+				result.number = divisor.number ? dividend.number % divisor.number : 0;
+				result.type = 0x22;
+				result.width = 10;
+				(void)flag;
+				stack.push_back(result);
+						} else if (id == 50) {
+				// Засев датчика случайных чисел (RUN67:0x1054: значение уходит в
+				// seg1:0x0588, затем десять прогревочных вызовов seg1:0x05a0).
+				// Книга берёт зерно из времени (метрика 39 → секунды → остаток),
+				// поэтому просто передаём его нашему датчику (ledger/0070).
+				Value seed = pop();
+				_random.setSeed(seed.number);
+				debug(2, "ToolBook: датчик случайных чисел засеян %u", seed.number);
+						} else if (id == 86) {
+				// Число элементов списка (RUN87:0x0b76). Элементы в ToolBook разделены
+				// запятыми; книга сразу после этого берёт случайный элемент, а `0x33`
+				// с единицей измерения 1 обращается к ним по номеру (ledger/0070).
+				Value list = pop();
+				Common::String text = valueString(list);
+				uint32 items = text.empty() ? 0 : 1;
+				for (uint i = 0; i < text.size(); i++)
+					if (text[i] == ',')
+						items++;
+				pushNumber(items, op == 0x22 ? 2 : 4);
+			} else if (id == 91) {
+				// Случайное число (RUN87:0x0a7c: тот же генератор seg1:0x05a0, что
+				// прогревается при засеве, затем `fimul` на аргумент). В OpenScript
+				// `random(n)` даёт от 1 до n.
+				Value bound = pop();
+				uint32 n = bound.number ? bound.number : 1;
+				pushNumber(_random.getRandomNumberRng(1, n), op == 0x22 ? 2 : 4);
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
@@ -919,6 +1001,54 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					uint index = atoi(folded.c_str() + 17);
 					pushString(index >= 1 && index <= ARRAYSIZE(drivers) ?
 							drivers[index - 1] : Common::String());
+				} else if (folded.hasPrefix("open ")) {
+					// `open <файл> [type <драйвер>] alias <имя>` — заводим псевдоним.
+					// Разбираем ту же грамматику, что и MCI: имя файла идёт первым,
+					// после `alias` — как его будут звать дальше (ledger/0070).
+					Common::String rest(command.c_str() + 5), fileName, alias;
+					uint32 space = rest.findFirstOf(' ');
+					fileName = space == Common::String::npos ? rest : Common::String(rest.c_str(), space);
+					Common::String lowered = rest;
+					lowered.toLowercase();
+					uint32 at = lowered.find("alias ");
+					if (at != Common::String::npos) {
+						alias = Common::String(rest.c_str() + at + 6);
+						uint32 cut = alias.findFirstOf(' ');
+						if (cut != Common::String::npos)
+							alias.erase(cut);
+					}
+					if (alias.empty()) {
+						debug(1, "ToolBook: MCI open без псевдонима: %s", command.c_str());
+						return false;
+					}
+					Common::String key = alias;
+					key.toLowercase();
+					_mciAliases[key] = fileName;
+					debug(2, "ToolBook: MCI открыт «%s» как «%s»", fileName.c_str(), alias.c_str());
+					pushString(Common::String());
+				} else if (folded.hasPrefix("close ")) {
+					Common::String alias(folded.c_str() + 6);
+					uint32 cut = alias.findFirstOf(' ');
+					if (cut != Common::String::npos)
+						alias.erase(cut);
+					if (_mciAliases.contains(alias))
+						_mciAliases.erase(alias);
+					stopMedia(alias);
+					debug(2, "ToolBook: MCI закрыт «%s»", alias.c_str());
+					pushString(Common::String());
+				} else if (folded.hasPrefix("play ") || folded.hasPrefix("stop ") ||
+						folded.hasPrefix("seek ") || folded.hasPrefix("pause ")) {
+					Common::String verb(folded.c_str(), folded.findFirstOf(' '));
+					Common::String alias(folded.c_str() + verb.size() + 1);
+					uint32 cut = alias.findFirstOf(' ');
+					if (cut != Common::String::npos)
+						alias.erase(cut);
+					if (verb == "play")
+						playMedia(alias);
+					else if (verb == "stop" || verb == "pause")
+						stopMedia(alias);
+					debug(2, "ToolBook: MCI «%s» для «%s»", verb.c_str(), alias.c_str());
+					pushString(Common::String());
 				} else {
 					debug(1, "ToolBook: MCI command пока не реализована: %s", command.c_str());
 					return false;
@@ -1018,7 +1148,23 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			uint8 mode = code[ip++];
 			Value index = pop();
 			Value aggregate = pop();
-			if (mode == 2 && !aggregate.array.empty() && index.number < aggregate.array.size())
+			if (mode == 1 && aggregate.isString) {
+				// Единица 1 — элементы, разделённые запятыми; нумерация с единицы.
+				Common::String rest = aggregate.string, item;
+				uint32 wanted = index.number, seen = 1;
+				uint32 from = 0;
+				for (uint i = 0; i <= rest.size(); i++) {
+					if (i == rest.size() || rest[i] == ',') {
+						if (seen == wanted) {
+							item = Common::String(rest.c_str() + from, i - from);
+							break;
+						}
+						seen++;
+						from = i + 1;
+					}
+				}
+				pushString(item);
+			} else if (mode == 2 && !aggregate.array.empty() && index.number < aggregate.array.size())
 				pushString(aggregate.array[index.number]);
 			else if (mode == 0 && aggregate.isString && !aggregate.string.empty()) {
 				int32 at = index.number == 0xffff ? -1 : (int32)index.number;
@@ -1137,6 +1283,21 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 						(stack.back().number & 0xffff);
 				stack.back().type = 0x22;
 				stack.back().width = 10;
+} else if ((form & 0xff) == 0x11) {
+				// Подобработчик RUN34:0x2ee5 смотрит старший байт формы: при 1 и 3
+				// проверяет верхнее слово на предел 0x7fff, при 0 пропускает, иначе
+				// требует, чтобы слово было ненулевым (`cmp word ss:[bx],0`).
+				// Достигнута форма 0x0211 — именно эта проверка (ledger/0070).
+				if ((form >> 8) != 2) {
+					debug(1, "ToolBook: опкод 71 форма %04x @0x%x пока не реализована",
+							form, ip - 3);
+					return false;
+				}
+				if (stack.back().number == 0) {
+					debug(1, "ToolBook: опкод 71 форма %04x: нулевое значение @0x%x",
+							form, ip - 3);
+					return false;
+				}
 			} else if ((form & 0xff) == 0x51) {
 				// Обратное преобразование: подобработчик RUN34:0x3207 передаёт
 				// форму целиком в общий преобразователь seg30:0x078c, а тот
@@ -1171,6 +1332,18 @@ case 0x48: {
 			Value upper = pop();
 			Value lower = pop();
 			pushNumber((int32)upper.number >= (int32)lower.number ? 1 : 0, 2);
+			break;
+		}
+		case 0x4b: {
+			// RUN34:0x190a: `lodsw`, затем на стек кладутся 0,0,0, операнд и 1 —
+			// те же десять байт `[8 байт числа][u16 признак]`, что у 0x4a, только
+			// константа шириной в слово.
+			Value value;
+			value.number = read16(ip);
+			ip += 2;
+			value.type = 0x22;
+			value.width = 10;
+			stack.push_back(value);
 			break;
 		}
 				case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
@@ -1640,6 +1813,49 @@ case 0x48: {
 //     4000 key 111
 // где первое число — миллисекунды от старта. Это только воспроизводимый
 // пользовательский ввод для кадров сверки; переходы выбирает сама книга.
+void ToolBookEngine::playMedia(const Common::String &alias) {
+	// Псевдоним завёл `open` (команда MCI книги); в нём лежит путь так, как его
+	// написала книга — с обратными косыми и, возможно, с буквой диска. Дерево
+	// игры у нас плоское по каталогам установки, поэтому приводим путь к тому
+	// виду, в котором его найдёт SearchMan (ledger/0070).
+	if (!_mciAliases.contains(alias)) {
+		debug(1, "ToolBook: играть нечего — псевдоним «%s» не открыт", alias.c_str());
+		return;
+	}
+	Common::String path = _mciAliases[alias];
+	for (uint i = 0; i < path.size(); i++)
+		if (path[i] == '\\')
+			path.setChar('/', i);
+	while (path.hasPrefix("./"))
+		path.erase(0, 2);
+	Common::String lowered = path;
+	lowered.toLowercase();
+	stopMedia(alias);
+	Common::SeekableReadStream *stream = SearchMan.createReadStreamForMember(Common::Path(path));
+	if (!stream) {
+		debug(1, "ToolBook: файл «%s» не найден", path.c_str());
+		return;
+	}
+	if (lowered.hasSuffix(".wav")) {
+		Audio::AudioStream *sound = Audio::makeWAVStream(stream, DisposeAfterUse::YES);
+		if (sound) {
+			_mixer->playStream(Audio::Mixer::kSFXSoundType, &_mediaHandle, sound);
+			_playingAlias = alias;
+			debug(2, "ToolBook: звук «%s» пошёл", path.c_str());
+			return;
+		}
+	}
+	delete stream;
+	debug(1, "ToolBook: «%s» пока не проигрывается", path.c_str());
+}
+
+void ToolBookEngine::stopMedia(const Common::String &alias) {
+	if (_playingAlias != alias)
+		return;
+	_mixer->stopHandle(_mediaHandle);
+	_playingAlias.clear();
+}
+
 void ToolBookEngine::loadInputScript() {
 	_inputScriptLoaded = true;
 	if (!ConfMan.hasKey("inputscript"))
