@@ -1659,10 +1659,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..34daeb2f
+index 00000000..fc938a7a
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,1754 @@
+@@ -0,0 +1,1760 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3147,9 +3147,15 @@ index 00000000..34daeb2f
 +			return true;
 +		}
 +		uint32 end = readU16(&_data[s]);
-+		if (!img.segBase || end < 4)
++		// База сегмента известна не всегда. Её можно вывести из заголовка самого
++		// блока DIB: его поле «конец» отсчитано от базы, а заканчивается блок
++		// ровно за палитрой. Отсюда base = afterPal − end(блока DIB).
++		uint32 base = img.segBase;
++		if (!base && img.offset >= 4)
++			base = afterPal - readU16(&_data[img.offset - 4]);
++		if (!base || end < 4)
 +			break;
-+		uint32 next = img.segBase + end;
++		uint32 next = base + end;
 +		if (next <= s || next + 8 >= _data.size())
 +			break;
 +		s = next;
@@ -3899,10 +3905,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..fef9a659
+index 00000000..1e5c950f
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2378 @@
+@@ -0,0 +1,2386 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -6137,12 +6143,18 @@ index 00000000..fef9a659
 +		// затем — сегмент, где лежит объект с таким именем.
 +		Common::Array<Object> extra;
 +		int overlayPage = findPageIndex(_shownOverlay);
++		debug(3, "ПОВЕРХ: «%s» страница %d", _shownOverlay.c_str(), overlayPage);
 +		if (overlayPage >= 0)
 +			extra = _book->pages()[overlayPage].objects;
 +		else
 +			extra = _book->objectsAround(_shownOverlay);
 +		for (uint o = 0; o < extra.size(); o++) {
 +			const Object &obj = extra[o];
++			debug(3, "ПОВЕРХ: объект «%s» индекс=%d raw=%u comp=%u бит=%u",
++					obj.name.c_str(), obj.image,
++					obj.image >= 0 ? _book->images()[obj.image].rawSize : 0,
++					obj.image >= 0 ? _book->images()[obj.image].compSize : 0,
++					obj.image >= 0 ? _book->images()[obj.image].depth : 0);
 +			if (!obj.picture || obj.image < 0)
 +				continue;
 +			Graphics::Palette palette(256);
@@ -6150,6 +6162,8 @@ index 00000000..fef9a659
 +					const_cast<Image &>(_book->images()[obj.image]), palette);
 +			if (!img || !img->format.isCLUT8()) {
 +				if (img) { img->free(); delete img; }
++				debug(3, "ПОВЕРХ: декодер не дал картинку %d (img=%d)",
++						obj.image, img != nullptr);
 +				continue;
 +			}
 +			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
