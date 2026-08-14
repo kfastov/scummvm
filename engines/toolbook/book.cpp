@@ -1455,17 +1455,39 @@ bool Book::locatePixels(Image &img) {
 		}
 	}
 
+	// Ближний случай: поток начинается сразу за блоком DIB.
 	for (uint32 shift = 4; shift <= 64; shift += 2) {
 		uint32 s = afterPal + shift;
 		if (s + 8 >= _data.size())
 			break;
-		uint32 got = probeChunks(&_data[s], MIN<uint32>(_data.size() - s, img.rawSize + 65536),
-				img.rawSize);
-		if (got == img.rawSize) {
+		if (probeChunks(&_data[s], MIN<uint32>(_data.size() - s, img.rawSize + 65536),
+				img.rawSize) == img.rawSize) {
 			img.pixels = s;
 			img.chunked = true;
 			return true;
 		}
+	}
+
+	// Поток лежит блоком кучи неподалёку за блоком DIB (0044), но не обязательно
+	// следующим: у рамки диалога между ними оказался ещё один блок, и поток начался
+	// на +1028 от палитры. Поэтому идём **по заголовкам блоков**, а не по мелкому
+	// окну сдвигов: каждый блок это `[u16 конец в сегменте][u16 тип][данные]`,
+	// и данные очередного блока проверяются как начало потока (ledger/0075).
+	for (uint32 s = afterPal, guard = 0; guard < 64 && s + 8 < _data.size(); guard++) {
+		uint32 got = probeChunks(&_data[s + 4],
+				MIN<uint32>(_data.size() - s - 4, img.rawSize + 65536), img.rawSize);
+		if (got == img.rawSize) {
+			img.pixels = s + 4;
+			img.chunked = true;
+			return true;
+		}
+		uint32 end = readU16(&_data[s]);
+		if (!img.segBase || end < 4)
+			break;
+		uint32 next = img.segBase + end;
+		if (next <= s || next + 8 >= _data.size())
+			break;
+		s = next;
 	}
 
 	// В сегменте с несколькими Picture потоки лежат после всей heap-цепочки,
