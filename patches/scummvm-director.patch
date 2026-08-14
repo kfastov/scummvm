@@ -1659,10 +1659,10 @@ index 76fc57aa..e7b3d5cf 100644
  	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));
 diff --git a/engines/toolbook/book.cpp b/engines/toolbook/book.cpp
 new file mode 100644
-index 00000000..e8866346
+index 00000000..41ee9bb4
 --- /dev/null
 +++ b/engines/toolbook/book.cpp
-@@ -0,0 +1,1876 @@
+@@ -0,0 +1,1891 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -2086,6 +2086,21 @@ index 00000000..e8866346
 +		if (_viewers[i].name.equalsIgnoreCase(name))
 +			return &_viewers[i];
 +	return nullptr;
++}
++
++Common::Array<int> Book::pagesOfBackground(const Common::String &name) const {
++	// Страницы фона идут в том порядке, в каком лежат в книге: `page 1 of
++	// background "Message"` — это первая из них. Фон опознаётся по имени своего
++	// сегмента кучи (тип 4), страница привязана к нему `backgroundSegmentBase`.
++	Common::Array<int> out;
++	for (uint s = 0; s < _heapSegments.size(); s++) {
++		if (_heapSegments[s].type != 4 || !_heapSegments[s].name.equalsIgnoreCase(name))
++			continue;
++		for (uint p = 0; p < _pages.size(); p++)
++			if (_pages[p].backgroundSegmentBase == _heapSegments[s].base)
++				out.push_back((int)p);
++	}
++	return out;
 +}
 +
 +int Book::pageOfObject(const Common::String &objectName) const {
@@ -3541,10 +3556,10 @@ index 00000000..e8866346
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/book.h b/engines/toolbook/book.h
 new file mode 100644
-index 00000000..4c633a78
+index 00000000..2b168736
 --- /dev/null
 +++ b/engines/toolbook/book.h
-@@ -0,0 +1,326 @@
+@@ -0,0 +1,329 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3791,6 +3806,9 @@ index 00000000..4c633a78
 +	const Viewer *findViewer(const Common::String &name) const;
 +	/// Страница, на которой лежит объект с таким именем; -1 — не нашлась.
 +	int pageOfObject(const Common::String &objectName) const;
++	/// Страницы названного фона по порядку: книга адресует их номером
++	/// (`page 1 of background "Message"`).
++	Common::Array<int> pagesOfBackground(const Common::String &name) const;
 +	/// Все обработчики с целой таблицей строк. Пока не привязаны к страницам:
 +	/// одного соседства в файле для доказуемой привязки недостаточно.
 +	const Common::Array<Handler> &handlers() const { return _handlers; }
@@ -4050,10 +4068,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..491833ec
+index 00000000..c4eeed76
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2596 @@
+@@ -0,0 +1,2830 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4259,11 +4277,46 @@ index 00000000..491833ec
 +}
 +
 +void ToolBookEngine::dispatchObjectEvent(const Object &object, uint16 eventHash) {
++	// Сообщение ToolBook идёт вверх по иерархии: объект, его страница, её фон.
++	// Кнопки диалога своих обработчиков не имеют — `buttonClick` лежит на фоне
++	// «message», и получателем остаётся нажатый объект (ledger/0078).
++	ScriptValue receiver;
++	receiver.string = object.name;
++	receiver.isObject = true;
++	receiver.width = 4;
++
 +	for (uint i = 0; i < object.handlers.size(); i++)
 +		if (object.handlers[i].eventHash == eventHash) {
-+			runHandler(object.handlers[i]);
++			runHandler(object.handlers[i], Common::Array<ScriptValue>(), receiver, nullptr, 0);
 +			return;
 +		}
++
++	int index = pageOfObject(object);
++	if (index < 0)
++		return;
++	// В `eventHandlers` страницы лежат и её собственные root-обработчики, и
++	// обработчики фона (book.cpp: appendRootHandlers для обоих сегментов).
++	const Common::Array<Handler> &handlers = _book->pages()[index].eventHandlers;
++	for (uint i = 0; i < handlers.size(); i++)
++		if (handlers[i].eventHash == eventHash) {
++			debug(2, "ToolBook: событие 0x%04x объекта «%s» обработано страницей «%s»",
++					eventHash, object.name.c_str(), _book->pages()[index].name.c_str());
++			runHandler(handlers[i], Common::Array<ScriptValue>(), receiver, nullptr, 0);
++			return;
++		}
++}
++
++int ToolBookEngine::pageOfObject(const Object &object) const {
++	for (int which = 0; which < 2; which++) {
++		int index = which == 0 ? shownViewerPage() : _currentPage;
++		if (index < 0 || index >= (int)_book->pages().size())
++			continue;
++		const Common::Array<Object> &objects = _book->pages()[index].objects;
++		for (uint i = 0; i < objects.size(); i++)
++			if (objects[i].block == object.block)
++				return index;
++	}
++	return -1;
 +}
 +
 +// Initial executable subset of OpenScript. It contains only machine-confirmed
@@ -4524,10 +4577,22 @@ index 00000000..491833ec
 +					_nativeFunctions[functionKey] = bindings[i];
 +				}
 +				debug(2, "ToolBook: native module %s: %u bindings", key.c_str(), bindings.size());
-+			} else if (id == 180) { // page(name)
++			} else if (id == 180) { // page(context, name or index)
 +				Value name = pop();
-+				pop(); // book/context
-+				if (op != 0x21) pushString(name.string);
++				Value context = pop();
++				Common::String wanted = name.string;
++				if (!name.isString && !name.isObject) {
++					// `page N of <фон>` — не имя, а **номер страницы внутри фона**.
++					// Так книга перебирает message1…Message5, подбирая ту, где
++					// сообщение помещается в поле (ledger/0078).
++					Common::Array<int> pages = _book->pagesOfBackground(context.string);
++					if (name.number >= 1 && name.number <= pages.size())
++						wanted = _book->pages()[pages[name.number - 1]].name;
++					else
++						debug(1, "ToolBook: у фона «%s» нет страницы %u (всего %u) @0x%x",
++								context.string.c_str(), name.number, pages.size(), ip - 3);
++				}
++				if (op != 0x21) pushString(wanted);
 +			} else if (id == 177) { // background(name)
 +				Value name = pop();
 +				pop(); // book/context
@@ -4638,18 +4703,70 @@ index 00000000..491833ec
 +				// sysLevel is a ToolBook enum word. Keep the symbolic value until
 +				// enum coercion (2d) tags it as a dynamic value.
 +				pushString("Reader", 2);
++			} else if (id == 138) {
++				// Состояние окна. RUN66:0x0182 пропускает только класс 0x26 и зовёт
++				// seg24:0x06c6; там для 0x4035, 0x4127 и 0x40d8 сначала разрешается
++				// живая запись окна (seg23:0x13dc), и если её нет — ответ ложь.
++				// То есть это вопросы «окно открыто?» и «показано?»: 324 пишет
++				// 0x4035, а кнопка диалога спрашивает 0x4127 перед закрытием
++				// (ledger/0078).
++				Value selector = pop();
++				Value object = pop();
++				Common::String key = uppercased(object.string);
++				bool state = false;
++				if (_viewerStates.contains(key))
++					state = selector.number == 0x4035 ? _viewerStates[key].visible :
++							_viewerStates[key].open;
++				if (selector.number != 0x4035 && selector.number != 0x4127) {
++					debug(1, "ToolBook: builtin 138 свойство 0x%04x окна «%s» не разобрано @0x%x",
++							selector.number, object.string.c_str(), ip - 3);
++					return false;
++				}
++				debug(2, "ToolBook: окно «%s» свойство 0x%04x -> %d",
++						object.string.c_str(), selector.number, state);
++				pushNumber(state ? 1 : 0, op == 0x22 ? 2 : 4);
 +			} else if (id == 144) {
 +				// RUN seg66:02fc consumes a selector W and an input D, and
 +				// returns a D. The exact serialized selector 0x401b is its
 +				// identity branch, used to obtain the current object/context.
 +				Value selector = pop();
 +				Value value = pop();
-+				if (selector.number != 0x401b) {
++				if (selector.number == 0x401c) {
++					// Имя класса объекта. Свойство лежит в базе объектов (общий путь
++					// RUN66:0x05d2 → CDBGetValueEx), но что в нём — видно по книге:
++					// во всех шестидесяти с лишним сравнениях справа стоит имя класса
++					// ToolBook — `button`, `field`, `group`, `rectangle`, `ellipse`,
++					// `paintobject`, `irregularpolygon` (ledger/0078).
++					//
++					// Имена классов и типы блоков кучи — разные нумерации, поэтому
++					// сопоставлены только те, что подтверждены: тип блока совпадает с
++					// аргументом класса у builtin 182, а объекты диалога дали
++					// 0x09 — кнопку, 0x0a — поле, 0x15 — картинку. Остальные типы
++					// оставлены без имени: движок называет их в логе, а не угадывает.
++					const Object *object = findCurrentObject(value.string);
++					Common::String className;
++					if (object) {
++						switch (object->type) {
++						case 0x09: className = "button"; break;
++						case 0x0a: className = "field"; break;
++						case 0x15: className = "picture"; break;
++						default:
++							debug(1, "ToolBook: имя класса для типа 0x%02x («%s») неизвестно @0x%x",
++									object->type, value.string.c_str(), ip - 3);
++							break;
++						}
++					} else {
++						debug(1, "ToolBook: объект «%s» для имени класса не найден @0x%x",
++								value.string.c_str(), ip - 3);
++					}
++					pushString(className);
++				} else if (selector.number == 0x401b) {
++					stack.push_back(value);
++				} else {
 +					debug(1, "ToolBook: builtin 144 selector %04x пока не реализован @0x%x",
 +							selector.number, ip - 3);
 +					return false;
 +				}
-+				stack.push_back(value);
 +			} else if (id == 98) { // Win16 AnsiUpper(string copy)
 +				Value value = pop();
 +				if (!value.isString && !value.isObject) {
@@ -4732,6 +4849,7 @@ index 00000000..491833ec
 +					debug(1, "ToolBook: builtin 139 без объекта @0x%x", ip - 3);
 +					return false;
 +				}
++				setFieldProperty(object, propertyId.number, propertyValue);
 +				_objectProperties[propertyKey(object.string, propertyId.number)] = propertyValue;
 +				debug(2, "ToolBook: свойство 0x%04x объекта «%s» := %u",
 +						propertyId.number, object.string.c_str(), propertyValue.number);
@@ -4762,13 +4880,29 @@ index 00000000..491833ec
 +				// из сериализованной записи объекта (ledger/0056).
 +				Value propertyId = pop();
 +				Value object = pop();
-+				Common::String storeKey = propertyKey(object.string, propertyId.number);
-+				if (_objectProperties.contains(storeKey)) {
-+					stack.push_back(_objectProperties[storeKey]);
++				if (propertyId.number == 0x4030 || propertyId.number == 0x41f8) {
++					// Признаки переполнения поля. Среда держит их в базе объектов
++					// (обычный `CDBGetValueEx` через seg8:0x0338), а заполняет их
++					// разметка текста, поэтому в машинном коде смысла каждого из
++					// двух не видно. Наблюдаемый договор книги однозначен: страница
++					// годится, **когда оба нуля** — цикл `myMessage` перебирает
++					// message1…Message5 и лишь потом уменьшает кегль до 10 и пишет
++					// «Не влазит сообщение». Поэтому оба признака движок считает
++					// одинаково: текст не помещается в прямоугольник поля.
++					const Object *field = findFieldObject(object);
++					bool overflow = field && !fieldTextFits(*field);
++					debug(2, "ToolBook: поле «%s» (в «%s») переполнено: %d",
++							object.string.c_str(), object.owner.c_str(), overflow);
++					pushNumber(overflow ? 1 : 0, op == 0x22 ? 2 : 4);
 +				} else {
-+					debug(1, "ToolBook: свойство 0x%04x объекта «%s» не ставилось @0x%x",
-+							propertyId.number, object.string.c_str(), ip - 3);
-+					pushString(Common::String());
++					Common::String storeKey = propertyKey(object.string, propertyId.number);
++					if (_objectProperties.contains(storeKey)) {
++						stack.push_back(_objectProperties[storeKey]);
++					} else {
++						debug(1, "ToolBook: свойство 0x%04x объекта «%s» не ставилось @0x%x",
++								propertyId.number, object.string.c_str(), ip - 3);
++						pushString(Common::String());
++					}
 +				}
 +						} else if (id == 212) {
 +				// Материализация текстового диапазона. У оригинала опкод 0x33 строит
@@ -6274,22 +6408,32 @@ index 00000000..491833ec
 +}
 +
 +const Object *ToolBookEngine::findCurrentObject(const Common::String &name) const {
-+	if (_currentPage < 0 || _currentPage >= (int)_book->pages().size())
-+		return nullptr;
-+	const Common::Array<Object> &objects = _book->pages()[_currentPage].objects;
-+	for (uint i = 0; i < objects.size(); i++)
-+		if (objects[i].name.equalsIgnoreCase(name))
-+			return &objects[i];
++	// Пока окно показано, его объекты — те, с которыми книга и игрок работают;
++	// страница под ним остаётся запасным вариантом.
++	for (int which = 0; which < 2; which++) {
++		int index = which == 0 ? shownViewerPage() : _currentPage;
++		if (index < 0 || index >= (int)_book->pages().size())
++			continue;
++		const Common::Array<Object> &objects = _book->pages()[index].objects;
++		for (uint i = 0; i < objects.size(); i++)
++			if (objects[i].name.equalsIgnoreCase(name))
++				return &objects[i];
++	}
 +	return nullptr;
 +}
 +
 +const Object *ToolBookEngine::findCurrentObject(uint32 block) const {
-+	if (!block || _currentPage < 0 || _currentPage >= (int)_book->pages().size())
++	if (!block)
 +		return nullptr;
-+	const Common::Array<Object> &objects = _book->pages()[_currentPage].objects;
-+	for (uint i = 0; i < objects.size(); i++)
-+		if (objects[i].block == block)
-+			return &objects[i];
++	for (int which = 0; which < 2; which++) {
++		int index = which == 0 ? shownViewerPage() : _currentPage;
++		if (index < 0 || index >= (int)_book->pages().size())
++			continue;
++		const Common::Array<Object> &objects = _book->pages()[index].objects;
++		for (uint i = 0; i < objects.size(); i++)
++			if (objects[i].block == block)
++				return &objects[i];
++	}
 +	return nullptr;
 +}
 +
@@ -6323,39 +6467,122 @@ index 00000000..491833ec
 +			_fieldValues.getVal(object.block) : object.initialText;
 +}
 +
++const Graphics::Font *ToolBookEngine::fieldFont(int points) const {
++	// Книга задаёт кегль в пунктах (свойство 0x400f: 12, при переполнении 10).
++	// При 96 точках на дюйм пункт — это 4/3 пикселя; шрифты кешируются, потому
++	// что цикл подбора страницы переразмечает текст на каждом шаге.
++	if (points <= 0)
++		points = 12;
++	int pixels = points * 4 / 3;
++	if (_fontCache.contains(pixels))
++		return _fontCache[pixels];
++	const Graphics::Font *font = nullptr;
++	#ifdef USE_FREETYPE2
++	font = Graphics::loadTTFFontFromArchive("LiberationSans-Regular.ttf", pixels,
++			Graphics::kTTFSizeModeCharacter, 96, 96, Graphics::kTTFRenderModeMonochrome);
++	#endif
++	if (!font)
++		font = _fieldFont;
++	_fontCache[pixels] = font;
++	return font;
++}
++
++int ToolBookEngine::fieldPoints(const Object &object) const {
++	return _fieldSizes.contains(object.block) ? _fieldSizes[object.block] : 12;
++}
++
++const Graphics::Font *ToolBookEngine::layoutField(const Object &object,
++		Common::Array<Common::U32String> &lines) const {
++	const Graphics::Font *font = fieldFont(fieldPoints(object));
++	lines.clear();
++	if (!font)
++		return nullptr;
++	Common::String value = (_fieldSelectAll && _focusedField == object.block) ?
++			Common::String() : fieldText(object);
++	// Поле ToolBook переносит текст по словам внутри своего прямоугольника;
++	// без этого длинное сообщение рисовалось одной строкой поверх рамки.
++	font->wordWrapText(value.decode(Common::kUtf8), MAX(1, object.rect.width() - 4), lines);
++	return font;
++}
++
++bool ToolBookEngine::fieldTextFits(const Object &object) const {
++	Common::Array<Common::U32String> lines;
++	const Graphics::Font *font = layoutField(object, lines);
++	if (!font)
++		return true;
++	if ((int)lines.size() * font->getFontHeight() > object.rect.height())
++		return false;
++	for (uint i = 0; i < lines.size(); i++)
++		if (font->getStringWidth(lines[i]) > object.rect.width() - 4)
++			return false;
++	return true;
++}
++
++void ToolBookEngine::drawField(Graphics::Surface *screen, const Object &object,
++		Common::Point origin) {
++	Common::Array<Common::U32String> lines;
++	const Graphics::Font *font = layoutField(object, lines);
++	if (!font)
++		return;
++	int lineHeight = font->getFontHeight();
++	int block = (int)lines.size() * lineHeight;
++	int x = object.rect.left + origin.x + 2;
++	int y = object.rect.top + origin.y + MAX(0, (object.rect.height() - block) / 2);
++	// Выключка не читается: в сериализованной записи поля она есть, но книга её
++	// не задаёт, а умолчание ToolBook — по левому краю.
++	for (uint i = 0; i < lines.size(); i++)
++		font->drawString(screen, lines[i], x, y + (int)i * lineHeight,
++				MAX(0, object.rect.width() - 4), 0);
++	if (_focusedField == object.block) {
++		Common::U32String last = lines.empty() ? Common::U32String() : lines[lines.size() - 1];
++		int caretY = y + MAX(0, (int)lines.size() - 1) * lineHeight;
++		int caret = MIN(object.rect.right + origin.x - 2, x + font->getStringWidth(last));
++		screen->drawLine(caret, caretY + 1, caret, caretY + lineHeight - 1, 0);
++	}
++}
++
++const Object *ToolBookEngine::findFieldObject(const ScriptValue &value) const {
++	// Имя поля неуникально — «Message» есть на каждой странице фона «Message», —
++	// поэтому ищем в той странице, в которой книга объект и разрешила
++	// (builtin 182 кладёт вместилище в `owner`).
++	int pageIndex = value.owner.empty() ? _book->pageOfObject(value.string) :
++			findPageIndex(value.owner);
++	if (pageIndex < 0)
++		return nullptr;
++	const Common::Array<Object> &objects = _book->pages()[pageIndex].objects;
++	for (uint i = 0; i < objects.size(); i++)
++		if (objects[i].field && objects[i].name.equalsIgnoreCase(value.string))
++			return &objects[i];
++	return nullptr;
++}
++
 +void ToolBookEngine::setFieldProperty(const ScriptValue &object, uint32 property,
 +		const ScriptValue &value) {
-+	// 0x402e — текст поля. Книга кладёт его свойством, а не вводом: обработчик
-+	// `myMessage` так раскладывает сообщение по полю «Message» той страницы,
-+	// которую потом показывает окно (ledger/0077).
-+	if (property != 0x402e)
++	// 0x402e — текст поля, 0x400f — его кегль в пунктах. Книга кладёт их
++	// свойствами, а не вводом: обработчик `myMessage` так раскладывает сообщение
++	// по полю «Message» той страницы, которую потом показывает окно
++	// (ledger/0077).
++	if (property != 0x402e && property != 0x400f)
 +		return;
-+	// Имя поля неуникально — «Message» есть на каждой странице фона, — поэтому
-+	// ищем в той странице, в которой книга объект и разрешила (builtin 182).
-+	int pageIndex = object.owner.empty() ? _book->pageOfObject(object.string) :
-+			findPageIndex(object.owner);
-+	if (pageIndex < 0) {
++	const Object *field = findFieldObject(object);
++	if (!field) {
 +		debug(1, "ToolBook: поле «%s» (в «%s») не нашлось", object.string.c_str(),
 +				object.owner.c_str());
 +		return;
 +	}
-+	const Common::Array<Object> &objects = _book->pages()[pageIndex].objects;
-+	for (uint i = 0; i < objects.size(); i++) {
-+		if (!objects[i].field || !objects[i].name.equalsIgnoreCase(object.string))
-+			continue;
++	if (property == 0x400f) {
++		_fieldSizes[field->block] = (int)value.number;
++		debug(2, "ToolBook: кегль поля «%s» := %u", field->name.c_str(), value.number);
++	} else {
 +		// Литералы книги — в CP1251, а в `_fieldValues` лежит UTF-8: там же
 +		// оказывается набранное игроком. Переводим на границе, как это делает
 +		// разбор текста страниц.
 +		Common::String text = value.isString || value.isObject ?
 +				cp1251ToUtf8(value.string) : Common::String();
-+		_fieldValues[objects[i].block] = text;
-+		_needsRedraw = true;
-+		debug(2, "ToolBook: текст поля «%s» страницы «%s» := «%s»",
-+				objects[i].name.c_str(), _book->pages()[pageIndex].name.c_str(), text.c_str());
-+		return;
++		_fieldValues[field->block] = text;
++		debug(2, "ToolBook: текст поля «%s» := «%s»", field->name.c_str(), text.c_str());
 +	}
-+	debug(1, "ToolBook: поля «%s» на странице «%s» нет", object.string.c_str(),
-+			_book->pages()[pageIndex].name.c_str());
++	_needsRedraw = true;
 +}
 +
 +int ToolBookEngine::shownViewerPage() const {
@@ -6381,17 +6608,31 @@ index 00000000..491833ec
 +
 +const Object *ToolBookEngine::objectAt(int x, int y) const {
 +	const Common::Array<Page> &pages = _book->pages();
-+	if (_imageMode || _currentPage < 0 || _currentPage >= (int)pages.size())
++	if (_imageMode)
 +		return nullptr;
 +
++	// Показанное окно лежит поверх страницы и ввод забирает себе: сначала
++	// проверяем его объекты, и только потом — страницу под ним (ledger/0078).
++	int viewer = shownViewerPage();
++	if (viewer >= 0) {
++		const Object *hit = objectIn(pages[viewer], viewerOrigin(pages[viewer]), x, y);
++		if (hit)
++			return hit;
++	}
++	if (_currentPage < 0 || _currentPage >= (int)pages.size())
++		return nullptr;
++	return objectIn(pages[_currentPage], pageOrigin(pages[_currentPage]), x, y);
++}
++
++const Object *ToolBookEngine::objectIn(const Page &page, Common::Point origin,
++		int x, int y) const {
 +	// Objects are stored in formal back-to-front child-list order. Walk that
 +	// order backwards so the topmost visible object receives the event.
-+	const Common::Array<Object> &objs = pages[_currentPage].objects;
-+	Common::Point origin = pageOrigin(pages[_currentPage]);
++	const Common::Array<Object> &objs = page.objects;
 +	for (int i = (int)objs.size() - 1; i >= 0; i--) {
 +		Common::Rect rect = objs[i].rect;
 +		rect.translate(origin.x, origin.y);
-+		if (!objectVisible(pages[_currentPage], objs[i]) || !rect.contains(x, y))
++		if (!objectVisible(page, objs[i]) || !rect.contains(x, y))
 +			continue;
 +		// У многоугольных областей рамка — только грубая отсечка: попадание
 +		// считается по обводу, иначе кнопки на карте перекрывают друг друга.
@@ -6400,6 +6641,30 @@ index 00000000..491833ec
 +		return &objs[i];
 +	}
 +	return nullptr;
++}
++
++Common::Point ToolBookEngine::viewerOrigin(const Page &page) const {
++	// Своей геометрии у диалога в таблице окон нет — все её поля нулевые (у окон
++	// с сохранённым положением там лежат 800×600 и 1024×768). Окно без положения
++	// ToolBook разворачивает по странице и ставит по центру родительского окна.
++	//
++	// Размер берётся по объектам страницы, а не по клиентскому размеру фона:
++	// у фона «message» он один (259×136), а страницы его разного размера —
++	// от 259×136 у `message1` до 449×304 у `Message5`, и по фону крупные
++	// свешивались за край экрана (ledger/0078).
++	Common::Rect box;
++	for (uint i = 0; i < page.objects.size(); i++) {
++		if (!objectVisible(page, page.objects[i]))
++			continue;
++		if (box.isEmpty())
++			box = page.objects[i].rect;
++		else
++			box.extend(page.objects[i].rect);
++	}
++	int width = box.isEmpty() ? (int)page.canvasWidth : box.right;
++	int height = box.isEmpty() ? (int)page.canvasHeight : box.bottom;
++	return Common::Point(((int)_system->getWidth() - width) / 2,
++			((int)_system->getHeight() - height) / 2);
 +}
 +
 +// Классический тест «луч вправо»: точка внутри, если пересечений нечётное число.
@@ -6491,11 +6756,19 @@ index 00000000..491833ec
 +		// (у окон с сохранённым положением там лежат 800×600 и 1024×768). Окно
 +		// без положения ToolBook разворачивает по странице и ставит по центру
 +		// родительского окна.
-+		Common::Point viewerOrigin((screen->w - (int)shown.canvasWidth) / 2,
-+				(screen->h - (int)shown.canvasHeight) / 2);
++		Common::Point windowOrigin = viewerOrigin(shown);
 +		debug(3, "ОКНО: страница «%s» %ux%u в (%d, %d), объектов %u",
 +				shown.name.c_str(), shown.canvasWidth, shown.canvasHeight,
-+				viewerOrigin.x, viewerOrigin.y, shown.objects.size());
++				windowOrigin.x, windowOrigin.y, shown.objects.size());
++		for (uint o = 0; o < shown.eventHandlers.size(); o++)
++			debug(3, "  ОКНО: обработчик страницы/фона «%s» hash=0x%04x",
++					shown.eventHandlers[o].name.c_str(), shown.eventHandlers[o].eventHash);
++		for (uint o = 0; o < shown.objects.size(); o++)
++			debug(3, "  ОКНО: объект «%s» (%d,%d)-(%d,%d)%s тип 0x%02x",
++					shown.objects[o].name.c_str(), shown.objects[o].rect.left,
++					shown.objects[o].rect.top, shown.objects[o].rect.right,
++					shown.objects[o].rect.bottom, shown.objects[o].field ? " поле" : "",
++					shown.objects[o].type);
 +		for (uint o = 0; o < shown.objects.size(); o++) {
 +			const Object &obj = shown.objects[o];
 +			if (!objectVisible(shown, obj) || !obj.picture || obj.image < 0)
@@ -6509,46 +6782,25 @@ index 00000000..491833ec
 +				continue;
 +			}
 +			_system->getPaletteManager()->setPalette(palette.data(), 0, 256);
-+			blitTransparent(screen, *img, obj.rect.left + viewerOrigin.x,
-+					obj.rect.top + viewerOrigin.y, 253);
++			blitTransparent(screen, *img, obj.rect.left + windowOrigin.x,
++					obj.rect.top + windowOrigin.y, 253);
 +			img->free();
 +			delete img;
 +			drawn = true;
 +		}
-+		if (_fieldFont) {
-+			for (uint o = 0; o < shown.objects.size(); o++) {
-+				const Object &obj = shown.objects[o];
-+				if (!obj.field || !objectVisible(shown, obj))
-+					continue;
-+				Common::U32String text = fieldText(obj).decode(Common::kUtf8);
-+				_fieldFont->drawString(screen, text, obj.rect.left + viewerOrigin.x + 2,
-+						obj.rect.top + viewerOrigin.y +
-+						MAX(0, (obj.rect.height() - _fieldFont->getFontHeight()) / 2),
-+						MAX(0, obj.rect.width() - 4), 0);
-+			}
++		for (uint o = 0; o < shown.objects.size(); o++) {
++			const Object &obj = shown.objects[o];
++			if (obj.field && objectVisible(shown, obj))
++				drawField(screen, obj, windowOrigin);
 +		}
 +	}
 +
 +	// ToolBook Fields are native text overlays; their frame and labels are
 +	// already part of the surrounding Picture DIB. Draw only the mutable text.
-+	const Graphics::Font *fieldFont = _fieldFont;
-+	if (fieldFont) {
-+		for (uint o = 0; o < page.objects.size(); o++) {
-+			const Object &obj = page.objects[o];
-+			if (!obj.field || !objectVisible(page, obj))
-+				continue;
-+			Common::String value = (_fieldSelectAll && _focusedField == obj.block) ?
-+					Common::String() : fieldText(obj);
-+			Common::U32String text = value.decode(Common::kUtf8);
-+			int x = obj.rect.left + origin.x + 2;
-+			int y = obj.rect.top + origin.y + MAX(0, (obj.rect.height() - fieldFont->getFontHeight()) / 2);
-+			fieldFont->drawString(screen, text, x, y, MAX(0, obj.rect.width() - 4), 0);
-+			if (_focusedField == obj.block) {
-+				int caret = MIN(obj.rect.right + origin.x - 2, x + fieldFont->getStringWidth(text));
-+				screen->drawLine(caret, obj.rect.top + origin.y + 3,
-+						caret, obj.rect.bottom + origin.y - 4, 0);
-+			}
-+		}
++	for (uint o = 0; o < page.objects.size(); o++) {
++		const Object &obj = page.objects[o];
++		if (obj.field && objectVisible(page, obj))
++			drawField(screen, obj, origin);
 +	}
 +
 +	if (!drawn) {
@@ -6652,10 +6904,10 @@ index 00000000..491833ec
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..4c5d9031
+index 00000000..3b32431b
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,224 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -6693,6 +6945,7 @@ index 00000000..4c5d9031
 +#include "common/random.h"
 +#include "audio/mixer.h"
 +#include "common/rect.h"
++#include "common/ustr.h"
 +
 +struct ADGameDescription;
 +
@@ -6770,12 +7023,28 @@ index 00000000..4c5d9031
 +	void drawPageInfo(Graphics::Surface *screen, int index, const struct Page &page);
 +	void drawObjectFrames(Graphics::Surface *screen, const struct Page &page);
 +	const struct Object *objectAt(int x, int y) const;
++	const struct Object *objectIn(const struct Page &page, Common::Point origin,
++			int x, int y) const;
++	/// Начало координат показанного окна на экране.
++	Common::Point viewerOrigin(const struct Page &page) const;
 +	const struct Object *findCurrentObject(const Common::String &name) const;
 +	const struct Object *findCurrentObject(uint32 block) const;
 +	bool objectVisible(const struct Page &page, const struct Object &object,
 +			uint depth = 0) const;
 +	void setObjectVisible(const Common::String &name, bool visible);
 +	Common::String fieldText(const struct Object &object) const;
++	/// Поле по значению скрипта: имя плюс вместилище из builtin 182.
++	const struct Object *findFieldObject(const ScriptValue &value) const;
++	/// Шрифт нужного кегля (в пунктах) и разметка текста поля по словам.
++	const Graphics::Font *fieldFont(int points) const;
++	int fieldPoints(const struct Object &object) const;
++	const Graphics::Font *layoutField(const struct Object &object,
++			Common::Array<Common::U32String> &lines) const;
++	/// Помещается ли текст в прямоугольник поля: этим книга выбирает страницу
++	/// диалога (свойства 0x4030 и 0x41f8, ledger/0078).
++	bool fieldTextFits(const struct Object &object) const;
++	void drawField(Graphics::Surface *screen, const struct Object &object,
++			Common::Point origin);
 +	Common::Point pageOrigin(const struct Page &page) const;
 +	static bool pointInOutline(const struct Object &obj, int x, int y);
 +	void handleEvents();
@@ -6787,6 +7056,8 @@ index 00000000..4c5d9031
 +			const ScriptValue &receiver, ScriptValue *result, uint depth);
 +	void dispatchPageEvent(uint16 eventHash);
 +	void dispatchObjectEvent(const struct Object &object, uint16 eventHash);
++	/// Страница, на которой лежит объект: сначала показанное окно, потом книга.
++	int pageOfObject(const struct Object &object) const;
 +
 +	const ADGameDescription *_desc;
 +	Book *_book = nullptr;
@@ -6803,6 +7074,9 @@ index 00000000..4c5d9031
 +	bool _showHotspots = false; ///< рамки объектов страницы, клавиша o
 +	Common::HashMap<uint32, bool> _visibilityOverrides;
 +	Common::HashMap<uint32, Common::String> _fieldValues;
++	/// Кегль поля в пунктах (свойство 0x400f), по блоку объекта.
++	Common::HashMap<uint32, int> _fieldSizes;
++	mutable Common::HashMap<int, const Graphics::Font *> _fontCache;
 +	Common::HashMap<Common::String, ScriptValue> _scriptGlobals;
 +	Common::HashMap<uint32, NativeBuffer> _nativeBuffers;
 +	uint32 _nextNativeBuffer = 1;
