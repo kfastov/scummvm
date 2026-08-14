@@ -388,8 +388,27 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			break;
 		}
 		case 0x12: { uint16 rel = read16(ip); ip += 2; branch(ip, rel); break; }
-		case 0x13: case 0x14: { uint16 rel = read16(ip); ip += 2; bool condition = truth(pop()); if ((op == 0x13 && condition) || (op == 0x14 && !condition)) branch(ip, rel); break; }
-		case 0x15: { uint16 rel = read16(ip); ip += 2; if (!truth(pop())) branch(ip, rel); break; }
+		case 0x13: case 0x14: {
+			uint16 rel = read16(ip); ip += 2;
+			Value tested = pop();
+			bool condition = truth(tested);
+			bool taken = (op == 0x13 && condition) || (op == 0x14 && !condition);
+			debug(5, "ToolBook: ветвление %02x @0x%x условие=%d («%s», число %u) переход=%d",
+					op, handler.code + ip - 3, condition, valueString(tested).c_str(),
+					tested.number, taken);
+			if (taken) branch(ip, rel);
+			break;
+		}
+		case 0x15: {
+			uint16 rel = read16(ip); ip += 2;
+			Value tested = pop();
+			bool condition = truth(tested);
+			debug(5, "ToolBook: ветвление 15 @0x%x условие=%d («%s», число %u) переход=%d",
+					handler.code + ip - 3, condition, valueString(tested).c_str(),
+					tested.number, !condition);
+			if (!condition) branch(ip, rel);
+			break;
+		}
 		case 0x20: {
 			uint16 id = read16(ip); ip += 2;
 			uint8 cleanup = code[ip++];
@@ -450,11 +469,17 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value name = pop();
 				pop();
 				if (op != 0x21) pushObject(name.string);
-			} else if (id == 194 || id == 198) { // typed `is` / ordinary equality
+			} else if (id == 194 || id == 198) {
+				// Оба идут в общий RUN91:0x1da2, различаясь одним флагом: 194
+				// кладёт 1, 198 — 0. Помощник считает равенство и в конце
+				// сравнивает его с этим флагом (`cmp ax,[bp+0ch]`), возвращая 1
+				// при совпадении. Значит **194 — равенство, а 198 —
+				// неравенство** (ledger/0062). Раньше 198 считался равенством,
+				// и книга уходила в ветку «не найден файл».
 				Value b = pop(), a = pop();
 				bool eq = a.isString || a.isObject || b.isString || b.isObject ?
 						a.string.equalsIgnoreCase(b.string) : a.number == b.number;
-				pushNumber(eq ? 1 : 0, 2);
+				pushNumber((id == 194 ? eq : !eq) ? 1 : 0, 2);
 			} else if (id == 63) { // ToolBook `&&`: concatenate with one space
 				Value right = pop();
 				Value left = pop();
@@ -1082,11 +1107,15 @@ uint16 selector = _book->readUint16(nameTarget);
 					for (int i = (int)args.size() - 1; i >= 0; i--)
 						orderedArgs.push_back(args[i]);
 					Value callResult;
+					debug(3, "ToolBook: вызов обработчика %s @0x%x", name.c_str(), handler.code + ip - 6);
 					if (!runHandler(*scriptTarget, orderedArgs, callReceiver,
 							scriptTarget->returnsValue ? &callResult : nullptr, depth + 1))
 						return false;
-					if (scriptTarget->returnsValue)
+					if (scriptTarget->returnsValue) {
+						debug(3, "ToolBook: %s вернул «%s» (число %u)", name.c_str(),
+								valueString(callResult).c_str(), callResult.number);
 						stack.push_back(callResult);
+					}
 				} else if (key == "GLOBALALLOC") {
 					// Win16 GlobalAlloc(flags, bytes). The compiled thunk exposes
 					// the OpenScript source order as size followed by flags.
