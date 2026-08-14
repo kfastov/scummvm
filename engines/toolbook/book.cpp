@@ -1482,9 +1482,15 @@ bool Book::locatePixels(Image &img) {
 			return true;
 		}
 		uint32 end = readU16(&_data[s]);
-		if (!img.segBase || end < 4)
+		// База сегмента известна не всегда. Её можно вывести из заголовка самого
+		// блока DIB: его поле «конец» отсчитано от базы, а заканчивается блок
+		// ровно за палитрой. Отсюда base = afterPal − end(блока DIB).
+		uint32 base = img.segBase;
+		if (!base && img.offset >= 4)
+			base = afterPal - readU16(&_data[img.offset - 4]);
+		if (!base || end < 4)
 			break;
-		uint32 next = img.segBase + end;
+		uint32 next = base + end;
 		if (next <= s || next + 8 >= _data.size())
 			break;
 		s = next;
