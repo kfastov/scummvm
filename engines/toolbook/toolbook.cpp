@@ -759,6 +759,58 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				Value object = pop();
 				debug(1, "ToolBook: действие 346 над «%s» пока не выполняется 	0x%x",
 						object.string.c_str(), ip - 3);
+						} else if (id == 175) {
+				// Запуск внешней программы (RUN83:0x0000 -> MTB40BAS.157). Книга так
+				// показывает вступительный ролик `.\demo\knt_demo.exe` — отдельный
+				// 16-битный EXE, которого у движка нет и быть не может. Ролик
+				// пропускается; результат — пустое значение, то есть «задача не
+				// запущена». Это ограничение платформы, а не выбор игровой ветки.
+				Value program = pop();
+				debug(1, "ToolBook: внешняя программа «%s» не запускается 	0x%x",
+						valueString(program).c_str(), ip - 3);
+				if (op != 0x21)
+					pushString(Common::String());
+			} else if (id == 180) {
+				// `page <имя>` — разрешение страницы по имени (класс 180 в таблице имён
+				// OpenScript, tools/osc.py). Возвращаем объектное значение с этим именем:
+				// дальше книга либо переходит на страницу, либо читает её свойства.
+				Value pageName = pop();
+				Common::String wanted = valueString(pageName);
+				int found = findPageIndex(wanted);
+				if (found < 0)
+					debug(1, "ToolBook: страница «%s» не найдена 	0x%x", wanted.c_str(), ip - 3);
+				Value pageValue;
+				pageValue.string = wanted;
+				pageValue.isObject = true;
+				pageValue.width = 4;
+				stack.push_back(pageValue);
+						} else if (id == 234) {
+				// RUN67:0x01a0: ставит признак `ds:[870h] = 1` и зовёт seg30:0x1048.
+				// Без аргументов и без результата — состояние показа. Отмечаем.
+				debug(2, "ToolBook: состояние показа 234 	0x%x", ip - 3);
+						} else if (id == 121) {
+				// RUN95:0x0b22, вызывается вариантом без результата с двумя словами.
+				// Что делает, не прочитано; на ветвление не влияет — отмечаем.
+				Value second = pop();
+				Value first = pop();
+				debug(1, "ToolBook: действие 121 (%u, %u) пока не выполняется 	0x%x",
+						first.number, second.number, ip - 3);
+						} else if (id == 124) {
+				// Метрика среды по номеру (RUN85:0x0b48 разбирает номер и для 0x75
+				// зовёт MTB40UTL.94 за метриками экрана, затем делит константу на
+				// разрешение и собирает пару). Номер 117 — сколько единиц ToolBook
+				// приходится на пиксель: при 96 точках на дюйм это 1440/96 = 15 по
+				// обеим осям, и книга сравнивает результат ровно со строкой «15,15».
+				// Наш экран — тот же 96 dpi, что и на эталонном стенде (ledger/0069).
+				Value which = pop();
+				if (which.number != 117) {
+					debug(1, "ToolBook: метрика %u (builtin 124) пока не реализована 	0x%x",
+							which.number, ip - 3);
+					return false;
+				}
+				const uint32 unitsPerInch = 1440, dotsPerInch = 96;
+				pushString(Common::String::format("%u,%u", unitsPerInch / dotsPerInch,
+						unitsPerInch / dotsPerInch));
 						} else if (id == 106) {
 				// RUN87:09fe, retf 8: два дальних указателя на строки. Зовёт
 				// MTB40BAS.108 и, если та вернула непустой указатель, отдаёт
@@ -1372,6 +1424,11 @@ case 0x48: {
 					debug(2, "ToolBook: setFileAttributes %s «%s» (пропущено)",
 							valueString(args[1]).c_str(), valueString(args[0]).c_str());
 					pushNumber(1);
+								} else if (key == "DISPLAYBITSPERPIXEL") {
+					// Глубина цвета экрана. Книга проверяет её на стартовых проверках и
+					// требует 256 цветов; наш экран палитровый, восьмибитный — как и на
+					// эталонном стенде (Cirrus в режиме 256 цветов).
+					pushNumber(8);
 								} else if (key == "GETINIVAR") {
 					// TB40WIN: чтение переменной из INI-файла. Порядок аргументов взят не
 					// из догадки, а из настоящего файла эталонного стенда
