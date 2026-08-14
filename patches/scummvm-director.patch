@@ -3031,10 +3031,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..ca8ba06a
+index 00000000..1448f5b3
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,1907 @@
+@@ -0,0 +1,1908 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -3383,6 +3383,7 @@ index 00000000..ca8ba06a
 +	};
 +	for (uint steps = 0; ip < handler.codeSize && steps < 10000; steps++) {
 +		uint8 op = code[ip++];
++		debug(6, "ToolBook: опкод %02x @0x%x (стек %u)", op, handler.code + ip - 1, stack.size());
 +		switch (op) {
 +		case 0x02: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 4; stack.push_back(value); break; }
 +		case 0x01: { int16 off = (int16)read16(ip); ip += 2; Value value = local(off); value.width = 2; stack.push_back(value); break; }
