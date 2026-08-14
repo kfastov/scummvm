@@ -1124,29 +1124,27 @@ case 0x48: {
 				case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
 		case 0x59: ip += 2; pushNumber(0, 2); break;
 		case 0x6c: {
-			// Посылка сообщения по имени неявному получателю. RUN34:0x4960
-			// читает u16 (смещение от байта, следующего за ним, — та же
-			// договорённость, что у 0x6d) и байт числа аргументов, после чего
-			// зовёт RUN31:0x0194 с описателем посылки: в него кладутся число
-			// аргументов (+6), u16 по цели (+8) и указатель на строку цель+2
-			// (+2/+4). То есть по цели лежит `[u16 селектор][имя\0]`.
+			// Посылка сообщения: RUN34:0x4960 читает u16 (смещение от следующего
+			// байта) и байт числа аргументов, зовёт RUN31:0x0194 и **не исполняет
+			// обработчик сам** — он лишь разрешает адрес. Передаёт управление
+			// следующий за ним опкод 0x1b, которому число байт аргументов кладут
+			// отдельной инструкцией. По всей книге это идёт связкой
+			// `6c <смещение> <число> / 04 <байт аргументов> / 1b` (ledger/0069).
+			//
+			// Поэтому здесь мы только разрешаем обработчик и кладём ссылку на него.
 			uint16 rel = read16(ip);
 			uint32 nameTarget = (uint32)((int32)(ip + 2) + (int16)rel);
 			uint8 count = code[ip + 2];
 			ip += 3;
-uint16 selector = _book->readUint16(nameTarget);
+			uint16 selector = _book->readUint16(nameTarget);
 			Common::String name = _book->readString(nameTarget + 2, 255);
 			if (count) {
 				// Ветка RUN31:0x01fb, до неё книга ещё не доходила.
-				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано @0x%x",
+				debug(1, "ToolBook: сообщение %s с %u аргументами пока не реализовано 	0x%x",
 						name.c_str(), count, ip - 3);
 				return false;
 			}
-			// Получателя кладут предыдущие инструкции: RUN31:0x0194 снимает со стека
-			// два дальних указателя (сам вызов 0x6c кладёт только 12 байт из 20) и
-			// записывает их в описатель посылки как получателя и контекст. Поэтому
-			// сообщение адресное: обработчик ищется у названного объекта, и лишь
-			// затем у себя (ledger/0055).
+			// Получателя и контекст кладут предыдущие инструкции (0055).
 			Value messageContext = pop();
 			Value messageReceiver = pop();
 			Common::String receiverName = messageReceiver.string;
@@ -1155,21 +1153,71 @@ uint16 selector = _book->readUint16(nameTarget);
 			if (!messageTarget && handler.ownerScriptRecord)
 				messageTarget = _book->findScriptHandler(handler.ownerScriptRecord, selector);
 			if (!messageTarget) {
-				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено @0x%x",
+				debug(1, "ToolBook: сообщение %s (селектор %04x) получателю «%s» не разрешено 	0x%x",
 						name.c_str(), selector, receiverName.c_str(), ip - 3);
 				return false;
 			}
 			(void)messageContext;
-						Common::Array<Value> noArguments;
-			Value messageResult;
-			if (!runHandler(*messageTarget, noArguments, messageReceiver,
-					messageTarget->returnsValue ? &messageResult : nullptr, depth + 1))
-				return false;
-			if (messageTarget->returnsValue)
-				stack.push_back(messageResult);
+			Value resolved;
+			resolved.isHandlerRef = true;
+			resolved.reference = messageTarget->code;
+			resolved.hasReference = true;
+			resolved.receiverName = receiverName;
+			resolved.width = 4;
+			stack.push_back(resolved);
 			break;
 		}
-		case 0x6d: {
+		case 0x1b: {
+			// Передача управления по адресу со стека. RUN34:0x1392:
+			//     mov dx,ds / mov cx,si   ; запомнить, где были
+			//     pop ax / pop si / pop ds ; адрес — со стека
+			//     push ax                 ; слово с числом байт аргументов вернуть
+			//     push dx / push cx       ; и положить обратный адрес
+			// У среды это переход в общем потоке кода; у нас обработчик пока
+			// исполняется отдельным вызовом, поэтому здесь он и запускается —
+			// с аргументами, снятыми со стека по числу байт из байт-кода, а не по
+			// нашей догадке (ledger/0069).
+			Value argumentBytes = pop();
+			Value target = pop();
+			if (!target.isHandlerRef) {
+				debug(1, "ToolBook: 0x1b без разрешённого обработчика 	0x%x", ip - 1);
+				return false;
+			}
+			const Handler *callee = _book->findHandlerByCode(target.reference);
+			if (!callee) {
+				debug(1, "ToolBook: обработчик по адресу 0x%x не найден 	0x%x",
+						target.reference, ip - 1);
+				return false;
+			}
+			Common::Array<Value> callArguments;
+			uint consumed = 0;
+			while (!stack.empty() && consumed < argumentBytes.number) {
+				consumed += stack.back().width;
+				callArguments.push_back(pop());
+			}
+			if (consumed != argumentBytes.number) {
+				debug(1, "ToolBook: 0x1b: аргументов %u байт, снято %u 	0x%x",
+						argumentBytes.number, consumed, ip - 1);
+				return false;
+			}
+			Common::Array<Value> ordered;
+			for (int a = (int)callArguments.size() - 1; a >= 0; a--)
+				ordered.push_back(callArguments[a]);
+			Value callReceiver;
+			callReceiver.string = target.receiverName;
+			callReceiver.isObject = !target.receiverName.empty();
+			callReceiver.width = 4;
+			Value callResult;
+			debug(3, "ToolBook: вызов по адресу 0x%x («%s»), аргументов %u байт",
+					target.reference, target.receiverName.c_str(), argumentBytes.number);
+			if (!runHandler(*callee, ordered, callReceiver,
+					callee->returnsValue ? &callResult : nullptr, depth + 1))
+				return false;
+			if (callee->returnsValue)
+				stack.push_back(callResult);
+			break;
+		}
+				case 0x6d: {
 			uint16 rel = read16(ip);
 			uint32 nameTarget = (uint32)((int32)(ip + 2) + (int16)rel);
 			uint8 kind = code[ip + 2];

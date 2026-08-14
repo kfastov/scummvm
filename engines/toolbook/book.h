@@ -224,6 +224,8 @@ public:
 	const ScriptObject *findScriptObject(uint16 handle, uint16 selector) const;
 	const ScriptObject *findScriptObjectByRecord(uint32 record) const;
 	const Handler *findScriptHandler(uint32 ownerRecord, uint16 selector) const;
+	/// Обработчик по адресу его кода (посылка разрешается в адрес, ledger/0069).
+	const Handler *findHandlerByCode(uint32 code) const;
 	/// Обработчик сообщения у названного объекта (посылка с явным получателем).
 	const Handler *findMessageHandler(const Common::String &receiver, uint16 selector) const;
 	const Common::Array<Common::String> &classNames() const { return _classNames; }
