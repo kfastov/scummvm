@@ -1,23 +1,15 @@
 #!/usr/bin/env python3
-"""Разжатие исходного текста скриптов, который лежит в книге ToolBook.
+"""Исходный текст скриптов, который лежит в книге ToolBook.
 
-Книга хранит не только байт-код, но и исходник каждого обработчика — сжатый
-обратными ссылками. Схема проверена на четырёх обработчиках подряд
-(ledger/0060):
+Книга хранит рядом с байт-кодом **исходник обработчиков — простым текстом в
+CP1251**. Никакого сжатия нет: прежняя версия этого инструмента (ledger/0060)
+принимала русские буквы за управляющие байты — `0xC0..0xCF` это «А»..«П», а
+`0xE0` это «а», — и разбирала их как обратные ссылки и конец строки, отчего
+текст выглядел изъеденным. Отменено записью ledger/0064.
 
-    байт 0xC0..0xCF  — ссылка: длина = (байт and 0x0f) + 3,
-                       следующий байт = расстояние − 3;
-                       **расстояние отсчитывается по сжатому потоку**, а не по
-                       разжатому — копируются сырые байты с позиции i − dist;
-    байт 0xE0        — конец строки;
-    прочее           — как есть (текст в CP1251).
-
-Байты 0x80..0xBF пока не расшифрованы: это, судя по всему, лексемы встроенных
-слов языка. Литеральные имена (обработчиков, объектов) видны как есть.
-
-    tools/tbksrc.py 0x134575          — разжать с этого смещения книги
-    tools/tbksrc.py 0x134575 400      — столько байт входа
-    tools/tbksrc.py --find            — где в книге лежат несжатые «TO HANDLE»
+    tools/tbksrc.py find "подстрока"     — где встречается (в CP1251)
+    tools/tbksrc.py at 0xf3b400 600      — показать кусок как текст
+    tools/tbksrc.py handlers             — заголовки `to handle` / `to get`
 """
 from __future__ import annotations
 
@@ -34,50 +26,40 @@ def load(path: str = DEFAULT_BOOK) -> bytes:
     return data[BOOK_IN_EXE:] if data[:2] == b'MZ' else data
 
 
-def unpack(book: bytes, start: int, count: int) -> bytes:
-    """Разжать `count` байт входа, начиная со `start`."""
-    out = bytearray()
-    i, end = start, min(start + count, len(book))
-    while i < end:
-        b = book[i]
-        if 0xc0 <= b <= 0xcf and i + 1 < len(book):
-            length = (b & 0x0f) + 3
-            source = i - (book[i + 1] + 3)
-            if source >= 0:
-                out += book[source:source + length]
-                i += 2
-                continue
-        out.append(b)
-        i += 1
-    return bytes(out)
+def text(book: bytes, start: int, count: int) -> str:
+    """Кусок книги как текст CP1251."""
+    return book[start:start + count].decode('cp1251', errors='replace')
 
 
-def render(raw: bytes) -> str:
-    """Показать разжатое: конец строки — 0xE0, неизвестные лексемы — <XX>."""
-    parts = []
-    for b in raw:
-        if b == 0xe0:
-            parts.append('\n')
-        elif b in (0x09, 0x20) or 32 <= b < 127:
-            parts.append(chr(b))
-        elif 0x80 <= b <= 0xbf:
-            parts.append('<%02x>' % b)
-        else:
-            parts.append(bytes([b]).decode('cp1251', errors='replace'))
-    return ''.join(parts)
+def find(book: bytes, needle: str) -> list[int]:
+    return [m.start() for m in re.finditer(re.escape(needle.encode('cp1251')), book)]
+
+
+def handlers(book: bytes) -> list[tuple[int, str]]:
+    """Заголовки обработчиков в исходниках."""
+    out = []
+    for m in re.finditer(rb'to (handle|get) [A-Za-z_][A-Za-z0-9_]*', book):
+        out.append((m.start(), m.group().decode('latin1')))
+    return out
 
 
 def main() -> int:
-    book = load()
-    if len(sys.argv) > 1 and sys.argv[1] == '--find':
-        for m in re.finditer(rb'TO HANDLE ', book):
-            print('0x%06x' % m.start())
-        return 0
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
-    start = int(sys.argv[1], 0)
-    count = int(sys.argv[2], 0) if len(sys.argv) > 2 else 300
-    print(render(unpack(book, start, count)))
+    book = load()
+    cmd = sys.argv[1]
+    if cmd == 'find':
+        for off in find(book, sys.argv[2]):
+            print('0x%06x  %s' % (off, text(book, max(0, off - 60), 200).replace('\n', ' ')))
+    elif cmd == 'at':
+        start = int(sys.argv[2], 0)
+        count = int(sys.argv[3], 0) if len(sys.argv) > 3 else 400
+        print(text(book, start, count))
+    elif cmd == 'handlers':
+        for off, head in handlers(book):
+            print('0x%06x  %s' % (off, head))
+    else:
+        raise SystemExit(__doc__)
     return 0
 
 
