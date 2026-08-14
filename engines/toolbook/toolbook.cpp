@@ -487,18 +487,141 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			if (!condition) branch(ip, rel);
 			break;
 		}
+		case 0x1e:
+		case 0x1f:
 		case 0x20: {
+			// Вызов builtin с переменным числом операндов: `[u16 номер][u8 сколько
+			// байт снять]`. Три опкода различаются только судьбой результата:
+			// RUN34:0x1436 после вызова делает `add sp, cleanup` и всё, 0x14b0
+			// кладёт обратно слово (`push cx`), а 0x152d — двойное (`push dx;
+			// push cx`). То же деление, что у обычных вызовов 0x21/0x22/0x23
+			// (ledger/0081).
 			uint16 id = read16(ip); ip += 2;
 			uint8 cleanup = code[ip++];
+			const uint8 resultWidth = op == 0x20 ? 4 : (op == 0x1f ? 2 : 0);
+			const bool wantsResult = resultWidth != 0;
+			if (id == 248) {
+				// `ValueNewArray` (MTB40BAS.207 — имя стоит в таблице экспорта).
+				// Обёртка RUN91:0x0f28 передаёт ей код типа, размер элемента
+				// результата (таблица `ds:0x0ca0` в DGROUP: 2, 4, 8 и 10 байт),
+				// число элементов **младшим байтом** второго операнда и указатель
+				// на сами элементы. Внутри (MTB40BAS seg60:0x006e) элементы
+				// читаются **словами с шагом 2** — размер из таблицы к источнику
+				// отношения не имеет.
+				//
+				// Книга зовёт это двенадцатью формами с кодами типа 9, 35, 38 и
+				// 128 и счётчиками 1..3; на всех двенадцати `cleanup` сходится с
+				// `2 + 2 + 2×счётчик` (ledger/0081).
+				Value type = pop();
+				Value count = pop();
+				uint elements = count.number & 0xff;
+				if (4 + 2 * elements != cleanup) {
+					debug(1, "ToolBook: 248 тип %u, элементов %u, но cleanup %u @0x%x",
+							type.number, elements, cleanup, ip - 4);
+					return false;
+				}
+				Common::Array<Value> items;
+				for (uint i = 0; i < elements; i++)
+					items.push_back(pop());
+				Value array;
+				array.width = 4;
+				array.arrayId = _nextArray++;
+				array.number = array.arrayId;
+				Common::Array<Value> &store = _arrayStore[array.arrayId];
+				for (int i = (int)items.size() - 1; i >= 0; i--)
+					store.push_back(items[i]);
+				debug(2, "ToolBook: массив %u типа %u из %u элементов",
+						array.arrayId, type.number, elements);
+				if (wantsResult) {
+					array.width = resultWidth;
+					stack.push_back(array);
+				}
+				break;
+			}
+			if (id == 249 || id == 251 || id == 262) {
+				// Чтение элемента массива. Обёртки RUN91:0x11ba, 0x1212 и 0x112a
+				// все приходят в `ValueArrayGet` (MTB40BAS.208) и различаются лишь
+				// шириной элемента да тем, спрашивают ли сперва `ValueArrayInfo`.
+				// На стеке, сверху вниз: массив (4), число измерений (2), индексы
+				// по слову (ledger/0081).
+				Value array = pop();
+				Value dims = pop();
+				uint count = dims.number & 0xff;
+				Common::Array<uint32> indices;
+				for (uint i = 0; i < count; i++)
+					indices.push_back(pop().number);
+				if (!array.arrayId || !_arrayStore.contains(array.arrayId) || count != 1) {
+					debug(1, "ToolBook: чтение элемента не-массива (измерений %u) @0x%x",
+							count, ip - 4);
+					return false;
+				}
+				const Common::Array<Value> &store = _arrayStore[array.arrayId];
+				uint32 at = indices[0];
+				if (at < 1 || at > store.size()) {
+					debug(1, "ToolBook: индекс %u вне массива %u (%u элементов) @0x%x",
+							at, array.arrayId, store.size(), ip - 4);
+					return false;
+				}
+				debug(2, "ToolBook: массив %u[%u] -> «%s»", array.arrayId, at,
+						valueString(store[at - 1]).c_str());
+				if (wantsResult) {
+					Value element = store[at - 1];
+					element.width = resultWidth;
+					stack.push_back(element);
+				}
+				break;
+			}
+			if (id == 250 || id == 263) {
+				// Запись элемента: обе обёртки (RUN91:0x135a и 0x12d8) зовут
+				// `ValueArraySet` (MTB40BAS.209) как `(массив, &значение, число
+				// измерений, &индексы)`; различаются шириной значения — два байта
+				// против четырёх, — а со стека оно снимается как есть. На стеке,
+				// сверху вниз: массив, значение, число измерений, индексы.
+				// Нумерация ToolBook с единицы (ledger/0081).
+				Value array = pop();
+				Value value = pop();
+				Value dims = pop();
+				uint count = dims.number & 0xff;
+				Common::Array<uint32> indices;
+				for (uint i = 0; i < count; i++)
+					indices.push_back(pop().number);
+				if (!array.arrayId || !_arrayStore.contains(array.arrayId)) {
+					debug(1, "ToolBook: запись в не-массив @0x%x", ip - 4);
+					return false;
+				}
+				if (count != 1) {
+					debug(1, "ToolBook: массив в %u измерений пока не разобран @0x%x",
+							count, ip - 4);
+					return false;
+				}
+				Common::Array<Value> &store = _arrayStore[array.arrayId];
+				uint32 at = indices[0];
+				if (at < 1 || at > store.size()) {
+					debug(1, "ToolBook: индекс %u вне массива %u (%u элементов) @0x%x",
+							at, array.arrayId, store.size(), ip - 4);
+					return false;
+				}
+				store[at - 1] = value;
+				debug(2, "ToolBook: массив %u[%u] := «%s»", array.arrayId, at,
+						valueString(value).c_str());
+				if (wantsResult)
+					pushNumber(0, resultWidth);
+				break;
+			}
 			if (id != 192) {
-				debug(1, "ToolBook: variadic builtin %u @0x%x пока не реализован",
-						id, ip - 4);
+				debug(1, "ToolBook: variadic builtin %u (cleanup %u) @0x%x пока не реализован",
+						id, cleanup, ip - 4);
+				for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 10; v--, n++)
+					debug(1, "    операнд [-%d]: ширина %u тип %02x число %u стр «%s»",
+							n, stack[v].width, stack[v].type, stack[v].number,
+							valueString(stack[v]).c_str());
 				return false;
 			}
 			// Aggregate constructor: cleanup includes flag/count words and N
 			// dynamic values, but not the receiver beneath them.
 			popBytes(cleanup);
-			pushNumber(0, 4);
+			if (wantsResult)
+				pushNumber(0, resultWidth);
 			break;
 		}
 		case 0x21: case 0x22: case 0x23: {
@@ -1333,7 +1456,6 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 		case 0x2c: { // materialize a dynamic value in the requested raw type
 			uint8 type = code[ip++];
 			if (!stack.empty()) {
-				uint8 sourceType = stack.back().type;
 				if (type == 0x22 && stack.back().isString) {
 					// MCI numeric responses are strings until the compiler asks for
 					// ToolBook's ten-byte extended numeric representation.
@@ -1350,8 +1472,18 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 					// Без этого «true» приходило нулём и книга уходила в ветку
 					// «звуковое устройство не обнаружено» (ledger/0054).
 					stack.back().number = stack.back().string.equalsIgnoreCase("true") ? 1 : 0;
-				} else if (type == 9 && !stack.back().isString && sourceType == 0x23) {
-					// Reached loop-index conversion used to compose an MCI command.
+				} else if (type == 9 && !stack.back().isString && !stack.back().isObject &&
+						!stack.back().hasReference && !stack.back().isBookReference &&
+						!stack.back().buffer && stack.back().array.empty()) {
+					// Тип 9 — сишная строка. Опкод 0x2c (RUN34:0x2821) для целей
+					// ниже 0x22 уходит в `MTB40BAS.97` — `ValueConvertToC`, то есть
+					// значение материализуется в строку **независимо от исходного
+					// типа**; матрица допустимых преобразований (`ss:[0x862]`)
+					// проверяется только для целей 0x22..0x5f.
+					//
+					// Раньше здесь стояло условие «исходный тип 0x23», и книга не
+					// могла собрать «Score_» & 1 — имя ключа в Scores.inf
+					// (ledger/0081).
 					stack.back().string = Common::String::format("%d", (int32)stack.back().number);
 					stack.back().isString = true;
 				}

@@ -81,6 +81,10 @@ private:
 		/// Через него читается свойство 0x4020 — «страница этого объекта».
 		Common::String owner;
 		bool isViewer = false;   ///< разрешён как класс 38 (Viewer)
+		/// Номер массива в `_arrayStore`. У среды массив — ссылка (`ValueNewArray`
+		/// отдаёт хендл, `ValueArraySet` меняет содержимое по нему), поэтому в
+		/// значении лежит номер, а не копия элементов (ledger/0081).
+		uint32 arrayId = 0;
 		uint8 type = 0;
 		uint8 width = 4;
 	};
@@ -196,6 +200,9 @@ private:
 	void stopMedia(const Common::String &alias);
 	/// Ячейки среды по номеру: пара builtin 127 (запись) и 128 (чтение).
 	Common::HashMap<uint32, ScriptValue> _systemSlots;
+	/// Массивы книги по номеру: `ValueNewArray` заводит, `ValueArraySet` меняет.
+	Common::HashMap<uint32, Common::Array<ScriptValue> > _arrayStore;
+	uint32 _nextArray = 1;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
 	bool _fieldSelectAll = false;
