@@ -244,6 +244,9 @@ public:
 	const Viewer *findViewer(const Common::String &name) const;
 	/// Страница, на которой лежит объект с таким именем; -1 — не нашлась.
 	int pageOfObject(const Common::String &objectName) const;
+	/// Страницы названного фона по порядку: книга адресует их номером
+	/// (`page 1 of background "Message"`).
+	Common::Array<int> pagesOfBackground(const Common::String &name) const;
 	/// Все обработчики с целой таблицей строк. Пока не привязаны к страницам:
 	/// одного соседства в файле для доказуемой привязки недостаточно.
 	const Common::Array<Handler> &handlers() const { return _handlers; }
