@@ -502,6 +502,18 @@ const Handler *Book::findScriptHandler(uint32 ownerRecord, uint16 selector) cons
 	return nullptr;
 }
 
+Common::Array<Object> Book::objectsAround(const Common::String &objectName) const {
+	Common::Array<Object> out;
+	for (uint i = 0; i < _heapSegments.size(); i++) {
+		Common::Array<Object> here;
+		appendSegmentObjects(_heapSegments[i].base, here);
+		for (uint k = 0; k < here.size(); k++)
+			if (here[k].name.equalsIgnoreCase(objectName))
+				return here;
+	}
+	return out;
+}
+
 Common::Array<Object> Book::objectsOfSegment(const Common::String &name) const {
 	Common::Array<Object> out;
 	for (uint i = 0; i < _heapSegments.size(); i++)
