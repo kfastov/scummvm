@@ -521,6 +521,16 @@ void Score::updateCurrentFrame() {
 		// This is mostly a no-op, however any sprite changes for
 		// non-puppet sprites will be reverted.
 
+		// Auto-puppet has to be released here as well. Above, on a frame change,
+		// the mask of the incoming frame decides what gets released; a frame that
+		// loops on itself overrides nothing, so that mask is empty. Yet the
+		// playhead did move, and by Director semantics that ends every temporary
+		// property override on a non-puppet sprite. Without this a sprite property
+		// set from Lingo sticks for good, and a looping frame keeps applying its
+		// changes on top of the previous ones instead of starting from the score.
+		for (uint ch = 0; ch < _channels.size(); ch++)
+			_channels[ch]->_sprite->releaseAutoPuppet(0xffffffff);
+
 		// If playback has been paused on a frame, the sprites aren't cleaned.
 		updateSprites(kRenderModeNormal, true);
 
@@ -1682,6 +1692,17 @@ uint16 Score::getSpriteIDFromPos(Common::Point pos) {
 uint16 Score::getMouseSpriteIDFromPos(Common::Point pos) {
 	for (int i = _channels.size() - 1; i >= 0; i--) {
 		CollisionTest test = _channels[i]->isMouseIn(pos);
+
+		if (debugChannelSet(5, kDebugEvents)) {
+			const Common::Rect bbox = _channels[i]->getBbox();
+			const Common::Point scorePos = _currentFrame->_sprites[i]->getPosition();
+			debugC(5, kDebugEvents, "  канал %d: bbox (%d,%d)-(%d,%d) в партитуре (%d,%d) puppet %d/%d тест %d отвечает %d",
+					i, bbox.left, bbox.top, bbox.right, bbox.bottom,
+					scorePos.x, scorePos.y,
+					_channels[i]->_sprite->_puppet, _channels[i]->_sprite->_autoPuppet,
+					test, _channels[i]->_sprite->respondsToMouse());
+		}
+
 		if (test == kCollisionYes && _channels[i]->_sprite->respondsToMouse())
 			return i;
 		else if (test == kCollisionHole)

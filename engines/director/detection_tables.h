@@ -1543,6 +1543,7 @@ static const PlainGameDescriptor directorGames[] = {
 	{ "pyatachok3",			"Пятачок в Затерянном мире" },				   // Pong-Pong's Learning Adventure: The Lost World
 	{ "pyatachok4",			"Пятачок: Назад в будущее" },				   // Pong-Pong's Learning Adventure: Back to the Future
 	{ "pyatachok5",			"Пятачок сдает экзамен по Анатомии" },		   // Pong-Pong's Learning Adventure: Mysteries of Human Body
+	{ "sevenwitches",		"Семь ведьм и заколдованный принц" },		   // Sieben Hexen und der verzauberte Prinz (Tivola)
 	{ "tchaik",				"Пётр Ильи́ч Чайко́вский: Жизнь и творчество" }, // Pyotr Ilyich Tchaikovsky: Life and Work
 	{ "tutti",				"Волшебные истории Тутти" },				   // Tutti's Magical Stories
 
@@ -8444,6 +8445,10 @@ static const DirectorGameDescription gameDescriptions[] = {
 	WINGAME1t("catseyeview", "Vol. 6 v2.0", "Cat'sEyeView vol.6_2.0.exe", "e1208aefc85d692b9e6fd477a04f2314", 7333831, 600),
 	MACGAME1("catseyeview", "Vol. 7", "Cat'sEyeView7", "55d01cca925752c170ac1e9c01d1f87e", 1030462, 601),
 	WINGAME1t("catseyeview", "Vol. 7", "Cat'sEyeView7.exe", "1c8ec55a7a65ba13890697e0e92670a5", 6017657, 600),
+
+	// Russian release by Buka of the Tivola title
+	// "Sieben Hexen und der verzauberte Prinz"
+	WINGAME1_l("sevenwitches", "", "Prince.exe", "t:0e1975bcf5c000ce3d55e864fc0d8c05", 1851314, Common::RU_RUS, 600),
 
 	// German title is "Hexentanz und Firlefanz", published by Tivola
 	// Bilingual English/German
