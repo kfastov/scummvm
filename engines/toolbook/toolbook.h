@@ -172,7 +172,8 @@ private:
 			const ScriptValue &value);
 	void playMedia(const Common::String &alias);
 	void stopMedia(const Common::String &alias);
-	bool _runtimeAction12 = false;
+	/// Ячейки среды по номеру: пара builtin 127 (запись) и 128 (чтение).
+	Common::HashMap<uint32, ScriptValue> _systemSlots;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
 	bool _fieldSelectAll = false;

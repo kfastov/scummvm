@@ -548,9 +548,31 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				foldedHaystack.toUppercase();
 				foldedNeedle.toUppercase();
 				pushNumber(foldedHaystack.find(foldedNeedle) == Common::String::npos, 2);
-			} else if (id == 210) { // ToolBook `is null`
+			} else if (id == 81) {
+				// Длина строки: RUN87:0x0bc2 — это `lstrlen` (KERNEL.90) над дальним
+				// указателем, у нулевого указателя ноль. Книга так проверяет имя
+				// игрока, прочитанное из names.sav.
 				Value value = pop();
-				pushNumber(isNullValue(value) ? 1 : 0, 2);
+				Common::String text = valueString(value);
+				pushNumber(text.size(), op == 0x22 ? 2 : 4);
+			} else if (id == 202) {
+				// Сравнение «больше» над десятибайтовыми числами (RUN91:0x0c2e).
+				// Целую ветвь видно прямо: старшие слова сравниваются знаково
+				// (`jl`/`jg`), младшие — беззнаково (`jbe`), и единица получается,
+				// когда **позже положенный операнд больше положенного раньше**.
+				// Нецелые операнды та же функция гонит через сопроцессор.
+				Value second = pop();
+				Value first = pop();
+				int32 a = first.isString ? atoi(first.string.c_str()) : (int32)first.number;
+				int32 b = second.isString ? atoi(second.string.c_str()) : (int32)second.number;
+				pushNumber(b > a ? 1 : 0, 2);
+			} else if (id == 210 || id == 211) {
+				// Пара «пусто» / «не пусто»: RUN91:0x08cc и 0x0944 различаются тем,
+				// что при канонической пустой ссылке (`[bp+6]==1 && [bp+8]==0x400`)
+				// первая возвращает 1, а вторая — 0.
+				Value value = pop();
+				bool null = isNullValue(value);
+				pushNumber((id == 210 ? null : !null) ? 1 : 0, 2);
 			} else if (id == 23) { // page navigation
 				Value target = pop();
 				if (target.isString || target.isObject)
@@ -1019,19 +1041,35 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 			} else if (id == 129) { // sysCursor setter
 				pop();
 				pop();
-			} else if (id == 127) {
-				// RUN seg95:02b0 is a void dispatcher over a W action and a D
-				// value (retf 6). The serialized startup uses action 12 with a
-				// null value; that exact branch performs no import/callback and
-				// sets the runtime's internal dynamic slot to canonical true.
-				Value action = pop();
-				Value value = pop();
-				if (action.number != 12 || truth(value)) {
-					debug(1, "ToolBook: builtin 127 action %u/value пока не реализован @0x%x",
-							action.number, ip - 3);
+			} else if (id == 127 || id == 128) {
+				// Ячейка среды: 127 (RUN95:0x02b0, `retf 6`) пишет, 128
+				// (RUN85:0x061e, `retf 2`) читает — обе по номеру. У номера 12 это
+				// буквально одна пара глобальных слов `ds:[0x8cc]`: ветка записи
+				// кладёт туда значение (пустое даёт каноническую пустую ссылку
+				// `{1, 0x400}`), ветка чтения его же и достаёт (ledger/0077).
+				//
+				// Книга пользуется парой как ловушкой ошибки: гасит ячейку, делает
+				// вызов, потом смотрит, не появилось ли в ней сообщение.
+				uint32 slot;
+				Value stored;
+				if (id == 127) {
+					slot = pop().number;
+					stored = pop();
+				} else {
+					slot = pop().number;
+					stored = _systemSlots.contains(slot) ? _systemSlots[slot] : Value();
+				}
+				if (slot != 12) {
+					debug(1, "ToolBook: ячейка среды %u (builtin %u) не разобрана @0x%x",
+							slot, id, ip - 3);
 					return false;
 				}
-				_runtimeAction12 = true;
+				if (id == 127) {
+					_systemSlots[slot] = stored;
+					debug(2, "ToolBook: ячейка среды 12 := «%s»", valueString(stored).c_str());
+				} else if (op != 0x21) {
+					stack.push_back(stored);
+				}
 			} else if (id == 247) { // select a complete Field text range
 				Value object = pop();
 				const Object *field = findCurrentObject(object.string);
@@ -1349,21 +1387,71 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 						(stack.back().number & 0xffff);
 				stack.back().type = 0x22;
 				stack.back().width = 10;
-} else if ((form & 0xff) == 0x11) {
-				// Подобработчик RUN34:0x2ee5 смотрит старший байт формы: при 1 и 3
-				// проверяет верхнее слово на предел 0x7fff, при 0 пропускает, иначе
-				// требует, чтобы слово было ненулевым (`cmp word ss:[bx],0`).
-				// Достигнута форма 0x0211 — именно эта проверка (ledger/0070).
-				if ((form >> 8) != 2) {
-					debug(1, "ToolBook: опкод 71 форма %04x @0x%x пока не реализована",
-							form, ip - 3);
+} else if ((form & 0xff) == 0x11 || (form & 0xff) == 0x12) {
+				// Проверка диапазона, а не преобразование. Подобработчик
+				// RUN34:0x2ee5 разбирает старший байт формы целиком:
+				//   * взведён знаковый бит и слово отрицательное — годится только
+				//     разновидность 3, остальные дают ошибку;
+				//   * 1 и 3 — слово обязано быть не больше 0x7fff (сравнение
+				//     беззнаковое, `ja`);
+				//   * 0 — не проверяется вовсе;
+				//   * прочее — слово обязано быть ненулевым.
+				// Книга доходит до 0x0211 (ledger/0070) и до 0x0311 — проверки
+				// длины имени игрока, прочитанного из names.sav.
+				uint8 kind = (uint8)(form >> 8);
+				uint16 word = (uint16)stack.back().number;
+				bool ok;
+				if ((kind & 0x80) && (int16)word < 0)
+					ok = (kind & 0x7f) == 3;
+				else if ((kind & 0x7f) == 1 || (kind & 0x7f) == 3)
+					ok = word <= 0x7fff;
+				else if ((kind & 0x7f) == 0)
+					ok = true;
+				else
+					ok = word != 0;
+				if (!ok) {
+					debug(1, "ToolBook: опкод 71 форма %04x: значение %u вне диапазона @0x%x",
+							form, word, ip - 3);
 					return false;
 				}
-				if (stack.back().number == 0) {
-					debug(1, "ToolBook: опкод 71 форма %04x: нулевое значение @0x%x",
-							form, ip - 3);
+				if ((form & 0xff) == 0x12) {
+					// RUN34:0x3047 — та же проверка, а следом расширение слова до
+					// двойного: `pop cx / push 0 / push cx`, и только при взведённом
+					// знаковом бите с разновидностью 3 и отрицательном слове
+					// вместо нуля кладётся -1. То есть знаковое расширение —
+					// исключение, а не правило.
+					bool signExtend = (kind & 0x80) && (int16)word < 0 && (kind & 0x7f) == 3;
+					stack.back().number = signExtend ?
+							(uint32)(int32)(int16)word : (uint32)word;
+					stack.back().width = 4;
+				}
+			} else if ((form & 0xff) == 0x21) {
+				// Обратное к 0x12: сужение двойного слова до слова (RUN34:0x2fef).
+				// Успех кончается на `pop cx / add sp,2 / push cx` — старшее слово
+				// просто выбрасывается, но перед этим оно обязано быть нулевым;
+				// единственное исключение — знаковая форма разновидности 3, где
+				// допускается ещё и `0xffff` (отрицательное число).
+				uint8 kind = (uint8)(form >> 8);
+				uint32 value = stack.back().number;
+				uint16 high = (uint16)(value >> 16), low = (uint16)value;
+				bool ok;
+				if ((kind & 0x80) && high == 0xffff)
+					ok = (kind & 0x7f) == 3;
+				else if (high != 0)
+					ok = false;
+				else if ((kind & 0x7f) == 1 || (kind & 0x7f) == 3)
+					ok = (int16)low >= 0;
+				else if ((kind & 0x7f) == 0)
+					ok = true;
+				else
+					ok = low != 0;
+				if (!ok) {
+					debug(1, "ToolBook: опкод 71 форма %04x: %u не сужается до слова @0x%x",
+							form, value, ip - 3);
 					return false;
 				}
+				stack.back().number = low;
+				stack.back().width = 2;
 			} else if ((form & 0xff) == 0x51) {
 				// Обратное преобразование: подобработчик RUN34:0x3207 передаёт
 				// форму целиком в общий преобразователь seg30:0x078c, а тот
@@ -1642,17 +1730,21 @@ case 0x48: {
 						return false;
 					pushNumber(0);
 				} else if (key == "FILEEXISTS") {
-					// TB40DOS: есть ли файл. Дерево игры плоское, поэтому от пути
-					// эталонной установки берём имя файла.
+					// TB40DOS.1 (seg3:0x0106, `retf 4`): берёт дальний указатель на
+					// имя и возвращает **число** в AX. Книга так его и проверяет — в
+					// обоих вызовах стоит `если fileExists(путь) <> 1`. Раньше движок
+					// отдавал строку «true», сравнение со единицей не сходилось, и
+					// книга уходила в ветку «не обнаружен файл» (ledger/0077).
 					if (args.size() != 1)
 						return false;
+					// Дерево игры плоское, поэтому от пути эталонной установки
+					// (`C:\NMG\KNTOWER\…`) берём имя файла.
 					Common::String probe = valueString(args[0]);
 					while (probe.contains('\\'))
 						probe.erase(0, probe.findFirstOf('\\') + 1);
 					bool present = !probe.empty() && SearchMan.hasFile(Common::Path(probe));
-					debug(2, "ToolBook: fileExists %s -> %s", probe.c_str(),
-							present ? "true" : "false");
-					pushString(present ? "true" : "false");
+					debug(2, "ToolBook: fileExists %s -> %d", probe.c_str(), present ? 1 : 0);
+					pushNumber(present ? 1 : 0);
 								} else if (key == "SETFILEATTRIBUTES") {
 					// TB40DOS: смена атрибутов файла. Своей файловой системы у движка
 					// нет — атрибуты DOS ни на что не влияют, а на эталонном стенде
