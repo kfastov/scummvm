@@ -502,6 +502,23 @@ const Handler *Book::findScriptHandler(uint32 ownerRecord, uint16 selector) cons
 	return nullptr;
 }
 
+const Handler *Book::findHandlerByCode(uint32 code) const {
+	for (uint i = 0; i < _scriptObjects.size(); i++)
+		for (uint k = 0; k < _scriptObjects[i].handlers.size(); k++)
+			if (_scriptObjects[i].handlers[k].code == code)
+				return &_scriptObjects[i].handlers[k];
+	for (uint i = 0; i < _pages.size(); i++) {
+		for (uint k = 0; k < _pages[i].eventHandlers.size(); k++)
+			if (_pages[i].eventHandlers[k].code == code)
+				return &_pages[i].eventHandlers[k];
+		for (uint o = 0; o < _pages[i].objects.size(); o++)
+			for (uint k = 0; k < _pages[i].objects[o].handlers.size(); k++)
+				if (_pages[i].objects[o].handlers[k].code == code)
+					return &_pages[i].objects[o].handlers[k];
+	}
+	return nullptr;
+}
+
 const Handler *Book::findMessageHandler(const Common::String &receiver, uint16 selector) const {
 	// Посылка 0x6c адресная: получатель лежит на стеке (RUN31:0x0194 кладёт его
 	// в описатель посылки). Ищем сегмент кучи с таким именем и разбираем его
