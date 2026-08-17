@@ -193,6 +193,10 @@ private:
 	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
 	Audio::SoundHandle _mediaHandle;
 	Common::String _playingAlias;
+	/// Звук в обход MCI: `sndPlaySound` (builtin 316) зовут прямо путём.
+	Audio::SoundHandle _effectHandle;
+	/// Путь книги (`.\wav\null.wav`) -> поток движка. Возвращает «сыграли ли».
+	bool playSoundFile(const Common::String &bookPath, Audio::SoundHandle *handle);
 	/// Окна книги по имени (регистр приведён к верхнему).
 	Common::HashMap<Common::String, ViewerState> _viewerStates;
 	/// Открытое и показанное окно с назначенной страницей, иначе -1.
