@@ -821,16 +821,21 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				// sysLevel is a ToolBook enum word. Keep the symbolic value until
 				// enum coercion (2d) tags it as a dynamic value.
 				pushString("Reader", 2);
-			} else if (id == 69 || id == 71 || id == 72 || id == 73) {
-				// Арифметика над десятибайтовыми числами. Все четыре — `retf 0x16`:
+			} else if (id == 65 || id == 69 || id == 71 || id == 72 || id == 73) {
+				// Арифметика над десятибайтовыми числами. Все пять — `retf 0x16`:
 				// указатель на приёмник (2 байта) и два числа по 10. Само число это
 				// `[u16 признак][8 байт]`: при нулевом признаке грузится
 				// `fld qword`, иначе `fild dword`.
 				//
+				//   65 (RUN91:0x025a) `fdivr`  — первое делить на второе
 				//   69 (RUN91:0x00b2) `fsubr`  — первое минус второе
 				//   71 (RUN91:0x02e2) `fdiv`/`fmul`/`fsubr` — остаток от деления
 				//   72 (RUN91:0x0012) `fadd`
 				//   73 (RUN91:0x0152) `fmul`
+				//
+				// У 65 порядок читается наизнанку, как и у 69: `fdivr` делит не
+				// то, что в стеке сопроцессора, а операнд из памяти — то есть
+				// первое на второе, а не наоборот.
 				//
 				// Приёмник — место в стеке операндов, отведённое опкодом `0x0f`
 				// (`add sp, -10`) и адресуемое опкодом `0x59` (`push sp+N`). После
@@ -854,6 +859,7 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 				int32 b = right.isString ? atoi(right.string.c_str()) : (int32)right.number;
 				int32 outcome = 0;
 				switch (id) {
+				case 65: outcome = b ? a / b : 0; break;
 				case 69: outcome = a - b; break;
 				case 71: outcome = b ? a % b : 0; break;
 				case 72: outcome = a + b; break;
@@ -1106,12 +1112,24 @@ bool ToolBookEngine::runHandler(const Handler &handler,
 							propertyId.number, valueString(object).c_str());
 					pushString(Common::String());
 				}
-						} else if (id == 149 || id == 151) {
-				// Запись свойства (RUN81:0x0c0a и 0x0e26 — сегмент записи свойств).
-				// У обоих `retf 0xa`: номер свойства, четырёхбайтовое значение и
-				// объект. Объект приходит со стека, а не из получателя обработчика:
-				// именно так книга пишет `page of Dial` — окно кладётся вызовом 182
-				// прямо перед значением (ledger/0077).
+						} else if (id == 147 || id == 149 || id == 151) {
+				// Запись свойства (RUN81:0x0c0a, 0x0d42 и 0x0e26 — сегмент записи
+				// свойств). У всех трёх `retf 0xa`: номер свойства, четырёхбайтовое
+				// значение и объект. Объект приходит со стека, а не из получателя
+				// обработчика: именно так книга пишет `page of Dial` — окно кладётся
+				// вызовом 182 прямо перед значением (ledger/0077).
+				//
+				// Что 147 — тоже запись, видно по размеру кадра: у чтения свойства
+				// (150 — RUN66:0x0dea, 152 — RUN66:0x103a) `retf 6`, то есть номер
+				// и объект, а значения нет вовсе. Плюс все трое — одно семейство:
+				// у каждого одинаковый пролог и вызов общего помощника
+				// RUN81:0x1386 с соседними селекторами (5 у 149, 6 у 147, 7 у 151).
+				// Помощник — обход набора: он спрашивает `StackGetSize`
+				// (MTB40BAS.131), перебирает `StackElement` (132) и зовёт тот же
+				// самый builtin на каждом элементе. Чем именно 147 отличается от
+				// 149 — своим внутренним вызовом (seg8:0x04ea против seg24:0x0c50);
+				// на нашем уровне, где свойства лежат общей таблицей, разница пока
+				// ни на что не влияет (ledger/0082).
 				Value propertyId = pop();
 				Value propertyValue = pop();
 				Value object = pop();
@@ -2119,6 +2137,20 @@ case 0x48: {
 					// требует 256 цветов; наш экран палитровый, восьмибитный — как и на
 					// эталонном стенде (Cirrus в режиме 256 цветов).
 					pushNumber(8);
+				} else if (key == "HORIZONTALDISPLAYRES" || key == "VERTICALDISPLAYRES") {
+					// Размер экрана. Обе объявлены в книге **без аргументов** — в
+					// дескрипторе рядом с `getIniVar` и `setWinIniVar` у них стоит
+					// длина 0 (книга @0x154efc). Отдаём настоящий размер экрана
+					// движка, а не зашитое число: книга по нему выбирает экранный
+					// режим и умеет ругаться на неподходящий («…установите режим с
+					// размером шрифта "SMALL FONTS"») (ledger/0082).
+					if (argumentBytes != 0 || !args.empty()) {
+						debug(1, "ToolBook: %s с аргументами (%u байт) @0x%x",
+								name.c_str(), argumentBytes, ip - 6);
+						return false;
+					}
+					pushNumber(key == "HORIZONTALDISPLAYRES" ?
+							_system->getWidth() : _system->getHeight());
 								} else if (key == "GETINIVAR") {
 					// TB40WIN: чтение переменной из INI-файла. Порядок аргументов взят не
 					// из догадки, а из настоящего файла эталонного стенда
