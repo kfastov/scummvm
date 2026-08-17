@@ -4068,10 +4068,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..cdc8e698
+index 00000000..89095c98
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,2979 @@
+@@ -0,0 +1,3073 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4398,6 +4398,9 @@ index 00000000..cdc8e698
 +		stack.push_back(v);
 +	};
 +	auto pushObject = [&](const Common::String &s) { Value v; v.string = s; v.isObject = true; v.width = 4; stack.push_back(v); };
++	// Пролог обработчика (`26` и следом `0f` с отрицательным сдвигом) отводит
++	// кадр локальных; всё последующее отведение — временные значения в стеке.
++	bool expectFrame = true;
 +	auto pop = [&]() { Value v; if (!stack.empty()) { v = stack.back(); stack.pop_back(); } return v; };
 +	auto popBytes = [&](uint bytes) {
 +		uint consumed = 0;
@@ -4434,6 +4437,15 @@ index 00000000..cdc8e698
 +			return string;
 +		}
 +		return v.string;
++	};
++	// Значение для лога. У чисел `valueString` пусто, и запись вида
++	// «массив 1[10] := «»» прятала, легло ли туда посчитанное — а именно ради
++	// этого лог и читают.
++	auto describe = [&](const Value &v) {
++		Common::String string = valueString(v);
++		if (!string.empty() || v.isString)
++			return Common::String::format("«%s»", string.c_str());
++		return Common::String::format("%d", (int32)v.number);
 +	};
 +	auto local = [&](int off) { return locals.contains(off) ? locals[off] : Value(); };
 +	auto read16 = [&](uint32 at) { return (uint16)(code[at] | (code[at + 1] << 8)); };
@@ -4520,10 +4532,22 @@ index 00000000..cdc8e698
 +		case 0x0f: {
 +			int16 adjustment = (int16)read16(ip);
 +			ip += 2;
-+			// A negative adjustment reserves frame scratch space, represented by
-+			// locals in this abstract VM. A positive one discards real values.
-+			if (adjustment > 0)
++			// RUN34:0x10ec — это буквально `add sp, N`. Отрицательное значение
++			// отводит место: в прологе под локальные, а посреди обработчика — под
++			// временные десятибайтовые числа, адрес которых потом берёт опкод
++			// 0x59. Поэтому отведённое место представлено значением нужной ширины
++			// (ledger/0082); локальные при этом по-прежнему живут отдельно.
++			if (adjustment > 0) {
 +				popBytes(adjustment);
++			} else if (adjustment < 0 && expectFrame) {
++				// Первое такое отведение в обработчике — кадр локальных: у нас они
++				// живут отдельной таблицей, поэтому на стек операндов не кладутся.
++				expectFrame = false;
++			} else if (adjustment < 0) {
++				Value scratch;
++				scratch.width = (uint8)MIN(255, -adjustment);
++				stack.push_back(scratch);
++			}
 +			break;
 +		}
 +		case 0x10: {
@@ -4631,27 +4655,36 @@ index 00000000..cdc8e698
 +				}
 +				const Common::Array<Value> &store = _arrayStore[array.arrayId];
 +				uint32 at = indices[0];
-+				if (at < 1 || at > store.size()) {
-+					debug(1, "ToolBook: индекс %u вне массива %u (%u элементов) @0x%x",
-+							at, array.arrayId, store.size(), ip - 4);
-+					return false;
-+				}
-+				debug(2, "ToolBook: массив %u[%u] -> «%s»", array.arrayId, at,
-+						valueString(store[at - 1]).c_str());
++				// Чтение за концом — не ошибка: общий поиск элемента
++				// (MTB40BAS seg60:0x11ce) на читающем вызове доходит до 0x1394 и
++				// возвращает нулевой дальний указатель, из которого получается
++				// пустое значение (ledger/0082).
++				Value element;
++				if (at >= 1 && at <= store.size())
++					element = store[at - 1];
++				else
++					debug(2, "ToolBook: массив %u[%u] за концом (%u элементов) -> пусто",
++							array.arrayId, at, store.size());
++				debug(2, "ToolBook: массив %u[%u] -> %s", array.arrayId, at,
++						describe(element).c_str());
 +				if (wantsResult) {
-+					Value element = store[at - 1];
 +					element.width = resultWidth;
 +					stack.push_back(element);
 +				}
 +				break;
 +			}
-+			if (id == 250 || id == 263) {
-+				// Запись элемента: обе обёртки (RUN91:0x135a и 0x12d8) зовут
-+				// `ValueArraySet` (MTB40BAS.209) как `(массив, &значение, число
-+				// измерений, &индексы)`; различаются шириной значения — два байта
-+				// против четырёх, — а со стека оно снимается как есть. На стеке,
-+				// сверху вниз: массив, значение, число измерений, индексы.
++			if (id == 250 || id == 252 || id == 263) {
++				// Запись элемента: все три обёртки (RUN91:0x135a, 0x13a8 и 0x12d8)
++				// зовут `ValueArraySet` (MTB40BAS.209) как `(массив, &значение,
++				// число измерений, &индексы)`; различаются шириной значения — два
++				// байта против четырёх, — а со стека оно снимается как есть. На
++				// стеке, сверху вниз: массив, значение, число измерений, индексы.
 +				// Нумерация ToolBook с единицы (ledger/0081).
++				//
++				// Что ширина — единственное различие, видно по общей проверке
++				// RUN91:0x1066: она спрашивает у `ValueArrayInfo` размер элемента,
++				// берёт его из той же таблицы ширин (DGROUP `0x0ca0`) и сверяет с
++				// константой обёртки — 2 у 250, 4 у 252 (ledger/0082).
 +				Value array = pop();
 +				Value value = pop();
 +				Value dims = pop();
@@ -4670,14 +4703,24 @@ index 00000000..cdc8e698
 +				}
 +				Common::Array<Value> &store = _arrayStore[array.arrayId];
 +				uint32 at = indices[0];
-+				if (at < 1 || at > store.size()) {
-+					debug(1, "ToolBook: индекс %u вне массива %u (%u элементов) @0x%x",
-+							at, array.arrayId, store.size(), ip - 4);
++				if (at < 1) {
++					debug(1, "ToolBook: индекс %u в массиве %u @0x%x",
++							at, array.arrayId, ip - 4);
 +					return false;
 +				}
++				// Запись за концом **растит** массив. Это видно в общем поиске
++				// элемента (MTB40BAS seg60:0x11ce): ветка 0x1279 берётся только
++				// при взведённом признаке записи, и там из индекса считается новый
++				// размер — `max(индекс, 1024 / размер элемента)`, то есть место
++				// отводится под запрошенный индекс, но не меньше килобайтного
++				// куска. Книга на это и рассчитывает: массивы заводятся из одного
++				// элемента, а таблица результатов растёт по мере чтения
++				// `Scores.inf` (ledger/0082).
++				while (store.size() < at)
++					store.push_back(Value());
 +				store[at - 1] = value;
-+				debug(2, "ToolBook: массив %u[%u] := «%s»", array.arrayId, at,
-+						valueString(value).c_str());
++				debug(2, "ToolBook: массив %u[%u] := %s", array.arrayId, at,
++						describe(value).c_str());
 +				if (wantsResult)
 +					pushNumber(0, resultWidth);
 +				break;
@@ -4852,6 +4895,52 @@ index 00000000..cdc8e698
 +				// sysLevel is a ToolBook enum word. Keep the symbolic value until
 +				// enum coercion (2d) tags it as a dynamic value.
 +				pushString("Reader", 2);
++			} else if (id == 69 || id == 71 || id == 72 || id == 73) {
++				// Арифметика над десятибайтовыми числами. Все четыре — `retf 0x16`:
++				// указатель на приёмник (2 байта) и два числа по 10. Само число это
++				// `[u16 признак][8 байт]`: при нулевом признаке грузится
++				// `fld qword`, иначе `fild dword`.
++				//
++				//   69 (RUN91:0x00b2) `fsubr`  — первое минус второе
++				//   71 (RUN91:0x02e2) `fdiv`/`fmul`/`fsubr` — остаток от деления
++				//   72 (RUN91:0x0012) `fadd`
++				//   73 (RUN91:0x0152) `fmul`
++				//
++				// Приёмник — место в стеке операндов, отведённое опкодом `0x0f`
++				// (`add sp, -10`) и адресуемое опкодом `0x59` (`push sp+N`). После
++				// вызова это место и оказывается вершиной стека, поэтому следующая
++				// же операция берёт результат оттуда. Раньше движок принимал
++				// указатель за «признак» и клал результат сам — сходилось по
++				// стеку, но ломалось, как только книга завела два временных места
++				// сразу (ledger/0082).
++				Value destination = pop();
++				Value right = pop();
++				Value left = pop();
++				if (!destination.isStackRef || destination.stackRef >= stack.size() ||
++						right.width != 10 || left.width != 10) {
++					debug(1, "ToolBook: builtin %u неожиданная форма операндов @0x%x",
++							id, ip - 3);
++					return false;
++				}
++				// Элемент массива мог прийти строкой (`getIniVar` отдаёт текст),
++				// поэтому число берётся так же, как в сравнении 202.
++				int32 a = left.isString ? atoi(left.string.c_str()) : (int32)left.number;
++				int32 b = right.isString ? atoi(right.string.c_str()) : (int32)right.number;
++				int32 outcome = 0;
++				switch (id) {
++				case 69: outcome = a - b; break;
++				case 71: outcome = b ? a % b : 0; break;
++				case 72: outcome = a + b; break;
++				default: outcome = a * b; break;
++				}
++				Value computed = left;
++				computed.width = 10;
++				computed.type = 0x22;
++				computed.number = (uint32)outcome;
++				computed.isString = false;
++				computed.string.clear();
++				stack[destination.stackRef] = computed;
++				debug(3, "ToolBook: builtin %u: %d и %d -> %d", id, a, b, outcome);
 +			} else if (id == 138) {
 +				// Состояние окна. RUN66:0x0182 пропускает только класс 0x26 и зовёт
 +				// seg24:0x06c6; там для 0x4035, 0x4127 и 0x40d8 сначала разрешается
@@ -4957,25 +5046,6 @@ index 00000000..cdc8e698
 +					return false;
 +				}
 +				pushNumber(iterator.number <= upperBound.number ? 1 : 0, 2);
-+			} else if (id == 69) {
-+				// RUN91:00b2: вычитание чисел ToolBook. Значение грузится как целое
-+				// (`fild dword`) или как двойное (`fld qword`) в зависимости от
-+				// слова-признака, дальше `fsubr` — то есть результат это
-+				// «первое минус второе», и он кладётся десятью байтами
-+				// `[u16 признак][8 байт числа]` (ledger/0054).
-+				Value secondTag = pop();
-+				Value second = pop();
-+				Value first = pop();
-+				if (secondTag.width != 2 || second.width != 10 || first.width != 10) {
-+					debug(1, "ToolBook: builtin 69 неожиданная форма операндов @0x%x",
-+							ip - 3);
-+					return false;
-+				}
-+				Value difference = first;
-+				difference.number = first.number - second.number;
-+				difference.type = 0x22;
-+				difference.width = 10;
-+				stack.push_back(difference);
 +						} else if (id == 139) {
 +				// Запись свойства объекта. RUN81:0x021c ветвится по классу объекта
 +				// (`байт[bp+0dh] and 0FCh`), неизвестные номера уходят общим путём в
@@ -5260,23 +5330,6 @@ index 00000000..cdc8e698
 +						amount.number;
 +				(void)source;
 +				pushString(Common::String::format("%u", seconds));
-+			} else if (id == 71) {
-+				// Остаток от деления (RUN91:0x02e2): значения грузятся как целые или
-+				// двойные по признаку, затем `fdiv`, `fmul` и `fsubr` — то есть
-+				// `a − (a/b)·b`. Перед этим делитель сверяется с нулём (ledger/0070).
-+				Value flag = pop();
-+				Value divisor = pop();
-+				Value dividend = pop();
-+				if (divisor.width != 10 || dividend.width != 10) {
-+					debug(1, "ToolBook: builtin 71 неожиданная форма операндов 	0x%x", ip - 3);
-+					return false;
-+				}
-+				Value result = dividend;
-+				result.number = divisor.number ? dividend.number % divisor.number : 0;
-+				result.type = 0x22;
-+				result.width = 10;
-+				(void)flag;
-+				stack.push_back(result);
 +						} else if (id == 50) {
 +				// Засев датчика случайных чисел (RUN67:0x1054: значение уходит в
 +				// seg1:0x0588, затем десять прогревочных вызовов seg1:0x05a0).
@@ -5501,7 +5554,7 @@ index 00000000..cdc8e698
 +			}
 +			break;
 +		}
-+		case 0x26: break;
++		case 0x26: expectFrame = true; break;
 +		case 0x27: return true;
 +		case 0x28:
 +			if (result) {
@@ -5726,7 +5779,21 @@ index 00000000..cdc8e698
 +						(stack.back().number & 0xffff);
 +				stack.back().type = 0x22;
 +				stack.back().width = 10;
-+} else if ((form & 0xff) == 0x11 || (form & 0xff) == 0x12) {
++			} else if ((form & 0xff) == 0x25) {
++				// RUN34:0x3162 — брат 0x15 для четырёхбайтового источника:
++				// `pop ax; pop dx`, дальше та же выкладка `push 0; push 0;
++				// push dx; push ax; push 1`, то есть десять байт
++				// `[u16 признак=1][dword][4 нуля]`. Ветки `jns`/`cdq` здесь нет
++				// вовсе — старший байт формы обработчик не смотрит, значение
++				// берётся со стека как есть (ledger/0082).
++				if (stack.back().isString) {
++					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
++					stack.back().isString = false;
++					stack.back().string.clear();
++				}
++				stack.back().type = 0x22;
++				stack.back().width = 10;
++			} else if ((form & 0xff) == 0x11 || (form & 0xff) == 0x12) {
 +				// Проверка диапазона, а не преобразование. Подобработчик
 +				// RUN34:0x2ee5 разбирает старший байт формы целиком:
 +				//   * взведён знаковый бит и слово отрицательное — годится только
@@ -5791,18 +5858,24 @@ index 00000000..cdc8e698
 +				}
 +				stack.back().number = low;
 +				stack.back().width = 2;
-+			} else if ((form & 0xff) == 0x51) {
-+				// Обратное преобразование: подобработчик RUN34:0x3207 передаёт
-+				// форму целиком в общий преобразователь seg30:0x078c, а тот
-+				// решает по `младший & 7` и по `старший & 3`. У форм 0x8351 и
-+				// 0x8251 оба признака совпадают, поэтому различать их незачем
-+				// (ledger/0054). Десятибайтовое число -> слово.
++			} else if ((form & 0xff) == 0x51 || (form & 0xff) == 0x52) {
++				// Обратное преобразование: подобработчики RUN34:0x3207 и 0x3276
++				// передают форму целиком в общий преобразователь seg30:0x078c и
++				// различаются только тем, сколько кладут обратно — слово (`push
++				// ax`) или двойное (`push dx; push ax`). Решение внутри
++				// принимается по `младший & 7` и `старший & 3`, поэтому формы
++				// 0x8351 и 0x8251 различать незачем (ledger/0054, 0082).
 +				if (stack.back().width != 10) {
 +					debug(1, "ToolBook: opcode 71 form %04x non-extended input @0x%x",
 +							form, ip - 3);
 +					return false;
 +				}
-+				stack.back().width = 2;
++				if (stack.back().isString) {
++					stack.back().number = (uint32)(int32)atoi(stack.back().string.c_str());
++					stack.back().isString = false;
++					stack.back().string.clear();
++				}
++				stack.back().width = (form & 0xff) == 0x51 ? 2 : 4;
 +			} else {
 +				debug(1, "ToolBook: opcode 71 form %04x @0x%x пока не реализована",
 +						form, ip - 3);
@@ -5840,7 +5913,28 @@ index 00000000..cdc8e698
 +			break;
 +		}
 +				case 0x4a: { Value value; value.number = code[ip++]; value.type = 0x22; value.width = 10; stack.push_back(value); break; }
-+		case 0x59: ip += 2; pushNumber(0, 2); break;
++		case 0x59: {
++			// RUN34:0x0fde: `lodsw; add ax, sp; push ax` — адрес байта в стеке
++			// операндов со смещением N от вершины. Наш стек — это значения с
++			// шириной, поэтому смещение отсчитывается по ним.
++			uint16 offset = read16(ip);
++			ip += 2;
++			uint32 accumulated = 0, target = stack.size();
++			for (uint i = stack.size(); i > 0; i--) {
++				if (accumulated == offset) { target = i - 1; break; }
++				accumulated += stack[i - 1].width;
++			}
++			if (target >= stack.size()) {
++				debug(1, "ToolBook: 0x59 смещение %u не попало в стек @0x%x", offset, ip - 3);
++				return false;
++			}
++			Value reference;
++			reference.isStackRef = true;
++			reference.stackRef = target;
++			reference.width = 2;
++			stack.push_back(reference);
++			break;
++		}
 +		case 0x6c: {
 +			// Посылка сообщения: RUN34:0x4960 читает u16 (смещение от следующего
 +			// байта) и байт числа аргументов, зовёт RUN31:0x0194 и **не исполняет
@@ -7053,10 +7147,10 @@ index 00000000..cdc8e698
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..046c83ec
+index 00000000..8c226359
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,235 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -7144,6 +7238,10 @@ index 00000000..046c83ec
 +		/// отдаёт хендл, `ValueArraySet` меняет содержимое по нему), поэтому в
 +		/// значении лежит номер, а не копия элементов (ledger/0081).
 +		uint32 arrayId = 0;
++		/// Ссылка на место в стеке операндов: опкод 0x59 — это `push (sp + N)`,
++		/// адрес внутри стека, куда арифметика пишет результат (ledger/0082).
++		bool isStackRef = false;
++		uint32 stackRef = 0;   ///< индекс значения в стеке
 +		uint8 type = 0;
 +		uint8 width = 4;
 +	};
