@@ -4068,10 +4068,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..7cff711c
+index 00000000..7eb54521
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,3105 @@
+@@ -0,0 +1,3202 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4890,6 +4890,32 @@ index 00000000..7cff711c
 +				Value target = pop();
 +				if (target.isString || target.isObject)
 +					navigateTo(target.string);
++			} else if (id == 411) {
++				// Переход на страницу **со зрительным эффектом**. Книга зовёт это
++				// всегда одинаково: `411(строка эффекта, 12, ссылка на страницу, 0)`
++				// — например `("vertical split out speed 2000", 12, zast4, 0)`.
++				//
++				// Обёртка RUN67:0x1104 сперва разбирает строку эффекта
++				// (`MTB40RCR.65 AsymTbkFxParseString`), а потом по флагам решает,
++				// куда идти: у 12 бит 0x40 не взведён, и ветка RUN67:0x1189
++				// уходит на переход по третьему операнду. То есть цель перехода —
++				// не догадка, она стоит в кадре отдельно от эффекта.
++				//
++				// **Отступление:** сам эффект (шторка, наплыв) не рисуем — страница
++				// сменяется сразу. Это единственное, что теряется; куда идти,
++				// известно точно (ledger/0084).
++				Value extra = pop();
++				Value target = pop();
++				Value flags = pop();
++				Value effect = pop();
++				(void)extra;
++				if (!target.isString && !target.isObject) {
++					debug(1, "ToolBook: builtin 411 без страницы @0x%x", ip - 3);
++					return false;
++				}
++				debug(2, "ToolBook: переход на «%s» эффектом «%s» (флаги %u, эффект не рисуется)",
++						target.string.c_str(), valueString(effect).c_str(), flags.number);
++				navigateTo(target.string);
 +			} else if (id == 122) { // system word property getter
 +				pop();
 +				// sysLevel is a ToolBook enum word. Keep the symbolic value until
@@ -4947,6 +4973,45 @@ index 00000000..7cff711c
 +				computed.string.clear();
 +				stack[destination.stackRef] = computed;
 +				debug(3, "ToolBook: builtin %u: %d и %d -> %d", id, a, b, outcome);
++			} else if (id == 316) {
++				// `sndPlaySound(путь, флаги)`. Обёртка RUN89:0x0000 не зовёт
++				// функцию напрямую: она берёт из ресурсов строку 0x13ea, отдаёт её
++				// в `LoadLibrary` (KERNEL.95), затем строку 0x13eb — в
++				// `GetProcAddress` (KERNEL.50). Обе строки лежат рядом в
++				// `MTB40UTL.DLL` (@0xef00): **`MMSYSTEM.DLL`** и
++				// **`sndPlaySound`** — так что гадать про «какой-то звук» не
++				// пришлось.
++				//
++				// Флаги считает пара `sbb ax,ax; neg ax` — та самая ловушка из
++				// `CLAUDE.md`, читается наизнанку. `cmp [bp+6],1`: аргумент 1 даёт
++				// 2 (`SND_NODEFAULT`, синхронно), аргумент 0 — 3
++				// (`SND_ASYNC|SND_NODEFAULT`).
++				//
++				// **Отступление:** синхронный вариант мы всё равно играем
++				// асинхронно. Ждать конца звука внутри обработчика значило бы
++				// встать всей VM; книга на этом пути глушит звук `null.wav`, где
++				// разницы нет. Если где-то понадобится настоящее ожидание — это
++				// первое место, куда смотреть (ledger/0084).
++				Value flags = pop();
++				Value path = pop();
++				bool played = playSoundFile(valueString(path), &_effectHandle);
++				debug(2, "ToolBook: sndPlaySound «%s» %s -> %d",
++						valueString(path).c_str(),
++						flags.number == 1 ? "синхронно" : "асинхронно", played);
++				pushNumber(played ? 1 : 0, op == 0x22 ? 2 : 4);
++			} else if (id == 487) {
++				// `TbkTimerStop` (RUN69:0x2e58 -> MTB40MM.7): `retf 2`, один
++				// операнд — номер таймера. Таймеров движок не заводит (486,
++				// `TbkTimerStartNew`, не реализован), поэтому останавливать нечего.
++				//
++				// Это не заглушка «лишь бы прошло»: страница меню зовёт 487 с нулём
++				// в самом начале обработчика — снять таймер, которого может и не
++				// быть, — и результат тут же выбрасывает (`adjustStack 4`).
++				// Отвечать «остановлено» на «останови несуществующий» верно и для
++				// среды (ledger/0084).
++				Value timer = pop();
++				debug(2, "ToolBook: таймер %u остановлен (таймеров нет)", timer.number);
++				pushNumber(0, op == 0x22 ? 2 : 4);
 +			} else if (id == 138) {
 +				// Состояние окна. RUN66:0x0182 пропускает только класс 0x26 и зовёт
 +				// seg24:0x06c6; там для 0x4035, 0x4127 и 0x40d8 сначала разрешается
@@ -4961,6 +5026,29 @@ index 00000000..7cff711c
 +				if (_viewerStates.contains(key))
 +					state = selector.number == 0x4035 ? _viewerStates[key].visible :
 +							_viewerStates[key].open;
++				if (selector.number == 0x4222) {
++					// Это спрашивают не у окна, а у мультимедийного клипа: у 138
++					// разбор идёт по классу объекта, и `0x4222..0x422b` — ветка
++					// класса 0x64 (таблица переходов RUN66:0x0070), которая целиком
++					// уходит в мультимедийную подсистему (seg124 → seg123, seg46,
++					// `MTB40LNL`). Клипов движок не проигрывает вовсе, поэтому
++					// честный ответ — «нельзя»: сама среда отвечает ложью ровно
++					// тогда, когда клип не разрешается.
++					//
++					// У книги на этот случай есть своя ветка. Обработчик
++					// `firstIdle` страницы `zast2` (книга @0x174c06) спрашивает это
++					// у клипа «NMG» и по лжи уходит на страницу `zast2a`, минуя
++					// проигрывание (builtin'ы 450/459/454). То есть заставка
++					// пропускается так, как задумано для машины, которая её не
++					// тянет, а не упирается в барьер (ledger/0084).
++					//
++					// Звука это не касается: он идёт мимо клипов, через
++					// `mciSendString` (в логе — открытие `.\midi\toy.mid`).
++					debug(2, "ToolBook: клип «%s» свойство 0x4222 -> нет (клипы не проигрываются)",
++							object.string.c_str());
++					pushNumber(0, op == 0x22 ? 2 : 4);
++					break;
++				}
 +				if (selector.number != 0x4035 && selector.number != 0x4127) {
 +					debug(1, "ToolBook: builtin 138 свойство 0x%04x окна «%s» не разобрано @0x%x",
 +							selector.number, object.string.c_str(), ip - 3);
@@ -6445,7 +6533,16 @@ index 00000000..7cff711c
 +		debug(1, "ToolBook: играть нечего — псевдоним «%s» не открыт", alias.c_str());
 +		return;
 +	}
-+	Common::String path = _mciAliases[alias];
++	stopMedia(alias);
++	if (playSoundFile(_mciAliases[alias], &_mediaHandle))
++		_playingAlias = alias;
++}
++
++bool ToolBookEngine::playSoundFile(const Common::String &bookPath, Audio::SoundHandle *handle) {
++	// Путь книги написан по-досовски — с обратными косыми и, возможно, с буквой
++	// диска. Дерево игры у нас плоское по каталогам установки, поэтому приводим
++	// путь к тому виду, в котором его найдёт SearchMan (ledger/0070).
++	Common::String path = bookPath;
 +	for (uint i = 0; i < path.size(); i++)
 +		if (path[i] == '\\')
 +			path.setChar('/', i);
@@ -6453,23 +6550,23 @@ index 00000000..7cff711c
 +		path.erase(0, 2);
 +	Common::String lowered = path;
 +	lowered.toLowercase();
-+	stopMedia(alias);
 +	Common::SeekableReadStream *stream = SearchMan.createReadStreamForMember(Common::Path(path));
 +	if (!stream) {
 +		debug(1, "ToolBook: файл «%s» не найден", path.c_str());
-+		return;
++		return false;
 +	}
 +	if (lowered.hasSuffix(".wav")) {
 +		Audio::AudioStream *sound = Audio::makeWAVStream(stream, DisposeAfterUse::YES);
 +		if (sound) {
-+			_mixer->playStream(Audio::Mixer::kSFXSoundType, &_mediaHandle, sound);
-+			_playingAlias = alias;
++			_mixer->stopHandle(*handle);
++			_mixer->playStream(Audio::Mixer::kSFXSoundType, handle, sound);
 +			debug(2, "ToolBook: звук «%s» пошёл", path.c_str());
-+			return;
++			return true;
 +		}
 +	}
 +	delete stream;
 +	debug(1, "ToolBook: «%s» пока не проигрывается", path.c_str());
++	return false;
 +}
 +
 +void ToolBookEngine::stopMedia(const Common::String &alias) {
@@ -7179,10 +7276,10 @@ index 00000000..7cff711c
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..8c226359
+index 00000000..bf8aa6b8
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,239 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -7378,6 +7475,10 @@ index 00000000..8c226359
 +	/// Звук книги: команды MCI заводят псевдонимы, по ним и играем.
 +	Audio::SoundHandle _mediaHandle;
 +	Common::String _playingAlias;
++	/// Звук в обход MCI: `sndPlaySound` (builtin 316) зовут прямо путём.
++	Audio::SoundHandle _effectHandle;
++	/// Путь книги (`.\wav\null.wav`) -> поток движка. Возвращает «сыграли ли».
++	bool playSoundFile(const Common::String &bookPath, Audio::SoundHandle *handle);
 +	/// Окна книги по имени (регистр приведён к верхнему).
 +	Common::HashMap<Common::String, ViewerState> _viewerStates;
 +	/// Открытое и показанное окно с назначенной страницей, иначе -1.
