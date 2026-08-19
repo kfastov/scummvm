@@ -1,5 +1,5 @@
 """Разбор 16-битного NE: дизассемблер сегмента и разрешение перемещений."""
-import struct, sys, pathlib
+import re, struct, sys, pathlib
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16
 
 class NE:
@@ -99,8 +99,171 @@ class NE:
             p += 8
         return out
 
+
+# ------------------------------------------------------- границы функций
+#
+# Раньше каждая функция читалась вслепую: `dis 67 0x0cfe 150`, потом
+# `dis 67 0x0d90 200` — длина угадывалась, и один и тот же код
+# дизассемблировался по десятку раз (адрес 0x29e0 встретился в 66 командах
+# разобранных сессий). Границу можно вычислить, а не угадывать.
+
+TERMINALS = ('ret', 'retf', 'iret')
+
+
+def _md():
+    return Cs(CS_ARCH_X86, CS_MODE_16)
+
+
+def func_end(ne, seg, start, limit=0x4000):
+    """Конец функции линейным проходом.
+
+    Останов на ret/retf, но только когда мы уже прошли все места, куда
+    прыгали вперёд: у компилятора 16-битного кода несколько точек выхода —
+    ранний `ret` в середине не означает конца тела. Возвращает адрес за
+    последней командой.
+    """
+    f, sz, _ = ne.seg(seg)
+    end = min(start + limit, sz)
+    code = ne.d[f + start:f + end]
+    reach = start
+    last = start
+    for i in _md().disasm(code, start):
+        last = i.address + i.size
+        if i.mnemonic.startswith('j') or i.mnemonic == 'loop':
+            try:
+                t = int(i.op_str, 0)
+                if start <= t < end:
+                    reach = max(reach, t)
+            except ValueError:
+                pass
+        if i.mnemonic in TERMINALS and i.address >= reach:
+            return i.address + i.size
+    return last
+
+
+def prologues(ne, seg):
+    """Начала функций: прологи плюс цели ближних call.
+
+    Дальняя точка входа выглядит как `mov ax,ds; nop; inc bp; push bp;
+    mov bp,sp` — внутри неё сидит и короткий пролог, на четыре байта дальше.
+    Считать их двумя функциями нельзя, поэтому вложенный отбрасываем.
+    """
+    f, sz, _ = ne.seg(seg)
+    body = ne.d[f:f + sz]
+    starts = set()
+    far = {m.start() for m in re.finditer(rb'\x8c\xd8\x90\x45\x55\x8b\xec', body)}
+    starts |= far
+    for m in re.finditer(rb'\x55\x8b\xec', body):        # push bp; mov bp,sp
+        if m.start() - 4 not in far:
+            starts.add(m.start())
+    for i in _md().disasm(body, 0):                       # цели ближних call
+        if i.mnemonic == 'call':
+            try:
+                t = int(i.op_str, 0)
+                if 0 <= t < sz:
+                    starts.add(t)
+            except ValueError:
+                pass
+    return sorted(starts)
+
+
+def cmd_index(ne, argv):
+    """Таблица функций сегмента: адрес, размер, имя из таблицы вывода."""
+    seg = int(argv[0])
+    names = {}
+    for num, (where, name) in ne.exports().items():
+        m = re.match(r'seg(\d+):([0-9a-fA-F]+)', str(where))
+        if m and int(m.group(1)) == seg:
+            names[int(m.group(2), 16)] = '%s (#%d)' % (name, num)
+    starts = prologues(ne, seg)
+    print('  сегмент %d: функций %d' % (seg, len(starts)))
+    for s in starts:
+        e = func_end(ne, seg, s)
+        print('  %04x..%04x  %5d  %s' % (s, e, e - s, names.get(s, '')))
+
+
+def cmd_fn(ne, argv):
+    """Ровно одна функция — от адреса до её конца, без угадывания длины."""
+    seg = int(argv[0]); start = int(argv[1], 0)
+    end = func_end(ne, seg, start)
+    f, _, _ = ne.seg(seg)
+    rel = ne.relocs(seg)
+    print('  %d:%04x..%04x  (%d байт)' % (seg, start, end, end - start))
+    for i in _md().disasm(ne.d[f + start:f + end], start):
+        mark = ''
+        for k in range(i.address, i.address + i.size):
+            if k in rel:
+                mark = '   <- %s %s' % (rel[k][0], rel[k][1])
+        print('  %04x: %-20s %s %s%s' % (i.address, i.bytes.hex(), i.mnemonic, i.op_str, mark))
+
+
+def cmd_xref(ne, argv):
+    """Кто зовёт этот адрес: ближние call внутри сегмента и дальние через фиксапы.
+
+    У дальнего вызова фиксап типа 2 правит только слово сегмента, а смещение
+    лежит в самом образе — по слову перед фиксапом (ledger/0054). Поэтому
+    сравнивать надо не описание цели (там смещение всегда 0000), а то, что
+    реально записано в байтах.
+    """
+    seg = int(argv[0]); target = int(argv[1], 0)
+    found = 0
+    f, sz, _ = ne.seg(seg)
+    for i in _md().disasm(ne.d[f:f + sz], 0):
+        if i.mnemonic in ('call', 'jmp') and i.op_str.startswith('0x'):
+            try:
+                if int(i.op_str, 0) == target:
+                    print('  %d:%04x  %s %s' % (seg, i.address, i.mnemonic, i.op_str))
+                    found += 1
+            except ValueError:
+                pass
+    for s in range(1, ne.nseg + 1):
+        try:
+            rel = ne.relocs(s)
+            sf, ssz, _ = ne.seg(s)
+        except Exception:
+            continue
+        for off, v in sorted(rel.items()):
+            m = re.match(r'seg(\d+):', str(v[1]))
+            if not m or int(m.group(1)) != seg:
+                continue
+            # слово-смещение дальнего адреса стоит перед словом-сегментом
+            if off < 2 or off + 2 > ssz:
+                continue
+            imm = struct.unpack_from('<H', ne.d, sf + off - 2)[0]
+            if imm == target:
+                # 9A перед парой смещение:сегмент — это именно дальний вызов;
+                # без него мы видим просто дальний указатель (или звено цепочки
+                # фиксапов, которое к вызову отношения не имеет).
+                call = ne.d[sf + off - 3] == 0x9a
+                print('  %s %d:%04x -> %d:%04x'
+                      % ('дальний вызов' if call else 'дальний указатель',
+                         s, off - 3 if call else off - 2, seg, target))
+                found += 1
+    if not found:
+        print('  ссылок на %d:%04x не найдено' % (seg, target))
+
+
 def main():
+    if len(sys.argv) < 3:
+        print("""tools/ne16.py МОДУЛЬ ПОДКОМАНДА …
+
+  index СЕГ            таблица функций сегмента: адрес, размер, имя
+  fn СЕГ АДРЕС         одна функция целиком — конец вычисляется, не угадывается
+  xref СЕГ АДРЕС       кто зовёт: ближние call и дальние через фиксапы
+  dis СЕГ АДРЕС [N]    N байт вслепую (когда границы не нужны)
+  rel СЕГ [АДРЕС]      перемещения сегмента
+  bt НОМЕР…            адрес встроенной функции по номеру
+  exp [НОМЕР…]         таблица вывода
+
+Пример: tools/ne16.py games/bashnya/RUNTIME/MTB40RUN.EXE fn 67 0x0cfe""")
+        return
     ne = NE(sys.argv[1]); cmd = sys.argv[2]
+    if cmd == 'index':
+        return cmd_index(ne, sys.argv[3:])
+    if cmd == 'fn':
+        return cmd_fn(ne, sys.argv[3:])
+    if cmd == 'xref':
+        return cmd_xref(ne, sys.argv[3:])
     if cmd == 'dis':
         s, off = int(sys.argv[3]), int(sys.argv[4], 0)
         n = int(sys.argv[5]) if len(sys.argv) > 5 else 120
