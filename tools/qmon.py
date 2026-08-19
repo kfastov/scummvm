@@ -9,9 +9,19 @@
     qmon.py type "fdisk"              — напечатать строку посимвольно
     qmon.py enter "format c: /s"      — напечатать строку и нажать Enter
     qmon.py shot vm/shots/01.png      — снимок экрана (ppm конвертируется в png)
+    qmon.py look [путь]               — снимок И описание словами вместо картинки
+    qmon.py await [секунды]           — ждать, пока экран изменится
+
+`await` заменяет цепочки «щёлкнуть, поспать сорок пять секунд, снять экран,
+повторить»: в разобранных сессиях такие цепочки доходили до четырнадцати
+одинаковых снимков подряд, и каждый снимок стоил около полутора тысяч токенов.
+Здесь ожидание идёт внутри, а наружу выходит одна строка. `look` печатает
+описание кадра (размеры, цвета, карта яркости) — этого почти всегда хватает,
+чтобы понять, что на экране, не открывая картинку.
 """
 
 import os
+import hashlib
 import socket
 import subprocess
 import sys
@@ -175,6 +185,79 @@ def shot(path: str) -> None:
     print(path)
 
 
+def raw_screen() -> bytes:
+    """Сырой ppm с экрана. Для сравнения кадров png не нужен — sips только тратит время."""
+    ppm = "/tmp/qmon-await.ppm"
+    send(f"screendump {ppm}", wait=0.6)
+    with open(ppm, "rb") as f:
+        return f.read()
+
+
+def diff_ratio(a: bytes, b: bytes) -> float:
+    """Доля различающихся байтов ppm. Сравниваем с шагом — попиксельно незачем."""
+    if len(a) != len(b):
+        return 1.0
+    step = max(1, len(a) // 20000)
+    n = d = 0
+    for i in range(0, len(a), step):
+        n += 1
+        if a[i] != b[i]:
+            d += 1
+    return d / max(n, 1)
+
+
+def wait_change(timeout: float = 60.0, path: str = "", settle: float = 1.5,
+                thresh: float = 0.005) -> None:
+    """Ждать изменения экрана; вернуть одну строку вместо череды снимков.
+
+    После первого изменения ждём `settle` секунд тишины: гость перерисовывает
+    окно в несколько заходов, и снимок, взятый на первом же отличии, ловит
+    картинку наполовину нарисованной.
+
+    Порог `thresh` обязателен: на экране гостя мигает курсор, и сравнение по
+    хешу срабатывало бы каждые полсекунды, ничего не сообщая. Считается доля
+    изменившихся точек, а не факт изменения.
+    """
+    base = raw_screen()
+    start = time.time()
+    changed_at = None
+    last = base
+    while time.time() - start < timeout:
+        time.sleep(0.7)
+        cur = raw_screen()
+        if changed_at is None:
+            if diff_ratio(base, cur) >= thresh:
+                changed_at = time.time()
+                last = cur
+            continue
+        if diff_ratio(last, cur) >= thresh:   # ещё рисует — сдвигаем отсчёт тишины
+            changed_at, last = time.time(), cur
+        elif time.time() - changed_at >= settle:
+            break
+    took = time.time() - start
+    if changed_at is None:
+        print("экран не изменился за %.0fс" % took)
+        return
+    print("экран изменился через %.0fс (на %.1f%% точек)"
+          % (took, 100 * diff_ratio(base, last)))
+    if path:
+        shot(path)
+        look(path, take=False)
+
+
+def look(path: str = "", take: bool = True) -> None:
+    """Снимок и его описание словами."""
+    path = path or "vm/shots/look.png"
+    if take:
+        shot(path)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import frames
+        print(frames.describe(path))
+    except ImportError as exc:
+        print("нет Pillow (%s): .venv/bin/pip install Pillow" % exc)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
@@ -190,6 +273,11 @@ def main() -> None:
         key("ret")
     elif action == "shot":
         shot(arg or "vm/shots/shot.png")
+    elif action == "look":
+        look(arg)
+    elif action == "await":
+        thresh = float(sys.argv[3]) / 100 if len(sys.argv) > 3 else 0.005
+        wait_change(float(arg or 60), path="vm/shots/await.png", thresh=thresh)
     elif action in ("click", "dblclick"):
         x, y = (int(v) for v in arg.split(","))
         click(x, y, double=(action == "dblclick"))
