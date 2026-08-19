@@ -5,6 +5,9 @@
 **/__pycache__/
 *.pyc
 
+# Python с capstone для разбора 16-битного кода среды (см. CLAUDE.md)
+.venv/
+
 # Данные игр и образы дисков (не наши, большие)
 downloaded/
 game/

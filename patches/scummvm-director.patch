@@ -4068,10 +4068,10 @@ index 00000000..67b14790
 +DETECT_OBJS += $(MODULE)/detection.o
 diff --git a/engines/toolbook/toolbook.cpp b/engines/toolbook/toolbook.cpp
 new file mode 100644
-index 00000000..76d95903
+index 00000000..3b258901
 --- /dev/null
 +++ b/engines/toolbook/toolbook.cpp
-@@ -0,0 +1,3222 @@
+@@ -0,0 +1,3417 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -4447,6 +4447,43 @@ index 00000000..76d95903
 +			return Common::String::format("«%s»", string.c_str());
 +		return Common::String::format("%d", (int32)v.number);
 +	};
++	// Наборы среды. Значение набора — четырёхбайтовая ссылка с тегом 0x40:
++	// `ValueNewStack` (MTB40BAS seg118:0x0000) отводит заголовок с признаком
++	// вида 0x10, а тег значения — это признак, умноженный на четыре (по нему
++	// же разбирает `StackPush`, таблица seg118:0x07e6).
++	auto newCollection = [&]() {
++		Value v;
++		v.collectionId = _nextCollection++;
++		v.number = v.collectionId;
++		v.type = 0x40;
++		v.width = 4;
++		_stackStore[v.collectionId].clear();
++		return v;
++	};
++	auto collectionOf = [&](const Value &v) -> Common::Array<Value> * {
++		if (!v.collectionId || !_stackStore.contains(v.collectionId))
++			return nullptr;
++		return &_stackStore[v.collectionId];
++	};
++	// `StackPush` (MTB40BAS.134): если элемент сам набор (тег 0x40..0x43), ветка
++	// seg118:0x096c обходит его с последнего элемента к первому, каждый — через
++	// `StackPushOne`. У нас `StackPushOne` — вставка в начало, поэтому весь
++	// чужой набор оказывается впереди целиком и в своём порядке.
++	auto stackPush = [&](Common::Array<Value> &into, const Value &element) {
++		Common::Array<Value> *nested = collectionOf(element);
++		if (!nested) {
++			into.insert_at(0, element);
++			return;
++		}
++		const Common::Array<Value> source = *nested;   // копия: набор бывает свой же
++		for (int i = (int)source.size() - 1; i >= 0; i--)
++			into.insert_at(0, source[i]);
++	};
++	// Число из значения так же, как его берёт арифметика: элемент набора мог
++	// прийти строкой.
++	auto numberOf = [&](const Value &v) {
++		return v.isString ? (int32)atoi(v.string.c_str()) : (int32)v.number;
++	};
 +	auto local = [&](int off) { return locals.contains(off) ? locals[off] : Value(); };
 +	auto read16 = [&](uint32 at) { return (uint16)(code[at] | (code[at + 1] << 8)); };
 +	auto branch = [&](uint32 end, uint16 rel) { ip = (uint32)((int32)end + (int16)rel); };
@@ -4745,21 +4782,68 @@ index 00000000..76d95903
 +					pushNumber(0, resultWidth);
 +				break;
 +			}
-+			if (id != 192) {
-+				debug(1, "ToolBook: variadic builtin %u (cleanup %u) @0x%x пока не реализован",
-+						id, cleanup, ip - 4);
-+				for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 10; v--, n++)
-+					debug(1, "    операнд [-%d]: ширина %u тип %02x число %u стр «%s»",
-+							n, stack[v].width, stack[v].type, stack[v].number,
-+							valueString(stack[v]).c_str());
-+				return false;
++			if (id == 192) {
++				// Сборка набора. Обёртка RUN67:0x0cfe читает операнды сверху
++				// вниз как `[u16 признак][u16 счётчик][элементы по 4 байта]` —
++				// отсюда и `cleanup = 2 + 2 + 4×счётчик`.
++				//
++				// Признак выбирает один из двух способов, и оба видны в самой
++				// обёртке:
++				//
++				//   ≠0 — `ValueNewStack` нулевого размера, дальше каждый элемент
++				//        через `StackPush` (MTB40BAS.134), то есть с разбором
++				//        вложенных наборов;
++				//   =0 — `ValueNewStack` на счётчик мест, дальше каждый элемент
++				//        через `StackSetElement` (MTB40BAS.133) с индексом,
++				//        который отсчитывается вниз от `счётчик−1` (`dec [bp+8]`
++				//        на 0x0d37, а в вызов идёт уже уменьшенное значение).
++				//
++				// Способы выглядят противоположными, но дают один и тот же
++				// порядок: у среды индекс 0 — это физически последний элемент
++				// (`StackElement` берёт позицию `размер − 1 − индекс`). В обоих
++				// случаях элемент 0 набора — первый операнд по коду книги.
++				//
++				// Книга зовёт 192 сто шестьдесят пять раз и **всегда** с
++				// признаком 1 (счётчики 2, 3, 4 и 28).
++				Value flag = pop();
++				Value count = pop();
++				uint elements = count.number & 0xff;
++				if (4 + 4 * elements != cleanup) {
++					debug(1, "ToolBook: 192 элементов %u, но cleanup %u @0x%x",
++							elements, cleanup, ip - 4);
++					return false;
++				}
++				Common::Array<Value> items;
++				for (uint i = 0; i < elements; i++)
++					items.push_back(pop());
++				Value collection = newCollection();
++				Common::Array<Value> &store = _stackStore[collection.collectionId];
++				if (flag.number) {
++					for (uint i = 0; i < items.size(); i++)
++						stackPush(store, items[i]);
++				} else {
++					store.resize(elements);
++					for (uint i = 0; i < items.size(); i++)
++						store[elements - 1 - i] = items[i];
++				}
++				debug(2, "ToolBook: набор %u из %u элементов (признак %u)",
++						collection.collectionId, store.size(), flag.number);
++				for (uint i = 0; i < store.size(); i++)
++					debug(3, "    набор %u[%u] = %s", collection.collectionId, i,
++							describe(store[i]).c_str());
++				if (wantsResult) {
++					collection.width = resultWidth;
++					stack.push_back(collection);
++				}
++				break;
 +			}
-+			// Aggregate constructor: cleanup includes flag/count words and N
-+			// dynamic values, but not the receiver beneath them.
-+			popBytes(cleanup);
-+			if (wantsResult)
-+				pushNumber(0, resultWidth);
-+			break;
++			debug(1, "ToolBook: variadic builtin %u (cleanup %u) @0x%x пока не реализован",
++					id, cleanup, ip - 4);
++			for (int v = (int)stack.size() - 1, n = 0; v >= 0 && n < 10; v--, n++)
++				debug(1, "    операнд [-%d]: ширина %u тип %02x число %u стр «%s»",
++						n, stack[v].width, stack[v].type, stack[v].number,
++						valueString(stack[v]).c_str());
++			return false;
 +		}
 +		case 0x21: case 0x22: case 0x23: {
 +			uint16 id = read16(ip); ip += 2;
@@ -5667,6 +5751,117 @@ index 00000000..76d95903
 +					return false;
 +				}
 +				(void)notifyReceiver;
++			} else if (id == 118) {
++				// Свёртка по набору. Обёртка RUN87:0x0faa (`retf 6`: указатель
++				// на приёмник и набор) зовёт общий обход RUN87:0x130a с кодом
++				// действия 3. Обход берёт размер (`StackGetSize`), затем каждый
++				// элемент (`StackElement`), приводит его к числу и складывает с
++				// накопителем в RUN87:0x143a. Там же читаются все четыре кода:
++				// 0 — среднее (сумма на выходе делится на число элементов,
++				// 0x13e8), 1 — сумма, 2 — минимум (`fcom`+`jae`), 3 — максимум.
++				// Обёртки под 0, 1 и 2 в среде есть, но в таблице встроенных
++				// номеров этой сборки их нет — из книги достижим только 118.
++				//
++				// Не набор или пустой набор — у среды ошибка сценария
++				// (`CDBSetPlErr` на 0x1349), поэтому движок останавливается.
++				//
++				// Приёмник — десятибайтовое место, отведённое опкодом `0x0f` и
++				// адресуемое `0x59`, ровно как у арифметики (ledger/0082).
++				Value destination = pop();
++				Value collection = pop();
++				const Common::Array<Value> *items = collectionOf(collection);
++				if (!destination.isStackRef || destination.stackRef >= stack.size() ||
++						!items || items->empty()) {
++					debug(1, "ToolBook: builtin 118 — приёмник или набор не разобраны @0x%x",
++							ip - 3);
++					return false;
++				}
++				int32 outcome = numberOf((*items)[0]);
++				for (uint i = 1; i < items->size(); i++)
++					outcome = MAX(outcome, numberOf((*items)[i]));
++				Value computed;
++				computed.width = 10;
++				computed.type = 0x22;
++				computed.number = (uint32)outcome;
++				stack[destination.stackRef] = computed;
++				debug(2, "ToolBook: максимум набора %u из %u элементов -> %d",
++						collection.collectionId, items->size(), outcome);
++			} else if (id == 165) {
++				// Дописывание в набор с заведением по месту. Обёртка
++				// RUN67:0x0d90 (`retf 8`) проверяет второй операнд на
++				// каноническую пустую ссылку (`[bp+0xa]==1 && [bp+0xc]==0x400`)
++				// и в этом случае сама заводит пустой набор `ValueNewStack(0)`.
++				// Дальше в любом случае `StackPush` (MTB40BAS.134) и возврат
++				// набора.
++				Value element = pop();
++				Value target = pop();
++				if (!target.collectionId) {
++					if (!isNullValue(target)) {
++						debug(1, "ToolBook: builtin 165 — приёмник не набор и не пустая ссылка @0x%x",
++								ip - 3);
++						return false;
++					}
++					target = newCollection();
++				}
++				Common::Array<Value> *store = collectionOf(target);
++				if (!store) {
++					debug(1, "ToolBook: builtin 165 — набор %u потерян @0x%x",
++							target.collectionId, ip - 3);
++					return false;
++				}
++				stackPush(*store, element);
++				debug(2, "ToolBook: в набор %u дописано %s, стало %u",
++						target.collectionId, describe(element).c_str(), store->size());
++				target.width = 4;
++				stack.push_back(target);
++			} else if (id == 166) {
++				// `StackPop`. Обёртка RUN67:0x0de8 (`retf 4`) на пустой ссылке
++				// сразу ругается (`CDBSetPlErr` @0x0e19), а иначе зовёт
++				// MTB40BAS.136. Снимается элемент 0 — у среды это физический
++				// хвост, тот самый, что дописал `StackPushOne`.
++				//
++				// Пустой набор среда тоже считает ошибкой, но результат при этом
++				// возвращает — то самое «пусто», которым обёртка завела место
++				// (0, 0x400). Движок так и делает, только шумит в лог.
++				Value collection = pop();
++				Common::Array<Value> *store = collectionOf(collection);
++				if (!store) {
++					debug(1, "ToolBook: builtin 166 — операнд не набор @0x%x", ip - 3);
++					return false;
++				}
++				Value element;
++				if (store->empty())
++					debug(1, "ToolBook: builtin 166 — набор %u пуст @0x%x",
++							collection.collectionId, ip - 3);
++				else {
++					element = (*store)[0];
++					store->remove_at(0);
++				}
++				debug(2, "ToolBook: из набора %u снято %s, осталось %u",
++						collection.collectionId, describe(element).c_str(), store->size());
++				element.width = 4;
++				stack.push_back(element);
++			} else if (id == 214) {
++				// «Элемент N набора», нумерация с единицы. Обёртка RUN86:0x0000
++				// (`retf 6`: слово-номер и набор) берёт размер только если тег
++				// операнда — набор (`and al,0xfc; cmp 0x40`), проверяет
++				// `1 ≤ N ≤ размер` и зовёт `StackElement` с `N − 1`. Вне
++				// диапазона — каноническая пустая ссылка (0x0d5c: `1`, `0x400`).
++				Value index = pop();
++				Value collection = pop();
++				const Common::Array<Value> *items = collectionOf(collection);
++				uint32 at = index.number;
++				Value element;
++				element.number = 0x04000001;
++				if (items && at >= 1 && at <= items->size())
++					element = (*items)[at - 1];
++				else
++					debug(2, "ToolBook: набор %u не отдал элемент %u -> пусто",
++							collection.collectionId, at);
++				debug(2, "ToolBook: набор %u[%u] -> %s", collection.collectionId, at,
++						describe(element).c_str());
++				element.width = 4;
++				stack.push_back(element);
 +			} else {
 +				debug(1, "ToolBook: builtin %u @0x%x пока не реализован",
 +						id, ip - 3);
@@ -7296,10 +7491,10 @@ index 00000000..76d95903
 +} // End of namespace ToolBook
 diff --git a/engines/toolbook/toolbook.h b/engines/toolbook/toolbook.h
 new file mode 100644
-index 00000000..bf8aa6b8
+index 00000000..61362c74
 --- /dev/null
 +++ b/engines/toolbook/toolbook.h
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,249 @@
 +/* ScummVM - Graphic Adventure Engine
 + *
 + * ScummVM is the legal property of its developers, whose names
@@ -7387,6 +7582,10 @@ index 00000000..bf8aa6b8
 +		/// отдаёт хендл, `ValueArraySet` меняет содержимое по нему), поэтому в
 +		/// значении лежит номер, а не копия элементов (ledger/0081).
 +		uint32 arrayId = 0;
++		/// Номер набора в `_stackStore`. Набор («stack» среды) — тоже ссылка:
++		/// 192 заводит, 165 дописывает, 166 снимает, и все они передают друг
++		/// другу одно четырёхбайтовое значение с тегом 0x40 (ledger/0086).
++		uint32 collectionId = 0;
 +		/// Ссылка на место в стеке операндов: опкод 0x59 — это `push (sp + N)`,
 +		/// адрес внутри стека, куда арифметика пишет результат (ledger/0082).
 +		bool isStackRef = false;
@@ -7513,6 +7712,12 @@ index 00000000..bf8aa6b8
 +	/// Массивы книги по номеру: `ValueNewArray` заводит, `ValueArraySet` меняет.
 +	Common::HashMap<uint32, Common::Array<ScriptValue> > _arrayStore;
 +	uint32 _nextArray = 1;
++	/// Наборы книги по номеру. Порядок здесь **прямой**: элемент 0 — тот, что
++	/// среда отдаёт по индексу 0. У самой среды он лежит физически последним
++	/// (`StackElement` берёт позицию `размер − 1 − индекс`), поэтому её
++	/// `StackPushOne` — это вставка в начало нашего массива (ledger/0086).
++	Common::HashMap<uint32, Common::Array<ScriptValue> > _stackStore;
++	uint32 _nextCollection = 1;
 +	uint32 _hoveredObject = 0;
 +	uint32 _focusedField = 0;
 +	bool _fieldSelectAll = false;
