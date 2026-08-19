@@ -85,6 +85,10 @@ private:
 		/// отдаёт хендл, `ValueArraySet` меняет содержимое по нему), поэтому в
 		/// значении лежит номер, а не копия элементов (ledger/0081).
 		uint32 arrayId = 0;
+		/// Номер набора в `_stackStore`. Набор («stack» среды) — тоже ссылка:
+		/// 192 заводит, 165 дописывает, 166 снимает, и все они передают друг
+		/// другу одно четырёхбайтовое значение с тегом 0x40 (ledger/0086).
+		uint32 collectionId = 0;
 		/// Ссылка на место в стеке операндов: опкод 0x59 — это `push (sp + N)`,
 		/// адрес внутри стека, куда арифметика пишет результат (ledger/0082).
 		bool isStackRef = false;
@@ -211,6 +215,12 @@ private:
 	/// Массивы книги по номеру: `ValueNewArray` заводит, `ValueArraySet` меняет.
 	Common::HashMap<uint32, Common::Array<ScriptValue> > _arrayStore;
 	uint32 _nextArray = 1;
+	/// Наборы книги по номеру. Порядок здесь **прямой**: элемент 0 — тот, что
+	/// среда отдаёт по индексу 0. У самой среды он лежит физически последним
+	/// (`StackElement` берёт позицию `размер − 1 − индекс`), поэтому её
+	/// `StackPushOne` — это вставка в начало нашего массива (ledger/0086).
+	Common::HashMap<uint32, Common::Array<ScriptValue> > _stackStore;
+	uint32 _nextCollection = 1;
 	uint32 _hoveredObject = 0;
 	uint32 _focusedField = 0;
 	bool _fieldSelectAll = false;
