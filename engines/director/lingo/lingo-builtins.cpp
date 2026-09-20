@@ -1658,6 +1658,16 @@ void LB::b_getNthFileNameInFolder(int nargs) {
 		return;
 	}
 
+	// Games that hunt for their CD by walking the drive letters stop at the first
+	// one that answers, and every letter answers here, so they settle on C: and
+	// then reject it as writable. A quirk names the letter FileIO already treats
+	// as a read-only CD; make the other letters look empty.
+	if (g_director->_cdDriveLetter && pathRaw.size() >= 2 && pathRaw[1] == ':' &&
+			toupper(pathRaw[0]) != g_director->_cdDriveLetter) {
+		g_lingo->push(Datum(""));
+		return;
+	}
+
 	// getNthFileNameInFolder requires an absolute path as an input.
 	// relative paths will not match anything.
 	Common::Path path = findAbsolutePath(pathRaw, true);

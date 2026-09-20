@@ -526,8 +526,15 @@ Graphics::MacWidget *DigitalVideoCastMember::createWidget(Common::Rect &bbox, Ch
 		}
 
 		if (frame->getPixels()) {
-			// Video should have the dithering palette set, decode using whatever palette we have now
-			_lastFrame = frame->convertTo(g_director->_pixelformat, _ditheringPalette);
+			// Video should have the dithering palette set, decode using whatever palette we have now.
+			// _ditheringPalette is a copy of the current game palette, so it is the destination of
+			// the conversion, not its source. Passing it as the source left the destination palette
+			// empty, and Surface::convertTo bails out on a truecolor frame with an 8-bit target.
+			const byte *srcPal = frame->format.bytesPerPixel == 1 ? _ditheringPalette : nullptr;
+			const byte *dstPal = g_director->_pixelformat.bytesPerPixel == 1 ? _ditheringPalette : nullptr;
+
+			_lastFrame = frame->convertTo(g_director->_pixelformat, srcPal, srcPal ? 256 : 0,
+					dstPal, dstPal ? 256 : 0, Graphics::kDitherNaive);
 		} else {
 			warning("DigitalVideoCastMember::createWidget(): frame has no pixel data");
 		}

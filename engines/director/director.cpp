@@ -108,6 +108,7 @@ DirectorEngine::DirectorEngine(OSystem *syst, const DirectorGameDescription *gam
 	_loadSlowdownCooldownTime = 0;
 	_fileIOType = 0;
 	_vfwPaletteHack = false;
+	_cdDriveLetter = 0;
 
 	_key = 0;
 	_keyCode = 0;

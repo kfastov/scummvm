@@ -396,7 +396,11 @@ void FileIO::m_openFile(int nargs) {
 	Common::String option;
 	switch (mode) {
 	case 0:
-		option = "append";
+		// Mode 0 is read/write in the FileIO Xtra, and we can only do one at a
+		// time. Reading has to win: mapping it to append made opening a missing
+		// file succeed, so a game reading its config back always got an empty
+		// string instead of taking its own "file is not there" branch.
+		option = "read";
 		break;
 	case 1:
 		option = "read";
@@ -758,6 +762,11 @@ void FileIO::m_delete(int nargs) {
 // Non-standard extensions
 XOBJSTUBNR(FileIO::m_setOverrideDrive)
 
-XOBJSTUB(FileIO::m_getOSDirectory, "")
+void FileIO::m_getOSDirectory(int nargs) {
+	// Was a stub returning an empty string, which left games building paths like
+	// "\\config.ini" and looking for them in the wrong place.
+	g_lingo->push(Datum(g_director->getPlatform() == Common::kPlatformWindows
+			? "C:\\WINDOWS" : "System Folder"));
+}
 
 } // End of namespace Director
