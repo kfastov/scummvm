@@ -189,6 +189,8 @@ public:
 	bool _videoPlayback;
 
 	int _nextEventId;
+	// Идентификатор нажатия, для которого уже определён the clickOn.
+	int _clickOnEventId;
 	Common::Queue<LingoEvent> _inputEventQueue;
 
 	int _selStart;

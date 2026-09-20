@@ -602,7 +602,14 @@ bool Window::loadNextMovie() {
 	_soundManager->changingMovie();
 	_newMovieStarted = true;
 	_newMovieFirstDraw = true;
-	_currentPath = Common::firstPathComponents(_nextMovie.movie, g_director->_dirSeparator);
+	// Имя фильма без каталога ищется относительно текущей папки, и она должна
+	// сохраниться: игры строят от неё все свои пути ("the pathName & что-то").
+	// Безусловное присваивание затирало её пустой строкой, и после перехода вида
+	// `go movie "LogIn"` игра теряла свой каталог со всем содержимым — озвучкой,
+	// соседними фильмами — и подвисала в скриптах, которые этот путь разбирают.
+	Common::String nextPath = Common::firstPathComponents(_nextMovie.movie, g_director->_dirSeparator);
+	if (!nextPath.empty())
+		_currentPath = nextPath;
 
 	Common::Path archivePath = Common::Path(_currentPath, g_director->_dirSeparator);
 	archivePath.appendInPlace(Common::lastPathComponent(_nextMovie.movie, g_director->_dirSeparator));

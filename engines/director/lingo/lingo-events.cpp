@@ -139,12 +139,26 @@ void Movie::resolveScriptEvent(LingoEvent &event) {
 			leventType2str(event.event), event.eventId, scriptType2str(event.scriptType),
 			eventHandlerSourceType2str(event.eventHandlerSourceType), event.mousePos.x, event.mousePos.y, spriteId);
 
-		if (event.event == kEventMouseDown || event.event == kEventRightMouseDown) {
+		// the clickOn is decided once, when the button goes down, and keeps that
+		// value for the whole click, mouseUp included. Two things used to spoil it.
+		//
+		// One, it was overwritten on mouseUp with the sprite under the mouse at
+		// release. Drag and drop scripts pick a sprite up in mouseDown and then
+		// ask the clickOn in mouseUp what they were dragging, so they were handed
+		// the drop target instead and their channel arithmetic went out of range.
+		// That also disabled mouseUpOutSide, which is by definition "released away
+		// from the sprite the click started on".
+		//
+		// Two, one mouse click queues several handlers (sprite, cast, frame,
+		// movie) and every one of them is resolved in turn, re-reading what is
+		// under the mouse. The very first handler had already run by then, and a
+		// drag script parks a sprite under the cursor -- so the second resolution
+		// saw that sprite and made it the clickOn. Hence the event id check: the
+		// first resolution of a given click wins.
+		if ((event.event == kEventMouseDown || event.event == kEventRightMouseDown) &&
+				_clickOnEventId != event.eventId) {
+			_clickOnEventId = event.eventId;
 			_lastClickedSpriteId = spriteId; // the clickOn
-		} else 	if (event.event == kEventMouseUp || event.event == kEventRightMouseUp) {
-			// Do not override when clicked on Score
-			if (spriteId)
-				_lastClickedSpriteId = spriteId;
 		}
 
 	}
@@ -263,11 +277,6 @@ void Movie::resolveScriptEvent(LingoEvent &event) {
 				scriptId = _currentKeyDownSpriteScriptID;
 				immediate = _currentKeyDownSpriteImmediate;
 			} else {
-				// clickOn must reflect the release sprite so drop-target scripts
-				// can identify the channel
-				if ((event.event == kEventMouseUp || event.event == kEventRightMouseUp) && event.channelId)
-					_lastClickedSpriteId = event.channelId;
-
 				Frame *currentFrame = _score->_currentFrame;
 				assert(currentFrame != nullptr);
 				Sprite *sprite = _score->getSpriteById(event.channelId);

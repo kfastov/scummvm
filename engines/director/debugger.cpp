@@ -1236,6 +1236,28 @@ bool Debugger::lingoCommandProcessor(const char *inputOrig) {
 	return ret;
 }
 
+Common::String Debugger::evalLingo(const Common::String &code, bool asExpression) {
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): см. debugger.h.
+	Common::String src = asExpression ? Common::String::format("return (%s)", code.c_str()) : code;
+
+	ScriptContext *sc = g_lingo->_compiler->compileAnonymous(src);
+	if (!sc)
+		return "не разобралось";
+
+	Symbol sym = sc->_eventHandlers[kEventGeneric];
+	uint stackBefore = g_lingo->_state->stack.size();
+
+	_lingoEval = true;
+	LC::call(sym, 0, asExpression);
+	g_lingo->execute();
+	_lingoEval = false;
+
+	if (asExpression && g_lingo->_state->stack.size() > stackBefore)
+		return g_lingo->pop().asString(true);
+
+	return asExpression ? Common::String("значения нет") : Common::String("выполнено");
+}
+
 bool Debugger::lingoEval(const char *inputOrig) {
 	Common::String inputSan = inputOrig;
 	inputSan.trim();
