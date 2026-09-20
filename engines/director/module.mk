@@ -6,6 +6,7 @@ MODULE_OBJS = \
 	cast.o \
 	channel.o \
 	cursor.o \
+	debug-bridge.o \
 	debugger.o \
 	director.o \
 	events.o \
