@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Командная строка к отладочному мосту ScummVM.
+
+    tools/svmdbg start [--target T] [--flags lingoexec] [--level 3] [--dump]
+    tools/svmdbg cmd "state"
+    tools/svmdbg cmd "print the frame" "sprites" ...
+    tools/svmdbg shot [имя.png]
+    tools/svmdbg log [-n 40] [--grep RE]
+    tools/svmdbg stop
+    tools/svmdbg status
+
+Тот же самый мост доступен из MCP-сервера (`tools/svmbridge/mcp_server.py`);
+общий код лежит в `tools/svmbridge/core.py`.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from svmbridge import core  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="svmdbg", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("start", help="поднять движок с мостом")
+    p.add_argument("--target", default=core.DEFAULT_TARGET)
+    p.add_argument("--port", type=int, default=core.DEFAULT_PORT)
+    p.add_argument("--level", type=int, default=1)
+    p.add_argument("--flags", default="")
+    p.add_argument("--framedump", type=int, default=0)
+    p.add_argument("--dump", action="store_true", help="выгрузить декомпилированный Lingo")
+    p.add_argument("--audio", action="store_true", help="со звуком (по умолчанию dummy)")
+    p.add_argument("--log", default="bridge-run.log")
+    p.add_argument("--wait", type=float, default=25.0)
+
+    p = sub.add_parser("cmd", help="выполнить команды моста")
+    p.add_argument("lines", nargs="+")
+
+    p = sub.add_parser("shot", help="снять кадр")
+    p.add_argument("name", nargs="?", default="")
+
+    p = sub.add_parser("log", help="хвост лога прогона")
+    p.add_argument("-n", type=int, default=40)
+    p.add_argument("--grep", default="")
+
+    sub.add_parser("stop", help="убить прогон")
+    sub.add_parser("status", help="что сейчас запущено")
+
+    args = ap.parse_args()
+
+    try:
+        if args.cmd == "start":
+            st = core.start(target=args.target, port=args.port, debuglevel=args.level,
+                            debugflags=args.flags, framedump_ms=args.framedump,
+                            dump_lingo=args.dump, audio=args.audio, log=args.log,
+                            wait=args.wait)
+            print(f"pid {st.pid}, порт {st.port}, цель {st.target}, лог {st.log}")
+            print(core.command("state"))
+        elif args.cmd == "cmd":
+            for line, out in zip(args.lines, core.commands(args.lines)):
+                if len(args.lines) > 1:
+                    print(f"--- {line}")
+                print(out)
+        elif args.cmd == "shot":
+            print(core.shot(args.name))
+        elif args.cmd == "log":
+            st = core.read_state()
+            print(core.tail(st.log if st else core.RUNDIR / "bridge-run.log", args.n, args.grep))
+        elif args.cmd == "stop":
+            print("снят" if core.stop() else "нечего снимать")
+        elif args.cmd == "status":
+            st = core.read_state()
+            print(f"pid {st.pid}, порт {st.port}, цель {st.target}" if st else "не запущено")
+    except (core.BridgeError, OSError) as err:
+        print(f"ошибка: {err}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
