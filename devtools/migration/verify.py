@@ -26,10 +26,13 @@ def main():
         return entries
     expected = tree(data['base'])
     expected.update(data['source_files'])
-    actual = {p: e for p, e in tree(args.combined).items() if not p.startswith('devtools/')}
+    tooling_dirs = ('devtools/workbench/', 'devtools/migration/', 'devtools/scenarios/')
+    tooling_files = {'devtools/run.py', 'devtools/README.md'}
+    actual = {p: e for p, e in tree(args.combined).items()
+              if p in expected or (p not in tooling_files and not p.startswith(tooling_dirs))}
     differences = [p for p in expected.keys() | actual.keys() if expected.get(p) != actual.get(p)]
     if differences:
-        raise SystemExit('Source mismatch: ' + ', '.join(differences))
+        raise SystemExit(f'{len(differences)} source mismatches: ' + ', '.join(sorted(differences)[:20]))
     checked = 0
     for state in data['patches'] + data['nested']:
         if not state['toolbook']:
