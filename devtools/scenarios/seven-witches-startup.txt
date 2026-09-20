@@ -1,0 +1,2 @@
+52000 click 232 215
+112000 sprite 9 mouseUp

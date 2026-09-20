@@ -19,7 +19,10 @@
  *
  */
 
+#include "common/config-manager.h"
 #include "common/events.h"
+#include "common/fs.h"
+#include "common/tokenizer.h"
 #include "common/keyboard.h"
 #include "common/system.h"
 #include "common/translation.h"
@@ -31,6 +34,7 @@
 #include "graphics/macgui/macwindowmanager.h"
 
 #include "director/director.h"
+#include "director/debug-bridge.h"
 #include "director/movie.h"
 #include "director/score.h"
 #include "director/channel.h"
@@ -43,7 +47,128 @@ namespace Director {
 
 int DirectorEngine::getMacTicks() { return (int)(g_system->getMillis() * 60 / 1000.) - _tickBaseline; }
 
+void DirectorEngine::loadInputScript() {
+	_inputScriptLoaded = true;
+
+	if (!ConfMan.hasKey("inputscript"))
+		return;
+
+	Common::FSNode node(ConfMan.getPath("inputscript"));
+	Common::SeekableReadStream *stream = node.createReadStream();
+	if (!stream) {
+		warning("loadInputScript(): не открывается %s", ConfMan.get("inputscript").c_str());
+		return;
+	}
+
+	while (!stream->eos()) {
+		Common::String line = stream->readLine();
+		line.trim();
+		if (line.empty() || line[0] == '#')
+			continue;
+
+		Common::StringTokenizer tok(line);
+		ScriptedInput in;
+		in.timeMs = atoi(tok.nextToken().c_str());
+		Common::String kind = tok.nextToken();
+
+		if (kind.equalsIgnoreCase("click")) {
+			in.x = atoi(tok.nextToken().c_str());
+			in.y = atoi(tok.nextToken().c_str());
+			in.code = 0;
+
+			// Клик разворачиваем в нажатие и отпускание, разнесённые во времени:
+			// Director опрашивает состояние мыши в своём цикле, и нажатие длиной
+			// в один тик он просто не замечает.
+			in.action = kActionPress;
+			_inputScript.push_back(in);
+			in.action = kActionRelease;
+			in.timeMs += 300;
+			_inputScript.push_back(in);
+			continue;
+		}
+
+		if (kind.equalsIgnoreCase("sprite")) {
+			// Прямой вызов обработчика спрайта, мимо попадания и тайминга:
+			// "<мс> sprite <номер> <mouseUp|mouseDown>". Нужен, чтобы проверять
+			// логику игры, не угадывая момент и точку клика.
+			in.action = kActionSpriteEvent;
+			in.x = atoi(tok.nextToken().c_str());
+			Common::String ev = tok.nextToken();
+			in.code = ev.equalsIgnoreCase("mouseDown") ? kEventMouseDown : kEventMouseUp;
+			in.y = 0;
+			_inputScript.push_back(in);
+			continue;
+		}
+
+		in.action = kActionKey;
+		in.x = in.y = 0;
+		in.code = atoi(tok.nextToken().c_str());
+		_inputScript.push_back(in);
+	}
+	delete stream;
+
+	debug("loadInputScript(): загружено событий: %d", _inputScript.size());
+}
+
+void DirectorEngine::feedScriptedInput() {
+	if (!_inputScriptLoaded)
+		loadInputScript();
+
+	while (_inputScriptPos < _inputScript.size() &&
+			_inputScript[_inputScriptPos].timeMs <= g_system->getMillis()) {
+		const ScriptedInput &in = _inputScript[_inputScriptPos++];
+		Common::Event ev;
+
+		// Кладём события в сам менеджер, а не в _injectedEvents: Lingo читает
+		// положение и кнопки мыши напрямую через getMousePos/getButtonState,
+		// и события в обход менеджера для игры просто не существуют.
+		Common::EventManager *eventMan = g_system->getEventManager();
+
+		if (in.action == kActionSpriteEvent) {
+			Movie *movie = g_director->getCurrentMovie();
+			if (movie) {
+				debug("feedScriptedInput(): событие %d спрайту %d", in.code, in.x);
+				movie->processEvent((LEvent)in.code, in.x);
+			} else {
+				warning("feedScriptedInput(): фильма нет, событие спрайту %d пропущено", in.x);
+			}
+			continue;
+		}
+
+		if (in.action == kActionPress) {
+			ev.mouse = Common::Point(in.x, in.y);
+			ev.type = Common::EVENT_MOUSEMOVE;
+			eventMan->pushEvent(ev);
+			ev.type = Common::EVENT_LBUTTONDOWN;
+			eventMan->pushEvent(ev);
+			debug("feedScriptedInput(): нажатие в (%d, %d)", in.x, in.y);
+		} else if (in.action == kActionRelease) {
+			ev.mouse = Common::Point(in.x, in.y);
+			ev.type = Common::EVENT_MOUSEMOVE;
+			eventMan->pushEvent(ev);
+			ev.type = Common::EVENT_LBUTTONUP;
+			eventMan->pushEvent(ev);
+			debug("feedScriptedInput(): отпускание в (%d, %d)", in.x, in.y);
+		} else {
+			ev.type = Common::EVENT_KEYDOWN;
+			ev.kbd = Common::KeyState((Common::KeyCode)in.code, in.code);
+			eventMan->pushEvent(ev);
+			ev.type = Common::EVENT_KEYUP;
+			eventMan->pushEvent(ev);
+			debug("feedScriptedInput(): клавиша %d", in.code);
+		}
+	}
+}
+
 bool DirectorEngine::pollEvent(Common::Event &event) {
+	feedScriptedInput();
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): отладочный мост обслуживается отсюда —
+	// pollEvent зовут из всех циклов ожидания движка, значит мост отвечает и
+	// тогда, когда игра стоит в цикле «go the frame».
+	if (_debugBridge)
+		_debugBridge->poll();
+
 	// used by UnitTest XObject
 	if (!_injectedEvents.empty()) {
 		event = _injectedEvents.remove_at(0);

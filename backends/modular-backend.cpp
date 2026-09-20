@@ -26,6 +26,7 @@
 #include "backends/mixer/mixer.h"
 #include "gui/EventRecorder.h"
 
+#include "common/config-manager.h"
 #include "common/timer.h"
 #include "graphics/pixelformat.h"
 
@@ -196,6 +197,29 @@ void ModularGraphicsBackend::updateScreen() {
 #endif
 
 	_graphicsManager->updateScreen();
+
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): периодический сброс кадра на диск.
+	// Нужен, чтобы гонять движок без окна (SDL_VIDEODRIVER=dummy) и всё равно
+	// видеть картинку: снять экран у хоста нечем, а штатный скриншот ScummVM
+	// висит на нажатии клавиши, которое посылать некуда.
+	// Период в миллисекундах задаётся ключом framedump_ms в scummvm.ini
+	// (getenv в ScummVM запрещён через common/forbidden.h).
+	{
+		// Значение перечитываем каждый кадр, а не кэшируем: первый updateScreen
+		// случается до того, как активируется секция игры в конфиге.
+		static uint32 lastFrameDump = 0;
+		int frameDumpPeriod = ConfMan.hasKey("framedump_ms") ? ConfMan.getInt("framedump_ms") : 0;
+
+		// Экран может быть ещё не инициализирован — снимать с него нечего,
+		// и SDL_BlitSurface ругается на невалидный src.
+		if (frameDumpPeriod > 0 && _graphicsManager->getWidth() > 0 && _graphicsManager->getHeight() > 0) {
+			uint32 now = g_system->getMillis();
+			if (now - lastFrameDump >= (uint32)frameDumpPeriod) {
+				lastFrameDump = now;
+				_graphicsManager->saveScreenshot();
+			}
+		}
+	}
 
 #ifdef ENABLE_EVENTRECORDER
 	g_eventRec.postDrawOverlayGui();

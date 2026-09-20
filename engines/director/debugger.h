@@ -86,6 +86,13 @@ public:
 	void entityReadHook(int entity, int field);
 	void entityWriteHook(int entity, int field);
 
+	// ЛОКАЛЬНАЯ ПРАВКА (не для апстрима): выполнение Lingo, пришедшего от
+	// отладочного моста. От консольного `print` отличается тем, что строка не
+	// проходит через разбор командной строки, который съедает кавычки и
+	// двоеточия, — а без них не записать ни `go movie "@:Turm:Turm"`, ни
+	// путь с разделителями.
+	Common::String evalLingo(const Common::String &code, bool asExpression);
+
 private:
 	void disasmAllCast(Cast *cast);
 	void disasmCast(Cast *cast, int scriptId, const Common::String &funcName);
